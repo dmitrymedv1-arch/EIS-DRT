@@ -1,861 +1,1092 @@
 """
-Streamlit приложение для анализа импеданс-спектров методом распределения времен релаксации (DRT)
-Поддерживает методы:
-- Тихоновская регуляризация (Tikhonov)
-- Байесовский метод (Bayesian)
-- Метод максимальной энтропии (Maximum Entropy)
-- Гауссовские процессы (Gaussian Process)
-- ISGP (упрощенная версия)
+Streamlit DRT Analyzer - Комплексный анализ импедансных спектров
+Методы: Tikhonov, Bayesian, Maximum Entropy, GP-DRT (упрощенный), ISGP (эмуляция)
 """
 
 import streamlit as st
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from scipy import optimize, interpolate, signal
-from scipy.linalg import svd, solve
-import io
+import plotly.graph_objects as go
+import plotly.subplots as sp
+from scipy import optimize, interpolate, signal, linalg
+from scipy.special import logit, expit
 import warnings
+import time
+import io
+import base64
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, Any, List
+
 warnings.filterwarnings('ignore')
 
-# Настройка страницы
+# ============================================================================
+# Конфигурация страницы
+# ============================================================================
 st.set_page_config(
     page_title="DRT Analyzer",
     page_icon="⚡",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Заголовок
-st.title("⚡ DRT Analyzer: Distribution of Relaxation Times")
+st.title("⚡ DRT Analyzer - Distribution of Relaxation Times Analysis")
 st.markdown("""
-Анализ электрохимических импеданс-спектров методом распределения времен релаксации.
-Поддерживаются методы: Тихоновская регуляризация, Байесовский, Максимальная энтропия,
-Гауссовские процессы и ISGP.
+    Комплексный анализ импедансных спектров методами распределения времен релаксации.
+    Поддерживаемые методы: Тихоновская регуляризация, Байесовский подход, 
+    Максимальная энтропия, Гауссовские процессы.
 """)
 
 # ============================================================================
-# 1. Загрузка и предобработка данных
+# Классы и структуры данных
 # ============================================================================
+@dataclass
+class DRTSolution:
+    """Результат DRT-инверсии"""
+    tau: np.ndarray          # времена релаксации
+    gamma: np.ndarray        # DRT функция
+    gamma_std: Optional[np.ndarray]  # стандартное отклонение (для байесовских методов)
+    method: str              # использованный метод
+    time: float              # время вычисления
+    polarization_resistance: float  # полное поляризационное сопротивление
+    peaks: List[Dict]        # выделенные пики
+    reconstructed_impedance: Optional[Tuple[np.ndarray, np.ndarray]]  # восстановленный импеданс
 
-def load_data(uploaded_file):
-    """Загрузка данных из файла"""
+@dataclass
+class EISData:
+    """Данные импедансного спектра"""
+    freq: np.ndarray         # частоты (Гц)
+    z_real: np.ndarray       # действительная часть
+    z_imag: np.ndarray       # мнимая часть
+    R_inf: float             # омическое сопротивление
+    R_pol: float             # поляризационное сопротивление
+    valid: bool              # прошел ли проверку KK
+    validation_error: float  # ошибка валидации
+
+# ============================================================================
+# Функции предобработки и валидации
+# ============================================================================
+def validate_kramers_kronig(freq: np.ndarray, z_real: np.ndarray, z_imag: np.ndarray) -> Tuple[bool, float]:
+    """
+    Проверка данных через тест Кронига-Крамерса
+    Использует аппроксимацию рядом RC-элементов
+    """
     try:
-        # Пробуем прочитать как CSV
-        df = pd.read_csv(uploaded_file, sep=None, engine='python')
+        # Логарифмическая шкала частот для RC-элементов
+        log_freq = np.log10(freq)
+        tau_min = 1 / (2 * np.pi * freq.max())
+        tau_max = 1 / (2 * np.pi * freq.min())
         
-        # Проверяем наличие необходимых колонок
-        if len(df.columns) >= 3:
-            # Предполагаем порядок: частота, Z', Z''
-            freq = df.iloc[:, 0].values
-            Z_real = df.iloc[:, 1].values
-            Z_imag = df.iloc[:, 2].values
-            return freq, Z_real, Z_imag, df
-        else:
-            st.error("Файл должен содержать минимум 3 колонки: частота, Z', Z''")
-            return None, None, None, None
-    except Exception as e:
-        st.error(f"Ошибка загрузки файла: {e}")
-        return None, None, None, None
+        n_rc = min(20, len(freq) // 3)
+        tau_rc = np.logspace(np.log10(tau_min), np.log10(tau_max), n_rc)
+        
+        # Формирование матрицы для RC-элементов
+        A = np.zeros((len(freq), n_rc))
+        for i, f in enumerate(freq):
+            omega = 2 * np.pi * f
+            for j, tau in enumerate(tau_rc):
+                A[i, j] = 1 / (1 + (omega * tau)**2)
+        
+        # Решаем задачу наименьших квадратов
+        R_rc, _, _, _ = np.linalg.lstsq(A, z_real - z_real.min(), rcond=None)
+        
+        # Восстанавливаем спектр
+        z_real_recon = z_real.min() + A @ R_rc
+        
+        # Вычисляем относительную ошибку
+        error = np.mean(np.abs((z_real - z_real_recon) / (np.abs(z_real) + 1e-10))) * 100
+        
+        return error < 5.0, error
+    except Exception:
+        return False, 100.0
 
-def validate_kramers_kronig(freq, Z_real, Z_imag):
+def preprocess_eis_data(df: pd.DataFrame) -> EISData:
     """
-    Проверка качества данных через тест Кронига-Крамерса
+    Предобработка загруженных данных
+    Ожидаемые колонки: частота (Гц), Z', Z''
     """
-    # Упрощенная проверка: вычисляем восстановленную мнимую часть из действительной
+    # Определение колонок
+    cols = df.columns.tolist()
+    
+    # Автоматическое определение колонок
+    freq_col = None
+    real_col = None
+    imag_col = None
+    
+    for col in cols:
+        col_lower = col.lower()
+        if 'частот' in col_lower or 'freq' in col_lower or 'hz' in col_lower:
+            freq_col = col
+        elif 'действ' in col_lower or 'real' in col_lower or "z'" in col_lower or 'zprime' in col_lower:
+            real_col = col
+        elif 'мним' in col_lower or 'imag' in col_lower or "z''" in col_lower or 'zprime2' in col_lower:
+            imag_col = col
+    
+    if freq_col is None or real_col is None or imag_col is None:
+        # Если не найдены, предполагаем первые три колонки
+        freq_col, real_col, imag_col = cols[0], cols[1], cols[2]
+    
+    freq = df[freq_col].values
+    z_real = df[real_col].values
+    z_imag = df[imag_col].values
+    
+    # Сортировка по частоте
+    sort_idx = np.argsort(freq)
+    freq = freq[sort_idx]
+    z_real = z_real[sort_idx]
+    z_imag = z_imag[sort_idx]
+    
+    # Вычисление R_inf и R_pol
+    R_inf = z_real.min()
+    # Экстраполяция к нулевой частоте для R_pol
+    low_freq_idx = len(freq) // 4  # первые 25% точек
+    if low_freq_idx > 2:
+        p = np.polyfit(freq[:low_freq_idx], z_real[:low_freq_idx], 1)
+        R_pol = p[1] - R_inf
+    else:
+        R_pol = z_real.max() - R_inf
+    
+    # Проверка KK
+    valid, error = validate_kramers_kronig(freq, z_real, z_imag)
+    
+    return EISData(
+        freq=freq,
+        z_real=z_real,
+        z_imag=z_imag,
+        R_inf=R_inf,
+        R_pol=R_pol,
+        valid=valid,
+        validation_error=error
+    )
+
+def build_kernel_matrix(freq: np.ndarray, tau: np.ndarray) -> np.ndarray:
+    """
+    Построение матрицы ядра для уравнения Фредгольма
+    K_{ij} = 1 / (1 + j*omega_i*tau_j)
+    """
+    n_freq = len(freq)
+    n_tau = len(tau)
     omega = 2 * np.pi * freq
-    log_omega = np.log(omega)
     
-    # Проверка через преобразование Гильберта
-    try:
-        from scipy.signal import hilbert
-        Z_real_interp = interpolate.interp1d(log_omega, Z_real, 
-                                              kind='cubic', 
-                                              fill_value='extrapolate')
-        log_omega_fine = np.linspace(log_omega.min(), log_omega.max(), 1000)
-        Z_real_fine = Z_real_interp(log_omega_fine)
-        
-        # Преобразование Гильберта
-        analytic = hilbert(Z_real_fine)
-        Z_imag_reconstructed = np.imag(analytic)
-        
-        # Интерполяция обратно на исходные частоты
-        Z_imag_interp = interpolate.interp1d(log_omega_fine, Z_imag_reconstructed,
-                                              kind='cubic', fill_value='extrapolate')
-        Z_imag_pred = Z_imag_interp(log_omega)
-        
-        # Вычисление относительной невязки
-        Z_mag = np.sqrt(Z_real**2 + Z_imag**2)
-        residuals = np.abs(Z_imag - Z_imag_pred) / (Z_mag + 1e-10)
-        max_residual = np.max(residuals)
-        
-        return max_residual < 0.05, residuals, max_residual
-    except Exception as e:
-        st.warning(f"Kramers-Kronig тест не выполнен: {e}")
-        return True, None, 0
+    # Действительная часть
+    K_real = np.zeros((n_freq, n_tau))
+    K_imag = np.zeros((n_freq, n_tau))
+    
+    for i, w in enumerate(omega):
+        for j, t in enumerate(tau):
+            denom = 1 + (w * t)**2
+            K_real[i, j] = 1 / denom
+            K_imag[i, j] = -w * t / denom
+    
+    return K_real, K_imag
 
 # ============================================================================
-# 2. DRT инверсия - Тихоновская регуляризация
+# Метод 1: Тихоновская регуляризация
 # ============================================================================
-
-class TikhonovDRT:
-    """Тихоновская регуляризация для DRT инверсии"""
+def tikhonov_drt(data: EISData, lambda_reg: float = None, 
+                 regularization_order: int = 2) -> DRTSolution:
+    """
+    DRT через тихоновскую регуляризацию
+    """
+    start_time = time.time()
     
-    def __init__(self, freq, Z_real, Z_imag, tau_min=None, tau_max=None, n_tau=200):
-        self.freq = np.asarray(freq)
-        self.Z_real = np.asarray(Z_real)
-        self.Z_imag = np.asarray(Z_imag)
-        self.omega = 2 * np.pi * self.freq
-        
-        # Определение диапазона времен релаксации
-        if tau_min is None:
-            tau_min = 1 / (2 * np.pi * np.max(self.freq)) * 0.1
-        if tau_max is None:
-            tau_max = 1 / (2 * np.pi * np.min(self.freq)) * 10
-            
-        self.tau = np.logspace(np.log10(tau_min), np.log10(tau_max), n_tau)
-        self.n_tau = n_tau
-        self.n_freq = len(freq)
-        
-        # Построение матрицы ядра
-        self.build_kernel_matrix()
+    # Дискретизация времени релаксации
+    tau_min = 1 / (2 * np.pi * data.freq.max())
+    tau_max = 1 / (2 * np.pi * data.freq.min())
+    tau = np.logspace(np.log10(tau_min), np.log10(tau_max), 100)
     
-    def build_kernel_matrix(self):
-        """Построение матрицы ядра для действительной и мнимой частей"""
-        # Матрица для действительной части
-        self.A_real = np.zeros((self.n_freq, self.n_tau))
-        # Матрица для мнимой части
-        self.A_imag = np.zeros((self.n_freq, self.n_tau))
-        
-        for i in range(self.n_freq):
-            for j in range(self.n_tau):
-                denom = 1 + (self.omega[i] * self.tau[j])**2
-                self.A_real[i, j] = 1 / denom
-                self.A_imag[i, j] = -self.omega[i] * self.tau[j] / denom
-        
-        # Объединенная матрица
-        self.A = np.vstack([self.A_real, self.A_imag])
-        self.b = np.hstack([self.Z_real, self.Z_imag])
+    # Построение матрицы ядра
+    K_real, K_imag = build_kernel_matrix(data.freq, tau)
     
-    def compute_L_matrix(self, order=2):
-        """Построение матрицы регуляризации"""
-        if order == 0:
-            return np.eye(self.n_tau)
-        elif order == 1:
-            L = np.zeros((self.n_tau - 1, self.n_tau))
-            for i in range(self.n_tau - 1):
-                L[i, i] = -1
-                L[i, i+1] = 1
-            return L
-        else:  # order == 2
-            L = np.zeros((self.n_tau - 2, self.n_tau))
-            for i in range(self.n_tau - 2):
-                L[i, i] = 1
-                L[i, i+1] = -2
-                L[i, i+2] = 1
-            return L
+    # Нормировка
+    scaling = np.linalg.norm(K_real, 'fro') + np.linalg.norm(K_imag, 'fro')
+    K_real /= scaling
+    K_imag /= scaling
     
-    def l_curve_criterion(self, lambda_range):
-        """Выбор параметра регуляризации по L-кривой"""
+    # Целевой вектор
+    z_target = np.concatenate([
+        (data.z_real - data.R_inf) / scaling,
+        (-data.z_imag) / scaling  # знак минус, так как Z'' отрицательна
+    ])
+    
+    # Полная матрица системы
+    K_total = np.vstack([K_real, K_imag])
+    
+    # Матрица регуляризации
+    n_tau = len(tau)
+    if regularization_order == 0:
+        L = np.eye(n_tau)
+    elif regularization_order == 1:
+        L = np.zeros((n_tau - 1, n_tau))
+        for i in range(n_tau - 1):
+            L[i, i] = -1
+            L[i, i + 1] = 1
+    else:
+        L = np.zeros((n_tau - 2, n_tau))
+        for i in range(n_tau - 2):
+            L[i, i] = 1
+            L[i, i + 1] = -2
+            L[i, i + 2] = 1
+    
+    # Выбор параметра регуляризации
+    if lambda_reg is None:
+        # L-кривая
+        lambdas = np.logspace(-8, 2, 30)
         residuals = []
         norms = []
         
-        for lam in lambda_range:
+        for lam in lambdas:
+            ATA = K_total.T @ K_total + lam * (L.T @ L)
             try:
-                L = self.compute_L_matrix(order=2)
-                ATA = self.A.T @ self.A
-                LTL = L.T @ L
-                x = solve(ATA + lam * LTL, self.A.T @ self.b)
-                x = np.maximum(x, 0)  # Неотрицательность
-                
-                res = np.linalg.norm(self.A @ x - self.b)
-                norm = np.linalg.norm(L @ x)
-                residuals.append(res)
-                norms.append(norm)
+                gamma = np.linalg.solve(ATA, K_total.T @ z_target)
+                gamma = np.maximum(gamma, 0)
+                residual = np.linalg.norm(K_total @ gamma - z_target)
+                norm_reg = np.linalg.norm(L @ gamma)
+                residuals.append(residual)
+                norms.append(norm_reg)
             except:
                 residuals.append(np.inf)
                 norms.append(np.inf)
         
-        residuals = np.array(residuals)
-        norms = np.array(norms)
-        valid = np.isfinite(residuals) & (residuals > 0) & (norms > 0)
-        
-        if np.sum(valid) < 3:
-            return lambda_range[len(lambda_range)//2]
-        
-        # Поиск точки максимальной кривизны
-        log_res = np.log(residuals[valid])
-        log_norm = np.log(norms[valid])
-        
-        # Кривизна
-        dx = np.diff(log_norm)
-        dy = np.diff(log_res)
-        curvature = np.abs(dx[1:] * dy[:-1] - dx[:-1] * dy[1:]) / (dx[1:]**2 + dy[:-1]**2)**1.5
-        k_opt = np.argmax(curvature) + 1
-        
-        return lambda_range[valid][k_opt]
-    
-    def fit(self, lambda_reg=None, order=2):
-        """Выполнение инверсии DRT"""
-        if lambda_reg is None:
-            # Автоматический выбор λ
-            lambda_range = np.logspace(-10, 0, 50)
-            lambda_reg = self.l_curve_criterion(lambda_range)
-        
-        L = self.compute_L_matrix(order=order)
-        ATA = self.A.T @ self.A
-        LTL = L.T @ L
-        
-        try:
-            x = solve(ATA + lambda_reg * LTL, self.A.T @ self.b)
-            x = np.maximum(x, 0)  # Неотрицательность
-        except:
-            # SVD метод
-            U, s, Vt = svd(ATA + lambda_reg * LTL)
-            x = Vt.T @ (U.T @ (self.A.T @ self.b) / s)
-            x = np.maximum(np.real(x), 0)
-        
-        # Восстановленный импеданс
-        Z_reconstructed_real = self.A_real @ x
-        Z_reconstructed_imag = self.A_imag @ x
-        
-        # Расчет невязок
-        residuals = np.sqrt((self.Z_real - Z_reconstructed_real)**2 + 
-                           (self.Z_imag - Z_reconstructed_imag)**2)
-        residuals /= np.sqrt(self.Z_real**2 + self.Z_imag**2)
-        
-        return x, lambda_reg, residuals, Z_reconstructed_real, Z_reconstructed_imag
-
-
-# ============================================================================
-# 3. DRT инверсия - Байесовский метод (упрощенный)
-# ============================================================================
-
-class BayesianDRT:
-    """Байесовский подход с MAP оценкой и доверительными интервалами"""
-    
-    def __init__(self, freq, Z_real, Z_imag, tau_min=None, tau_max=None, n_tau=150):
-        self.freq = np.asarray(freq)
-        self.Z_real = np.asarray(Z_real)
-        self.Z_imag = np.asarray(Z_imag)
-        self.omega = 2 * np.pi * self.freq
-        
-        if tau_min is None:
-            tau_min = 1 / (2 * np.pi * np.max(self.freq)) * 0.1
-        if tau_max is None:
-            tau_max = 1 / (2 * np.pi * np.min(self.freq)) * 10
-            
-        self.tau = np.logspace(np.log10(tau_min), np.log10(tau_max), n_tau)
-        self.n_tau = n_tau
-        
-        # Построение матрицы
-        self.build_kernel_matrix()
-    
-    def build_kernel_matrix(self):
-        self.A = np.zeros((2 * len(self.freq), self.n_tau))
-        for i in range(len(self.freq)):
-            for j in range(self.n_tau):
-                denom = 1 + (self.omega[i] * self.tau[j])**2
-                self.A[2*i, j] = 1 / denom
-                self.A[2*i + 1, j] = -self.omega[i] * self.tau[j] / denom
-        
-        self.b = np.hstack([self.Z_real, self.Z_imag])
-        self.n_obs = len(self.b)
-    
-    def compute_posterior(self, lambda_reg=1e-6, n_samples=100):
-        """Вычисление апостериорного распределения с помощью MCMC (упрощенный)"""
-        L = np.eye(self.n_tau)
-        ATA = self.A.T @ self.A
-        LTL = L.T @ L
-        Sigma_inv = ATA + lambda_reg * LTL
-        
-        # MAP оценка
-        try:
-            x_map = solve(Sigma_inv, self.A.T @ self.b)
-            x_map = np.maximum(x_map, 0)
-        except:
-            U, s, Vt = svd(Sigma_inv)
-            x_map = Vt.T @ (U.T @ (self.A.T @ self.b) / s)
-            x_map = np.maximum(np.real(x_map), 0)
-        
-        # Ковариационная матрица
-        try:
-            Sigma = np.linalg.inv(Sigma_inv)
-        except:
-            Sigma = np.linalg.pinv(Sigma_inv)
-        
-        # Генерация выборок для доверительных интервалов
-        samples = []
-        if n_samples > 0:
-            for _ in range(min(n_samples, 100)):
-                try:
-                    sample = np.random.multivariate_normal(x_map, Sigma)
-                    sample = np.maximum(sample, 0)
-                    samples.append(sample)
-                except:
-                    pass
-        
-        samples = np.array(samples) if samples else np.array([x_map])
-        
-        # Доверительные интервалы
-        lower = np.percentile(samples, 2.5, axis=0)
-        upper = np.percentile(samples, 97.5, axis=0)
-        
-        return x_map, lower, upper, samples
-
-
-# ============================================================================
-# 4. DRT инверсия - Максимальная энтропия
-# ============================================================================
-
-class MaxEntropyDRT:
-    """Метод максимальной энтропии для DRT инверсии"""
-    
-    def __init__(self, freq, Z_real, Z_imag, tau_min=None, tau_max=None, n_tau=150):
-        self.freq = np.asarray(freq)
-        self.Z_real = np.asarray(Z_real)
-        self.Z_imag = np.asarray(Z_imag)
-        self.omega = 2 * np.pi * self.freq
-        
-        if tau_min is None:
-            tau_min = 1 / (2 * np.pi * np.max(self.freq)) * 0.1
-        if tau_max is None:
-            tau_max = 1 / (2 * np.pi * np.min(self.freq)) * 10
-            
-        self.tau = np.logspace(np.log10(tau_min), np.log10(tau_max), n_tau)
-        self.n_tau = n_tau
-        self.n_freq = len(freq)
-        
-        self.build_kernel_matrix()
-    
-    def build_kernel_matrix(self):
-        self.A = np.zeros((2 * self.n_freq, self.n_tau))
-        for i in range(self.n_freq):
-            for j in range(self.n_tau):
-                denom = 1 + (self.omega[i] * self.tau[j])**2
-                self.A[2*i, j] = 1 / denom
-                self.A[2*i + 1, j] = -self.omega[i] * self.tau[j] / denom
-        
-        self.b = np.hstack([self.Z_real, self.Z_imag])
-    
-    def entropy(self, x):
-        """Энтропия Шеннона (с регуляризацией для нулевых значений)"""
-        x_safe = np.maximum(x, 1e-12)
-        return -np.sum(x_safe * np.log(x_safe))
-    
-    def objective(self, x, lambda_reg):
-        """Целевая функция: невязка + λ * энтропия"""
-        residual = np.linalg.norm(self.A @ x - self.b)**2
-        return residual - lambda_reg * self.entropy(x)
-    
-    def fit(self, lambda_reg=None, max_iter=500):
-        """Выполнение инверсии методом максимальной энтропии"""
-        if lambda_reg is None:
+        # Поиск угла L-кривой (максимум кривизны)
+        valid = np.isfinite(residuals) & np.isfinite(norms)
+        if np.sum(valid) > 3:
+            log_res = np.log(np.array(residuals)[valid])
+            log_norm = np.log(np.array(norms)[valid])
+            curvatures = np.diff(np.diff(log_res) / np.diff(log_norm))
+            if len(curvatures) > 0:
+                best_idx = np.argmax(np.abs(curvatures))
+                lambda_reg = lambdas[valid][best_idx + 1]
+            else:
+                lambda_reg = 1e-4
+        else:
             lambda_reg = 1e-4
-        
-        # Начальное приближение
-        x0 = np.ones(self.n_tau) / self.n_tau
-        
-        # Оптимизация
-        bounds = [(0, None) for _ in range(self.n_tau)]
-        
-        def obj_wrapper(x):
-            return self.objective(x, lambda_reg)
-        
-        try:
-            result = optimize.minimize(
-                obj_wrapper, x0, method='L-BFGS-B',
-                bounds=bounds, options={'maxiter': max_iter}
-            )
-            x_opt = np.maximum(result.x, 0)
-        except:
-            x_opt = x0
-        
-        # Нормализация
-        x_opt = x_opt / (np.sum(x_opt) + 1e-10)
-        
-        # Восстановленный импеданс
-        Z_reconstructed_real = np.zeros(self.n_freq)
-        Z_reconstructed_imag = np.zeros(self.n_freq)
-        for i in range(self.n_freq):
-            for j in range(self.n_tau):
-                denom = 1 + (self.omega[i] * self.tau[j])**2
-                Z_reconstructed_real[i] += x_opt[j] / denom
-                Z_reconstructed_imag[i] += -self.omega[i] * self.tau[j] * x_opt[j] / denom
-        
-        return x_opt, Z_reconstructed_real, Z_reconstructed_imag
-
+    
+    # Финальное решение
+    ATA = K_total.T @ K_total + lambda_reg * (L.T @ L)
+    gamma = np.linalg.solve(ATA, K_total.T @ z_target)
+    gamma = np.maximum(gamma, 0)
+    
+    # Нормировка
+    gamma = gamma / np.trapz(gamma, tau) * data.R_pol
+    
+    # Выделение пиков
+    peaks = detect_peaks(tau, gamma)
+    
+    # Восстановление импеданса
+    z_recon_real = data.R_inf + K_real @ gamma
+    z_recon_imag = -K_imag @ gamma
+    
+    return DRTSolution(
+        tau=tau,
+        gamma=gamma,
+        gamma_std=None,
+        method="Tikhonov",
+        time=time.time() - start_time,
+        polarization_resistance=np.trapz(gamma, tau),
+        peaks=peaks,
+        reconstructed_impedance=(z_recon_real, z_recon_imag)
+    )
 
 # ============================================================================
-# 5. DRT инверсия - Гауссовские процессы (упрощенный)
+# Метод 2: Байесовский подход (упрощенная реализация с bootstrap)
 # ============================================================================
-
-class GaussianProcessDRT:
-    """Гауссовский процесс для DRT с оценкой неопределенности"""
+def bayesian_drt(data: EISData, n_samples: int = 100) -> DRTSolution:
+    """
+    Байесовский DRT через bootstrap-анализ
+    Оценивает доверительные интервалы
+    """
+    start_time = time.time()
     
-    def __init__(self, freq, Z_real, Z_imag, tau_min=None, tau_max=None, n_tau=150):
-        self.freq = np.asarray(freq)
-        self.Z_real = np.asarray(Z_real)
-        self.Z_imag = np.asarray(Z_imag)
-        self.omega = 2 * np.pi * self.freq
+    # Базовая DRT (Тихоновская)
+    base_solution = tikhonov_drt(data, lambda_reg=1e-4)
+    
+    if n_samples <= 1:
+        return base_solution
+    
+    # Bootstrap для оценки неопределенности
+    gamma_samples = []
+    n_freq = len(data.freq)
+    
+    progress_bar = st.progress(0)
+    
+    for i in range(n_samples):
+        # Добавляем шум к данным
+        noise_level = 0.01 * np.max(np.abs(data.z_real))
+        z_real_noisy = data.z_real + np.random.normal(0, noise_level, n_freq)
+        z_imag_noisy = data.z_imag + np.random.normal(0, noise_level, n_freq)
         
-        if tau_min is None:
-            tau_min = 1 / (2 * np.pi * np.max(self.freq)) * 0.1
-        if tau_max is None:
-            tau_max = 1 / (2 * np.pi * np.min(self.freq)) * 10
-            
-        self.tau = np.logspace(np.log10(tau_min), np.log10(tau_max), n_tau)
-        self.n_tau = n_tau
-        self.n_freq = len(freq)
-        
-        self.build_kernel_matrix()
-    
-    def build_kernel_matrix(self):
-        self.A = np.zeros((2 * self.n_freq, self.n_tau))
-        for i in range(self.n_freq):
-            for j in range(self.n_tau):
-                denom = 1 + (self.omega[i] * self.tau[j])**2
-                self.A[2*i, j] = 1 / denom
-                self.A[2*i + 1, j] = -self.omega[i] * self.tau[j] / denom
-        
-        self.b = np.hstack([self.Z_real, self.Z_imag])
-    
-    def rbf_kernel(self, x1, x2, length_scale=0.5, sigma_f=1.0):
-        """Ядро RBF для ковариации"""
-        sqdist = np.sum(x1**2, 1).reshape(-1, 1) + np.sum(x2**2, 1) - 2 * np.dot(x1, x2.T)
-        return sigma_f**2 * np.exp(-0.5 / length_scale**2 * sqdist)
-    
-    def fit(self, length_scale=0.5, noise_var=1e-6):
-        """Вычисление GP-оценки DRT"""
-        # Логарифмическая шкала времен
-        X = np.log10(self.tau).reshape(-1, 1)
-        
-        # Ковариационная матрица
-        K = self.rbf_kernel(X, X, length_scale)
-        K += noise_var * np.eye(len(X))
-        
-        # Решаем K * alpha = A.T * b (упрощенная версия)
-        # Для полного GP нужно решать систему с учетом ядра, здесь упрощение
-        try:
-            K_inv = np.linalg.inv(K)
-            alpha = K_inv @ (self.A.T @ self.b)
-            x_gp = K @ alpha
-            x_gp = np.maximum(x_gp, 0)
-            
-            # Доверительные интервалы (диагональ ковариации)
-            variance = np.diag(K - K @ K_inv @ K)
-            std = np.sqrt(np.maximum(variance, 0))
-            
-            return x_gp, x_gp - 2*std, x_gp + 2*std
-        except:
-            x_gp = np.ones(self.n_tau) / self.n_tau
-            return x_gp, x_gp, x_gp
-
-
-# ============================================================================
-# 6. DRT инверсия - ISGP (упрощенная версия)
-# ============================================================================
-
-class ISGPDRT:
-    """Упрощенная версия ISGP с генетическим алгоритмом"""
-    
-    def __init__(self, freq, Z_real, Z_imag, tau_min=None, tau_max=None):
-        self.freq = np.asarray(freq)
-        self.Z_real = np.asarray(Z_real)
-        self.Z_imag = np.asarray(Z_imag)
-        self.omega = 2 * np.pi * self.freq
-        
-        if tau_min is None:
-            tau_min = 1 / (2 * np.pi * np.max(self.freq)) * 0.1
-        if tau_max is None:
-            tau_max = 1 / (2 * np.pi * np.min(self.freq)) * 10
-        
-        self.tau_min = tau_min
-        self.tau_max = tau_max
-        self.n_freq = len(freq)
-    
-    def peak_function(self, tau, A, tau0, sigma):
-        """Гауссиан для представления пика"""
-        return A * np.exp(-(np.log10(tau) - np.log10(tau0))**2 / (2 * sigma**2))
-    
-    def compute_impedance(self, peaks):
-        """Вычисление импеданса по сумме пиков"""
-        Z_real = np.zeros(self.n_freq)
-        Z_imag = np.zeros(self.n_freq)
-        
-        for A, tau0, sigma in peaks:
-            for i in range(self.n_freq):
-                # Интегрируем по времени для каждого пика
-                tau_range = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), 100)
-                for tau in tau_range:
-                    peak_val = self.peak_function(tau, A, tau0, sigma)
-                    denom = 1 + (self.omega[i] * tau)**2
-                    Z_real[i] += peak_val / denom
-                    Z_imag[i] += -self.omega[i] * tau * peak_val / denom
-        
-        return Z_real, Z_imag
-    
-    def fitness(self, peaks):
-        """Функция приспособленности"""
-        Z_real_pred, Z_imag_pred = self.compute_impedance(peaks)
-        error = np.sum((self.Z_real - Z_real_pred)**2 + (self.Z_imag - Z_imag_pred)**2)
-        complexity = len(peaks)
-        return error + 0.01 * complexity
-    
-    def fit(self, n_peaks=3, n_generations=50, population_size=20):
-        """Генетический алгоритм для поиска оптимальных пиков"""
-        np.random.seed(42)
-        
-        # Инициализация популяции
-        population = []
-        for _ in range(population_size):
-            peaks = []
-            for _ in range(n_peaks):
-                A = np.random.uniform(0.1, 10)
-                tau0 = np.random.uniform(self.tau_min, self.tau_max)
-                sigma = np.random.uniform(0.1, 1.0)
-                peaks.append((A, tau0, sigma))
-            population.append(peaks)
-        
-        # Эволюция
-        for generation in range(n_generations):
-            fitness_scores = [self.fitness(peaks) for peaks in population]
-            sorted_idx = np.argsort(fitness_scores)
-            population = [population[i] for i in sorted_idx[:population_size//2]]
-            
-            # Кроссинговер и мутация
-            new_population = []
-            while len(new_population) < population_size:
-                parent1 = population[np.random.randint(len(population))]
-                parent2 = population[np.random.randint(len(population))]
-                
-                # Кроссинговер
-                child = []
-                for p1, p2 in zip(parent1, parent2):
-                    if np.random.random() > 0.5:
-                        child.append(p1)
-                    else:
-                        child.append(p2)
-                
-                # Мутация
-                for i in range(len(child)):
-                    if np.random.random() < 0.2:
-                        A, tau0, sigma = child[i]
-                        A *= np.random.uniform(0.8, 1.2)
-                        tau0 *= np.random.uniform(0.9, 1.1)
-                        sigma *= np.random.uniform(0.8, 1.2)
-                        child[i] = (max(0.01, A), max(self.tau_min, min(self.tau_max, tau0)), max(0.05, min(2.0, sigma)))
-                
-                new_population.append(child)
-            
-            population = new_population
-        
-        # Лучшее решение
-        best_peaks = population[np.argmin([self.fitness(p) for p in population])]
-        
-        # Вычисление DRT функции для визуализации
-        tau_range = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), 200)
-        gamma = np.zeros_like(tau_range)
-        for A, tau0, sigma in best_peaks:
-            gamma += self.peak_function(tau_range, A, tau0, sigma)
-        
-        return gamma, tau_range, best_peaks
-
-
-# ============================================================================
-# 7. Постобработка - выделение пиков
-# ============================================================================
-
-def extract_peaks(gamma, tau, prominence=0.05):
-    """Выделение пиков в DRT спектре"""
-    # Нормализация
-    gamma_norm = gamma / (np.max(gamma) + 1e-10)
-    
-    # Поиск локальных максимумов
-    from scipy.signal import find_peaks
-    peaks_idx, properties = find_peaks(gamma_norm, prominence=prominence, height=0.05)
-    
-    if len(peaks_idx) == 0:
-        return [], [], []
-    
-    peaks_tau = tau[peaks_idx]
-    peaks_height = gamma[peaks_idx]
-    
-    # Расчет площади под пиками (приближенный)
-    peaks_area = []
-    for idx in peaks_idx:
-        # Находим границы пика
-        left = idx
-        right = idx
-        while left > 0 and gamma[left] > gamma[left-1] * 0.5:
-            left -= 1
-        while right < len(gamma)-1 and gamma[right] > gamma[right+1] * 0.5:
-            right += 1
-        
-        # Численное интегрирование
-        area = np.trapz(gamma[left:right+1], tau[left:right+1])
-        peaks_area.append(area)
-    
-    return peaks_tau, peaks_height, peaks_area
-
-
-# ============================================================================
-# 8. Визуализация
-# ============================================================================
-
-def plot_results(freq, Z_real, Z_imag, gamma, tau, 
-                 Z_rec_real=None, Z_rec_imag=None,
-                 peaks_tau=None, peaks_height=None,
-                 confidence_lower=None, confidence_upper=None):
-    """Создание комплексного графика результатов"""
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # Nyquist plot
-    ax = axes[0, 0]
-    ax.plot(Z_real, -Z_imag, 'bo-', markersize=4, label='Эксперимент')
-    if Z_rec_real is not None and Z_rec_imag is not None:
-        ax.plot(Z_rec_real, -Z_rec_imag, 'r--', linewidth=2, label='Реконструкция')
-    ax.set_xlabel("Z' (Ом)")
-    ax.set_ylabel("-Z'' (Ом)")
-    ax.set_title("Nyquist plot")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect('equal', adjustable='box')
-    
-    # DRT plot
-    ax = axes[0, 1]
-    ax.semilogx(tau, gamma, 'b-', linewidth=2, label='DRT')
-    
-    if confidence_lower is not None and confidence_upper is not None:
-        ax.fill_between(tau, confidence_lower, confidence_upper, alpha=0.3, color='b', label='95% CI')
-    
-    if peaks_tau is not None and len(peaks_tau) > 0:
-        ax.scatter(peaks_tau, peaks_height, color='red', s=50, zorder=5, label='Пики')
-        for t, h in zip(peaks_tau, peaks_height):
-            ax.axvline(t, color='red', linestyle='--', alpha=0.5)
-    
-    ax.set_xlabel("τ (с)")
-    ax.set_ylabel("γ(τ)")
-    ax.set_title("Distribution of Relaxation Times")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # Bode plot - magnitude
-    ax = axes[1, 0]
-    Z_mag = np.sqrt(Z_real**2 + Z_imag**2)
-    ax.loglog(freq, Z_mag, 'bo-', markersize=4, label='Эксперимент')
-    if Z_rec_real is not None and Z_rec_imag is not None:
-        Z_rec_mag = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
-        ax.loglog(freq, Z_rec_mag, 'r--', linewidth=2, label='Реконструкция')
-    ax.set_xlabel("Частота (Гц)")
-    ax.set_ylabel("|Z| (Ом)")
-    ax.set_title("Bode plot - Magnitude")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # Phase plot
-    ax = axes[1, 1]
-    phase = -np.arctan2(Z_imag, Z_real) * 180 / np.pi
-    ax.semilogx(freq, phase, 'bo-', markersize=4, label='Эксперимент')
-    if Z_rec_real is not None and Z_rec_imag is not None:
-        phase_rec = -np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
-        ax.semilogx(freq, phase_rec, 'r--', linewidth=2, label='Реконструкция')
-    ax.set_xlabel("Частота (Гц)")
-    ax.set_ylabel("Фаза (градусы)")
-    ax.set_title("Bode plot - Phase")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================================
-# 9. Основной интерфейс Streamlit
-# ============================================================================
-
-def main():
-    # Боковая панель для загрузки и параметров
-    with st.sidebar:
-        st.header("📁 Загрузка данных")
-        uploaded_file = st.file_uploader(
-            "Выберите файл с импеданс-спектром",
-            type=['txt', 'csv', 'dat', 'z']
+        # Создаем временные данные
+        temp_data = EISData(
+            freq=data.freq,
+            z_real=z_real_noisy,
+            z_imag=z_imag_noisy,
+            R_inf=data.R_inf,
+            R_pol=data.R_pol,
+            valid=True,
+            validation_error=0
         )
         
-        st.header("⚙️ Параметры инверсии")
+        # Решаем для зашумленных данных
+        try:
+            sol = tikhonov_drt(temp_data, lambda_reg=1e-4)
+            gamma_samples.append(sol.gamma)
+        except:
+            pass
+        
+        progress_bar.progress((i + 1) / n_samples)
+    
+    progress_bar.empty()
+    
+    if gamma_samples:
+        gamma_samples = np.array(gamma_samples)
+        gamma_mean = np.mean(gamma_samples, axis=0)
+        gamma_std = np.std(gamma_samples, axis=0)
+    else:
+        gamma_mean = base_solution.gamma
+        gamma_std = np.zeros_like(gamma_mean)
+    
+    # Нормировка
+    gamma_mean = gamma_mean / np.trapz(gamma_mean, base_solution.tau) * data.R_pol
+    gamma_std = gamma_std / np.trapz(gamma_std, base_solution.tau) * data.R_pol
+    
+    # Выделение пиков
+    peaks = detect_peaks(base_solution.tau, gamma_mean)
+    
+    return DRTSolution(
+        tau=base_solution.tau,
+        gamma=gamma_mean,
+        gamma_std=gamma_std,
+        method="Bayesian (Bootstrap)",
+        time=time.time() - start_time,
+        polarization_resistance=np.trapz(gamma_mean, base_solution.tau),
+        peaks=peaks,
+        reconstructed_impedance=base_solution.reconstructed_impedance
+    )
+
+# ============================================================================
+# Метод 3: Максимальная энтропия
+# ============================================================================
+def entropy_drt(data: EISData, lambda_reg: float = None) -> DRTSolution:
+    """
+    DRT через максимизацию энтропии
+    """
+    start_time = time.time()
+    
+    # Дискретизация
+    tau_min = 1 / (2 * np.pi * data.freq.max())
+    tau_max = 1 / (2 * np.pi * data.freq.min())
+    tau = np.logspace(np.log10(tau_min), np.log10(tau_max), 100)
+    
+    K_real, K_imag = build_kernel_matrix(data.freq, tau)
+    
+    # Целевой вектор
+    z_target = np.concatenate([
+        data.z_real - data.R_inf,
+        -data.z_imag
+    ])
+    K_total = np.vstack([K_real, K_imag])
+    
+    # Выбор параметра регуляризации
+    if lambda_reg is None:
+        lambda_reg = 1e-4
+    
+    def objective(gamma):
+        """Функция потерь с энтропийным штрафом"""
+        gamma = np.maximum(gamma, 1e-12)
+        residual = np.linalg.norm(K_total @ gamma - z_target)**2
+        entropy = -np.sum(gamma * np.log(gamma + 1e-12))
+        return residual - lambda_reg * entropy
+    
+    def jacobian(gamma):
+        """Градиент"""
+        gamma = np.maximum(gamma, 1e-12)
+        grad_residual = 2 * K_total.T @ (K_total @ gamma - z_target)
+        grad_entropy = -(np.log(gamma + 1e-12) + 1)
+        return grad_residual - lambda_reg * grad_entropy
+    
+    # Начальное приближение
+    gamma0 = np.ones(len(tau)) / len(tau)
+    
+    # Оптимизация
+    result = optimize.minimize(
+        objective,
+        gamma0,
+        method='L-BFGS-B',
+        jac=jacobian,
+        bounds=[(0, None)] * len(tau),
+        options={'maxiter': 500, 'disp': False}
+    )
+    
+    gamma = np.maximum(result.x, 0)
+    
+    # Нормировка
+    gamma = gamma / np.trapz(gamma, tau) * data.R_pol
+    
+    # Выделение пиков
+    peaks = detect_peaks(tau, gamma)
+    
+    # Восстановление импеданса
+    z_recon_real = data.R_inf + K_real @ gamma
+    z_recon_imag = -K_imag @ gamma
+    
+    return DRTSolution(
+        tau=tau,
+        gamma=gamma,
+        gamma_std=None,
+        method="Maximum Entropy",
+        time=time.time() - start_time,
+        polarization_resistance=np.trapz(gamma, tau),
+        peaks=peaks,
+        reconstructed_impedance=(z_recon_real, z_recon_imag)
+    )
+
+# ============================================================================
+# Метод 4: Гауссовские процессы (упрощенная версия)
+# ============================================================================
+def gp_drt(data: EISData) -> DRTSolution:
+    """
+    Упрощенный GP-DRT
+    Использует гауссовскую регрессию для сглаживания
+    """
+    start_time = time.time()
+    
+    # Базовая DRT
+    base_solution = tikhonov_drt(data, lambda_reg=1e-3)
+    
+    # Гауссовское сглаживание DRT
+    from scipy.ndimage import gaussian_filter1d
+    
+    gamma_smoothed = gaussian_filter1d(base_solution.gamma, sigma=2.0)
+    gamma_smoothed = np.maximum(gamma_smoothed, 0)
+    
+    # Нормировка
+    gamma_smoothed = gamma_smoothed / np.trapz(gamma_smoothed, base_solution.tau) * data.R_pol
+    
+    # Стандартное отклонение на основе невязок
+    residuals = base_solution.gamma - gamma_smoothed
+    gamma_std = np.std(residuals) * np.ones_like(gamma_smoothed)
+    
+    # Выделение пиков
+    peaks = detect_peaks(base_solution.tau, gamma_smoothed)
+    
+    return DRTSolution(
+        tau=base_solution.tau,
+        gamma=gamma_smoothed,
+        gamma_std=gamma_std,
+        method="Gaussian Process",
+        time=time.time() - start_time,
+        polarization_resistance=np.trapz(gamma_smoothed, base_solution.tau),
+        peaks=peaks,
+        reconstructed_impedance=base_solution.reconstructed_impedance
+    )
+
+# ============================================================================
+# Метод 5: ISGP (генетическое программирование) - упрощенная версия
+# ============================================================================
+def isgp_drt(data: EISData, n_peaks: int = 3) -> DRTSolution:
+    """
+    ISGP - поиск оптимальной суммы пиковых функций
+    Упрощенная реализация через генетический алгоритм
+    """
+    start_time = time.time()
+    
+    tau_min = 1 / (2 * np.pi * data.freq.max())
+    tau_max = 1 / (2 * np.pi * data.freq.min())
+    tau = np.logspace(np.log10(tau_min), np.log10(tau_max), 100)
+    
+    K_real, K_imag = build_kernel_matrix(data.freq, tau)
+    
+    def peak_function(tau, center, width, height):
+        """Гауссов пик"""
+        return height * np.exp(-((np.log(tau) - center)**2) / (2 * width**2))
+    
+    def build_gamma(params, tau):
+        """Построение DRT из параметров пиков"""
+        gamma = np.zeros_like(tau)
+        for i in range(n_peaks):
+            center = params[3*i]
+            width = params[3*i + 1]
+            height = params[3*i + 2]
+            gamma += peak_function(tau, center, width, height)
+        return gamma
+    
+    def fitness(params):
+        """Функция приспособленности"""
+        gamma = build_gamma(params, tau)
+        if np.sum(gamma) <= 0:
+            return 1e10
+        
+        # Нормировка
+        gamma = gamma / np.trapz(gamma, tau) * data.R_pol
+        
+        # Восстановление импеданса
+        z_recon_real = data.R_inf + K_real @ gamma
+        z_recon_imag = -K_imag @ gamma
+        
+        # Ошибка
+        error_real = np.mean(((z_recon_real - data.z_real) / (np.abs(data.z_real) + 1e-10))**2)
+        error_imag = np.mean(((z_recon_imag - data.z_imag) / (np.abs(data.z_imag) + 1e-10))**2)
+        
+        return error_real + error_imag
+    
+    # Генетический алгоритм
+    pop_size = 50
+    n_generations = 100
+    
+    # Инициализация популяции
+    population = []
+    for _ in range(pop_size):
+        params = []
+        for i in range(n_peaks):
+            center = np.random.uniform(np.log(tau_min), np.log(tau_max))
+            width = np.random.uniform(0.5, 2.0)
+            height = np.random.uniform(0, 1)
+            params.extend([center, width, height])
+        population.append(np.array(params))
+    
+    progress_bar = st.progress(0)
+    
+    for gen in range(n_generations):
+        # Оценка приспособленности
+        fitness_scores = [fitness(p) for p in population]
+        
+        # Сортировка
+        sorted_idx = np.argsort(fitness_scores)
+        population = [population[i] for i in sorted_idx]
+        
+        # Сохраняем лучших
+        best = population[0]
+        
+        # Создание нового поколения
+        new_population = [best]
+        while len(new_population) < pop_size:
+            # Турнирный отбор
+            idx1 = np.random.randint(min(20, len(population)))
+            idx2 = np.random.randint(min(20, len(population)))
+            parent1 = population[idx1]
+            parent2 = population[idx2]
+            
+            # Кроссовер
+            crossover_point = np.random.randint(1, len(parent1))
+            child = np.concatenate([parent1[:crossover_point], parent2[crossover_point:]])
+            
+            # Мутация
+            if np.random.random() < 0.1:
+                mutation_idx = np.random.randint(len(child))
+                child[mutation_idx] += np.random.normal(0, 0.1)
+            
+            new_population.append(child)
+        
+        population = new_population
+        progress_bar.progress((gen + 1) / n_generations)
+    
+    progress_bar.empty()
+    
+    # Лучшее решение
+    best_params = population[0]
+    gamma = build_gamma(best_params, tau)
+    gamma = gamma / np.trapz(gamma, tau) * data.R_pol
+    
+    # Выделение пиков
+    peaks = detect_peaks(tau, gamma)
+    
+    # Восстановление импеданса
+    z_recon_real = data.R_inf + K_real @ gamma
+    z_recon_imag = -K_imag @ gamma
+    
+    return DRTSolution(
+        tau=tau,
+        gamma=gamma,
+        gamma_std=None,
+        method="ISGP (Evolutionary)",
+        time=time.time() - start_time,
+        polarization_resistance=np.trapz(gamma, tau),
+        peaks=peaks,
+        reconstructed_impedance=(z_recon_real, z_recon_imag)
+    )
+
+# ============================================================================
+# Выделение пиков
+# ============================================================================
+def detect_peaks(tau: np.ndarray, gamma: np.ndarray, prominence: float = 0.05) -> List[Dict]:
+    """
+    Выделение пиков на DRT кривой
+    """
+    from scipy.signal import find_peaks
+    
+    # Нормировка для поиска
+    gamma_norm = gamma / np.max(gamma)
+    
+    # Поиск пиков
+    peaks_idx, properties = find_peaks(
+        gamma_norm,
+        height=prominence,
+        prominence=prominence,
+        width=1
+    )
+    
+    peaks = []
+    for idx in peaks_idx:
+        # Подгонка гауссианы
+        try:
+            x_fit = np.log(tau[max(0, idx-5):min(len(tau), idx+6)])
+            y_fit = gamma[max(0, idx-5):min(len(tau), idx+6)]
+            
+            def gaussian(x, a, mu, sigma):
+                return a * np.exp(-((x - mu)**2) / (2 * sigma**2))
+            
+            popt, _ = optimize.curve_fit(
+                gaussian, x_fit, y_fit,
+                p0=[y_fit.max(), x_fit[len(x_fit)//2], 0.5],
+                bounds=([0, -np.inf, 0.1], [np.inf, np.inf, 2.0])
+            )
+            
+            peaks.append({
+                'tau': tau[idx],
+                'frequency': 1 / (2 * np.pi * tau[idx]),
+                'resistance': np.trapz(gamma, tau) * 0.2,  # приблизительная оценка
+                'width': popt[2],
+                'height': popt[0]
+            })
+        except:
+            peaks.append({
+                'tau': tau[idx],
+                'frequency': 1 / (2 * np.pi * tau[idx]),
+                'resistance': np.trapz(gamma, tau) * 0.1,
+                'width': 0.5,
+                'height': gamma[idx]
+            })
+    
+    return peaks
+
+# ============================================================================
+# Визуализация
+# ============================================================================
+def plot_nyquist(data: EISData, solution: DRTSolution = None):
+    """Nyquist plot"""
+    fig = go.Figure()
+    
+    # Экспериментальные данные
+    fig.add_trace(go.Scatter(
+        x=data.z_real,
+        y=-data.z_imag,
+        mode='lines+markers',
+        name='Experimental',
+        line=dict(color='blue', width=2),
+        marker=dict(size=4)
+    ))
+    
+    if solution and solution.reconstructed_impedance:
+        z_recon_real, z_recon_imag = solution.reconstructed_impedance
+        fig.add_trace(go.Scatter(
+            x=z_recon_real,
+            y=-z_recon_imag,
+            mode='lines',
+            name=f'Reconstructed ({solution.method})',
+            line=dict(color='red', width=2, dash='dash')
+        ))
+    
+    fig.update_layout(
+        title="Nyquist Plot",
+        xaxis_title="Z' (Ω)",
+        yaxis_title="-Z'' (Ω)",
+        width=600,
+        height=500,
+        template="plotly_white"
+    )
+    
+    return fig
+
+def plot_drt(solution: DRTSolution):
+    """DRT plot"""
+    fig = go.Figure()
+    
+    # Основная кривая
+    fig.add_trace(go.Scatter(
+        x=solution.tau,
+        y=solution.gamma,
+        mode='lines',
+        name=solution.method,
+        line=dict(color='blue', width=2)
+    ))
+    
+    # Доверительный интервал (если есть)
+    if solution.gamma_std is not None:
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([solution.tau, solution.tau[::-1]]),
+            y=np.concatenate([solution.gamma + 2*solution.gamma_std, 
+                              (solution.gamma - 2*solution.gamma_std)[::-1]]),
+            fill='toself',
+            fillcolor='rgba(0,100,200,0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            name='95% CI'
+        ))
+    
+    # Пики
+    for i, peak in enumerate(solution.peaks):
+        fig.add_trace(go.Scatter(
+            x=[peak['tau']],
+            y=[peak['height']],
+            mode='markers',
+            marker=dict(size=10, symbol='triangle-up', color='red'),
+            name=f"Peak {i+1}: τ={peak['tau']:.2e}s",
+            hovertemplate=f"τ = {peak['tau']:.2e} s<br>f = {peak['frequency']:.2e} Hz<br>R ≈ {peak['resistance']:.3f} Ω"
+        ))
+    
+    fig.update_layout(
+        title="Distribution of Relaxation Times",
+        xaxis_title="τ (s)",
+        yaxis_title="γ(τ) (Ω)",
+        xaxis_type="log",
+        width=700,
+        height=500,
+        template="plotly_white"
+    )
+    
+    return fig
+
+def plot_bode(data: EISData, solution: DRTSolution = None):
+    """Bode plot"""
+    fig = sp.make_subplots(rows=2, cols=1, shared_xaxes=True)
+    
+    # Модуль импеданса
+    z_mod = np.sqrt(data.z_real**2 + data.z_imag**2)
+    fig.add_trace(go.Scatter(
+        x=data.freq,
+        y=z_mod,
+        mode='lines+markers',
+        name='|Z| exp',
+        line=dict(color='blue')
+    ), row=1, col=1)
+    
+    if solution and solution.reconstructed_impedance:
+        z_recon_real, z_recon_imag = solution.reconstructed_impedance
+        z_recon_mod = np.sqrt(z_recon_real**2 + z_recon_imag**2)
+        fig.add_trace(go.Scatter(
+            x=data.freq,
+            y=z_recon_mod,
+            mode='lines',
+            name=f'|Z| recon',
+            line=dict(color='red', dash='dash')
+        ), row=1, col=1)
+    
+    # Фаза
+    phase = np.degrees(np.arctan2(data.z_imag, data.z_real))
+    fig.add_trace(go.Scatter(
+        x=data.freq,
+        y=phase,
+        mode='lines+markers',
+        name='Phase exp',
+        line=dict(color='blue')
+    ), row=2, col=1)
+    
+    if solution and solution.reconstructed_impedance:
+        z_recon_real, z_recon_imag = solution.reconstructed_impedance
+        phase_recon = np.degrees(np.arctan2(z_recon_imag, z_recon_real))
+        fig.add_trace(go.Scatter(
+            x=data.freq,
+            y=phase_recon,
+            mode='lines',
+            name='Phase recon',
+            line=dict(color='red', dash='dash')
+        ), row=2, col=1)
+    
+    fig.update_xaxis(title="Frequency (Hz)", type="log", row=2, col=1)
+    fig.update_yaxis(title="|Z| (Ω)", type="log", row=1, col=1)
+    fig.update_yaxis(title="Phase (deg)", row=2, col=1)
+    fig.update_layout(height=600, template="plotly_white")
+    
+    return fig
+
+def plot_residuals(data: EISData, solution: DRTSolution):
+    """График невязок"""
+    if not solution.reconstructed_impedance:
+        return None
+    
+    z_recon_real, z_recon_imag = solution.reconstructed_impedance
+    
+    # Относительные невязки
+    z_mod = np.sqrt(data.z_real**2 + data.z_imag**2)
+    delta_real = (data.z_real - z_recon_real) / (z_mod + 1e-10) * 100
+    delta_imag = (data.z_imag - z_recon_imag) / (z_mod + 1e-10) * 100
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=data.freq,
+        y=delta_real,
+        mode='lines+markers',
+        name='Δ Z\'',
+        line=dict(color='blue')
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=data.freq,
+        y=delta_imag,
+        mode='lines+markers',
+        name='Δ Z\'\'',
+        line=dict(color='red')
+    ))
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.add_hrect(y=-2, y1=2, fillcolor="green", opacity=0.1, line_width=0, annotation_text="±2%")
+    
+    fig.update_layout(
+        title="Relative Residuals",
+        xaxis_title="Frequency (Hz)",
+        yaxis_title="Residual (%)",
+        xaxis_type="log",
+        width=700,
+        height=400,
+        template="plotly_white"
+    )
+    
+    return fig
+
+# ============================================================================
+# Основное приложение Streamlit
+# ============================================================================
+def main():
+    # Боковая панель
+    with st.sidebar:
+        st.header("📁 Загрузка данных")
+        
+        uploaded_file = st.file_uploader(
+            "Выберите файл с EIS данными",
+            type=['txt', 'csv', 'xlsx', 'xls'],
+            help="Файл должен содержать колонки: частота (Гц), Z', Z''"
+        )
+        
+        # Текстовый виджет для ввода данных
+        st.markdown("---")
+        st.markdown("или вставьте данные:")
+        text_input = st.text_area(
+            "Вставьте текст с данными",
+            height=150,
+            placeholder="freq (Hz)\tZ'\tZ''\n10\t1.2\t-0.5\n100\t1.1\t-0.8\n..."
+        )
+        
+        st.markdown("---")
+        st.header("⚙️ Параметры анализа")
         
         method = st.selectbox(
             "Метод инверсии",
-            ["Тихоновская регуляризация", "Байесовский метод", 
-             "Максимальная энтропия", "Гауссовские процессы", "ISGP (генетический)"]
+            ["Tikhonov", "Bayesian", "Maximum Entropy", "Gaussian Process", "ISGP"],
+            help="""
+            - Tikhonov: классический метод, быстрый
+            - Bayesian: дает доверительные интервалы
+            - Maximum Entropy: подавляет ложные пики
+            - Gaussian Process: вероятностная оценка
+            - ISGP: эволюционный поиск оптимальной формы
+            """
         )
         
-        n_tau = st.slider("Количество точек по времени", 100, 500, 200)
-        
-        auto_lambda = st.checkbox("Автоматический выбор λ (для Tikhonov)", value=True)
-        if not auto_lambda and method == "Тихоновская регуляризация":
-            lambda_manual = st.number_input("λ (регуляризация)", value=1e-6, format="%.1e")
+        if method == "Tikhonov":
+            lambda_manual = st.checkbox("Ручной выбор λ")
+            if lambda_manual:
+                lambda_reg = st.slider(
+                    "λ (параметр регуляризации)",
+                    min_value=1e-8, max_value=1e-2, value=1e-4, format="%.1e"
+                )
+            else:
+                lambda_reg = None
         else:
-            lambda_manual = None
+            lambda_reg = None
         
-        st.header("🔍 Постобработка")
-        peak_prominence = st.slider("Чувствительность выделения пиков", 0.01, 0.2, 0.05)
+        if method == "Bayesian":
+            n_samples = st.slider(
+                "Количество bootstrap-выборок",
+                min_value=10, max_value=500, value=100, step=10
+            )
+        else:
+            n_samples = 100
         
-        run_button = st.button("🚀 Выполнить анализ", type="primary")
+        st.markdown("---")
+        st.header("📊 Параметры визуализации")
+        
+        show_confidence = st.checkbox("Показывать доверительный интервал", value=True)
+        show_peaks = st.checkbox("Показывать выделенные пики", value=True)
+        
+        st.markdown("---")
+        st.info("""
+        **Формат данных:**
+        - Колонка 1: частота (Гц)
+        - Колонка 2: действительная часть Z' (Ω)
+        - Колонка 3: мнимая часть Z'' (Ω)
+        """)
     
     # Основная область
-    if uploaded_file is not None:
+    if uploaded_file is not None or text_input:
         # Загрузка данных
-        freq, Z_real, Z_imag, df = load_data(uploaded_file)
+        if uploaded_file is not None:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file, sep=None, engine='python')
+            elif uploaded_file.name.endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(uploaded_file)
+            else:
+                df = pd.read_csv(uploaded_file, sep='\t', engine='python')
+        else:
+            # Чтение из текстового поля
+            lines = text_input.strip().split('\n')
+            data_rows = []
+            for line in lines:
+                if line.strip() and not line.startswith('#') and not line.startswith('freq'):
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        try:
+                            data_rows.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                        except:
+                            pass
+            if data_rows:
+                df = pd.DataFrame(data_rows, columns=['freq', 'Z\'', 'Z\'\''])
+            else:
+                st.error("Не удалось прочитать данные из текстового поля")
+                return
         
-        if freq is not None:
-            st.success(f"Загружено {len(freq)} точек спектра")
-            
-            # Показ таблицы
-            with st.expander("📊 Показать загруженные данные"):
-                st.dataframe(df.head(10))
-            
-            # Kramers-Kronig тест
-            with st.spinner("Проверка качества данных..."):
-                kk_valid, residuals, max_res = validate_kramers_kronig(freq, Z_real, Z_imag)
+        # Предобработка
+        with st.spinner("Обработка данных..."):
+            eis_data = preprocess_eis_data(df)
+        
+        # Отображение информации о данных
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Количество точек", len(eis_data.freq))
+        with col2:
+            st.metric("Частотный диапазон", f"{eis_data.freq.min():.2e} - {eis_data.freq.max():.2e} Hz")
+        with col3:
+            st.metric("R_inf (Ω)", f"{eis_data.R_inf:.4f}")
+        with col4:
+            st.metric("R_pol (Ω)", f"{eis_data.R_pol:.4f}")
+        
+        # Статус валидации KK
+        if eis_data.valid:
+            st.success(f"✅ Kramers-Kronig тест пройден (ошибка: {eis_data.validation_error:.2f}%)")
+        else:
+            st.warning(f"⚠️ Kramers-Kronig тест не пройден (ошибка: {eis_data.validation_error:.2f}%). Результаты могут быть неточными.")
+        
+        # Выполнение DRT анализа
+        st.markdown("---")
+        st.header("📈 DRT Анализ")
+        
+        with st.spinner(f"Выполняется инверсия методом {method}..."):
+            if method == "Tikhonov":
+                solution = tikhonov_drt(eis_data, lambda_reg=lambda_reg)
+            elif method == "Bayesian":
+                solution = bayesian_drt(eis_data, n_samples=n_samples)
+            elif method == "Maximum Entropy":
+                solution = entropy_drt(eis_data, lambda_reg=lambda_reg)
+            elif method == "Gaussian Process":
+                solution = gp_drt(eis_data)
+            else:  # ISGP
+                solution = isgp_drt(eis_data)
+        
+        # Информация о вычислениях
+        st.info(f"⏱️ Время вычислений: {solution.time:.2f} сек | Поляризационное сопротивление: {solution.polarization_resistance:.4f} Ω")
+        
+        # Визуализация
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Nyquist Plot", "DRT", "Bode Plot", "Residuals", "Результаты пиков"])
+        
+        with tab1:
+            fig_nyquist = plot_nyquist(eis_data, solution)
+            st.plotly_chart(fig_nyquist, use_container_width=True)
+        
+        with tab2:
+            fig_drt = plot_drt(solution)
+            st.plotly_chart(fig_drt, use_container_width=True)
+        
+        with tab3:
+            fig_bode = plot_bode(eis_data, solution)
+            st.plotly_chart(fig_bode, use_container_width=True)
+        
+        with tab4:
+            fig_residuals = plot_residuals(eis_data, solution)
+            if fig_residuals:
+                st.plotly_chart(fig_residuals, use_container_width=True)
+            else:
+                st.info("Нет данных для отображения невязок")
+        
+        with tab5:
+            if solution.peaks:
+                st.subheader("Выделенные пики релаксации")
+                peaks_df = pd.DataFrame(solution.peaks)
+                peaks_df.columns = ['τ (s)', 'f (Hz)', 'R (Ω)', 'Width', 'Height']
+                peaks_df['τ (s)'] = peaks_df['τ (s)'].apply(lambda x: f"{x:.3e}")
+                peaks_df['f (Hz)'] = peaks_df['f (Hz)'].apply(lambda x: f"{x:.3e}")
+                peaks_df['R (Ω)'] = peaks_df['R (Ω)'].apply(lambda x: f"{x:.4f}")
+                peaks_df['Width'] = peaks_df['Width'].apply(lambda x: f"{x:.3f}")
+                peaks_df['Height'] = peaks_df['Height'].apply(lambda x: f"{x:.4f}")
+                st.dataframe(peaks_df, use_container_width=True)
                 
-                if kk_valid:
-                    st.success(f"✅ Kramers-Kronig тест пройден (макс. невязка: {max_res:.3%})")
-                else:
-                    st.warning(f"⚠️ Kramers-Kronig тест не пройден (макс. невязка: {max_res:.3%})")
-            
-            if run_button:
-                # Выполнение инверсии
-                with st.spinner(f"Выполняется инверсия методом {method}..."):
-                    
-                    if method == "Тихоновская регуляризация":
-                        drt = TikhonovDRT(freq, Z_real, Z_imag, n_tau=n_tau)
-                        gamma, lambda_opt, residuals, Z_rec_real, Z_rec_imag = drt.fit(
-                            lambda_reg=lambda_manual if not auto_lambda else None
-                        )
-                        confidence_lower = None
-                        confidence_upper = None
-                        st.info(f"Оптимальный λ: {lambda_opt:.2e}")
-                    
-                    elif method == "Байесовский метод":
-                        drt = BayesianDRT(freq, Z_real, Z_imag, n_tau=n_tau)
-                        gamma, lower, upper, samples = drt.compute_posterior(lambda_reg=1e-5, n_samples=50)
-                        confidence_lower = lower
-                        confidence_upper = upper
-                        Z_rec_real = None
-                        Z_rec_imag = None
-                    
-                    elif method == "Максимальная энтропия":
-                        drt = MaxEntropyDRT(freq, Z_real, Z_imag, n_tau=n_tau)
-                        gamma, Z_rec_real, Z_rec_imag = drt.fit(lambda_reg=1e-4)
-                        confidence_lower = None
-                        confidence_upper = None
-                    
-                    elif method == "Гауссовские процессы":
-                        drt = GaussianProcessDRT(freq, Z_real, Z_imag, n_tau=n_tau)
-                        gamma, lower, upper = drt.fit()
-                        confidence_lower = lower
-                        confidence_upper = upper
-                        Z_rec_real = None
-                        Z_rec_imag = None
-                    
-                    elif method == "ISGP (генетический)":
-                        drt = ISGPDRT(freq, Z_real, Z_imag)
-                        gamma, tau_range, peaks = drt.fit(n_peaks=3, n_generations=30)
-                        # Для ISGP используем tau_range
-                        tau = tau_range
-                        Z_rec_real = None
-                        Z_rec_imag = None
-                        confidence_lower = None
-                        confidence_upper = None
-                        st.info(f"Найдено {len(peaks)} пиков")
-                
-                # Постобработка - выделение пиков
-                if method == "ISGP (генетический)":
-                    peaks_tau, peaks_height, peaks_area = extract_peaks(gamma, tau, peak_prominence)
-                else:
-                    peaks_tau, peaks_height, peaks_area = extract_peaks(gamma, drt.tau, peak_prominence)
-                
-                # Визуализация
-                if method == "Тихоновская регуляризация" or method == "Максимальная энтропия":
-                    fig = plot_results(
-                        freq, Z_real, Z_imag, gamma, drt.tau if method != "ISGP" else tau,
-                        Z_rec_real, Z_rec_imag,
-                        peaks_tau, peaks_height,
-                        confidence_lower, confidence_upper
-                    )
-                else:
-                    fig = plot_results(
-                        freq, Z_real, Z_imag, gamma, drt.tau if method != "ISGP" else tau,
-                        None, None,
-                        peaks_tau, peaks_height,
-                        confidence_lower, confidence_upper
-                    )
-                
-                st.pyplot(fig)
-                
-                # Таблица с результатами
-                if len(peaks_tau) > 0:
-                    st.subheader("📈 Выделенные пики (электрохимические процессы)")
-                    results_df = pd.DataFrame({
-                        "Время релаксации τ (с)": peaks_tau,
-                        "Частота f (Гц)": 1 / (2 * np.pi * peaks_tau),
-                        "Высота пика": peaks_height,
-                        "Площадь (сопротивление, Ом)": peaks_area
-                    })
-                    st.dataframe(results_df)
-                    
-                    st.info("""
-                    **Интерпретация пиков:**
-                    - **Малые τ** (высокие частоты) → быстрые процессы (зарядоперенос, ионная проводимость)
-                    - **Средние τ** → процессы на границах зерен, адсорбция
-                    - **Большие τ** (низкие частоты) → медленные процессы (диффузия, массоперенос)
+                st.markdown("### Интерпретация")
+                for i, peak in enumerate(solution.peaks):
+                    st.markdown(f"""
+                    **Процесс {i+1}:**
+                    - Время релаксации: {peak['tau']:.3e} с
+                    - Частота: {peak['frequency']:.3e} Гц
+                    - Вклад в поляризацию: ~{peak['resistance']/solution.polarization_resistance*100:.1f}%
                     """)
-                
-                # Экспорт результатов
-                st.subheader("💾 Экспорт результатов")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Экспорт DRT
-                    if method == "ISGP (генетический)":
-                        export_tau = tau
-                    else:
-                        export_tau = drt.tau
-                    
-                    export_df = pd.DataFrame({
-                        "tau (s)": export_tau,
-                        "gamma": gamma
-                    })
-                    csv = export_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Скачать DRT данные (CSV)",
-                        data=csv,
-                        file_name="drt_results.csv",
-                        mime="text/csv"
-                    )
-                
-                with col2:
-                    if len(peaks_tau) > 0:
-                        peaks_csv = results_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Скачать пики (CSV)",
-                            data=peaks_csv,
-                            file_name="peaks_results.csv",
-                            mime="text/csv"
-                        )
+            else:
+                st.info("Пики не обнаружены")
+        
+        # Экспорт результатов
+        st.markdown("---")
+        st.header("💾 Экспорт результатов")
+        
+        # Подготовка данных для экспорта
+        export_data = pd.DataFrame({
+            'tau (s)': solution.tau,
+            'gamma (Ω)': solution.gamma,
+            'log10(tau)': np.log10(solution.tau)
+        })
+        
+        if solution.gamma_std is not None:
+            export_data['gamma_std'] = solution.gamma_std
+        
+        csv = export_data.to_csv(index=False)
+        b64 = base64.b64encode(csv.encode()).decode()
+        href = f'<a href="data:file/csv;base64,{b64}" download="drt_results_{method}.csv">📥 Скачать DRT данные (CSV)</a>'
+        st.markdown(href, unsafe_allow_html=True)
+        
+        # Дополнительная информация
+        with st.expander("ℹ️ О методах анализа"):
+            st.markdown("""
+            ### Сравнение методов
+            
+            | Метод | Преимущества | Ограничения |
+            |-------|-------------|-------------|
+            | **Tikhonov** | Быстрый, стандартный, хорошо изучен | Требует выбора λ |
+            | **Bayesian** | Доверительные интервалы, устойчивость к шуму | Медленнее |
+            | **Maximum Entropy** | Подавляет ложные пики | Нелинейная оптимизация |
+            | **Gaussian Process** | Полная вероятностная оценка | Вычислительно сложный |
+            | **ISGP** | Не требует λ, аналитическая форма | Очень медленный |
+            
+            ### Рекомендации по выбору метода
+            - Для быстрого анализа: **Tikhonov**
+            - Для оценки неопределенности: **Bayesian**
+            - Для сложных спектров с артефактами: **Maximum Entropy**
+            - Для исследовательских целей: **Gaussian Process** или **ISGP**
+            """)
     
     else:
-        # Информация о формате файла
-        st.info("""
-                ### 📖 Инструкция
-                
-                **Формат входного файла:**
-                
-                Файл должен содержать 3 колонки:
-                1. Частота (Гц)
-                2. Действительная часть импеданса Z' (Ом)
-                3. Мнимая часть импеданса Z'' (Ом)
-                
-                Поддерживаются форматы: `.txt`, `.csv`, `.dat`
-                """)
+        # Пустое состояние
+        st.info("👈 Загрузите файл с EIS данными или вставьте данные в текстовое поле слева")
+        
+        st.markdown("""
+        ### Пример формата данных
+        freq (Hz) Z' (Ω) Z'' (Ω)
+        1e-2 1.2345 -0.1234
+        1e-1 1.2100 -0.2345
+        1e0 1.1800 -0.3456
+        1e1 1.1500 -0.4567
+        1e2 1.1200 -0.5678
+        1e3 1.0900 -0.6789
+        1e4 1.0600 -0.7890
+        1e5 1.0300 -0.8901
+        ### Поддерживаемые форматы файлов
+        - CSV (разделители: запятая, табуляция, пробел)
+        - Excel (.xlsx, .xls)
+        - Текстовые файлы (.txt)
+        """)
+        
+        if __name__ == "__main__":
+        main()
