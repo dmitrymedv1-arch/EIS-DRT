@@ -20,6 +20,13 @@ import io
 import warnings
 warnings.filterwarnings('ignore')
 
+import numpy as np
+from scipy.integrate import trapezoid
+
+# Переопределяем np.trapz если его нет (для обратной совместимости)
+if not hasattr(np, 'trapz'):
+    np.trapz = trapezoid
+
 # Настройка страницы
 st.set_page_config(
     page_title="DRT Analysis Tool",
