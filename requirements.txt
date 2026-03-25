@@ -1,11 +1,15 @@
-streamlit
-numpy
-pandas
-plotly
-scipy
-kaleido
-pymc
-arviz
-openpyxl
-xlrd
-statsmodels
+
+streamlit>=1.28.0
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+
+scikit-learn>=1.3.0  # для GCV, кросс-валидации
+plotly>=5.17.0       # для интерактивных графиков (опционально)
+
+pymc>=5.0.0          # для байесовского MCMC (требует компилятора)
+arviz>=0.16.0        # для визуализации байесовских результатов
+
+openpyxl>=3.1.0      # для Excel файлов
+xlrd>=2.0.0          # для старых Excel
