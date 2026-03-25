@@ -920,8 +920,14 @@ def main():
                 
                 # Дополнительный анализ пиков
                 st.subheader("Аппроксимация гауссианами")
-                n_peaks_fit = st.slider("Число пиков для аппроксимации:", 1, len(peak_results), len(peak_results))
-                fitted_gamma, fit_params = fit_gaussian_peaks(tau_grid, gamma, n_peaks_fit)
+                
+                if len(peak_results) > 1:
+                    n_peaks_fit = st.slider("Число пиков для аппроксимации:", 1, len(peak_results), len(peak_results))
+                    fitted_gamma, fit_params = fit_gaussian_peaks(tau_grid, gamma, n_peaks_fit)
+                else:
+                    st.info(f"Обнаружен {len(peak_results)} пик. Для аппроксимации гауссианами требуется минимум 2 пика.")
+                    fitted_gamma = gamma
+                    fit_params = []
                 
                 fig_fit = go.Figure()
                 fig_fit.add_trace(go.Scatter(x=tau_grid, y=gamma, mode='lines', name='Исходный DRT', line=dict(color='blue')))
