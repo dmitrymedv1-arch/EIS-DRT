@@ -102,27 +102,76 @@ def load_data(file, freq_col, re_col, im_col):
     return None, None, None
 
 def manual_data_entry():
-    """Create widget for manual data entry."""
+    """Create widget for manual data entry with single text area."""
     st.subheader("Ручной ввод данных")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        freq_input = st.text_area("Частота (Гц)", "0.1\n1.0\n10.0\n100.0\n1000.0\n10000.0", height=150)
-    with col2:
-        re_input = st.text_area("Re(Z) (Ω)", "10.0\n8.5\n6.2\n4.1\n2.5\n1.2", height=150)
-    with col3:
-        im_input = st.text_area("-Im(Z) (Ω)", "0.5\n1.2\n2.8\n3.5\n2.9\n1.8", height=150)
+    st.markdown("Введите данные в формате: **частота Re(Z) -Im(Z)** (разделитель - пробел или табуляция)")
     
-    if st.button("Загрузить данные"):
+    # Пример данных для отображения
+    example_data = """1000000	-71.55	-3745
+891300	-102.3	-4127
+794300	-62.24	-4664
+707900	88.34	-5240
+631000	317.9	-5944
+562300	763	-6676
+501200	1207	-7348
+446700	1843	-8127
+398100	2629	-8805
+354800	3557	-9427
+316200	4561	-9925
+281800	5561	-10370"""
+    
+    data_input = st.text_area(
+        "Введите данные (каждая строка: частота Re(Z) -Im(Z))",
+        value=example_data,
+        height=300,
+        help="Формат: частота (Гц) Re(Z) (Ом) -Im(Z) (Ом). Разделитель - пробел или табуляция"
+    )
+    
+    if st.button("Загрузить данные", type="primary"):
         try:
-            freq = np.array([float(x) for x in freq_input.strip().split('\n')])
-            re_z = np.array([float(x) for x in re_input.strip().split('\n')])
-            im_z = np.array([float(x) for x in im_input.strip().split('\n')])
-            if len(freq) == len(re_z) == len(im_z):
+            # Парсинг данных
+            rows = []
+            for line in data_input.strip().split('\n'):
+                # Пропускаем пустые строки
+                if not line.strip():
+                    continue
+                # Разделяем по пробелам или табуляции
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    try:
+                        freq_val = float(parts[0])
+                        re_val = float(parts[1])
+                        im_val = abs(float(parts[2]))  # Берем абсолютное значение для -Im(Z)
+                        rows.append([freq_val, re_val, im_val])
+                    except ValueError:
+                        st.warning(f"Пропущена некорректная строка: {line}")
+                        continue
+            
+            if len(rows) >= 3:
+                rows = np.array(rows)
+                freq = rows[:, 0]
+                re_z = rows[:, 1]
+                im_z = rows[:, 2]
+                
+                st.success(f"✅ Загружено {len(freq)} точек спектра")
+                
+                # Показываем预览 загруженных данных
+                with st.expander("Просмотр загруженных данных"):
+                    preview_df = pd.DataFrame({
+                        'Frequency (Hz)': freq,
+                        'Re(Z) (Ω)': re_z,
+                        '-Im(Z) (Ω)': im_z
+                    })
+                    st.dataframe(preview_df.head(10))
+                
                 return freq, re_z, im_z
             else:
-                st.error("Все столбцы должны иметь одинаковое количество точек")
-        except:
-            st.error("Неверный формат данных")
+                st.error(f"Недостаточно данных. Загружено только {len(rows)} строк. Минимум 3 строки.")
+                
+        except Exception as e:
+            st.error(f"Ошибка при загрузке данных: {e}")
+            st.info("Проверьте формат данных. Каждая строка должна содержать: частоту, Re(Z), -Im(Z)")
+    
     return None, None, None
 
 def kramers_kronig_test(freq, re_z, im_z):
