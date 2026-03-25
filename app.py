@@ -831,8 +831,9 @@ def main():
             peak_results = find_peaks_drt(tau_grid, gamma)
             
             # Реконструкция
-            Z_rec_real = drt.R_inf + gamma @ drt._build_kernel_matrix(tau_grid)[0]
-            Z_rec_imag = -gamma @ drt._build_kernel_matrix(tau_grid)[1]
+            K_real, K_imag = drt._build_kernel_matrix(tau_grid)
+            Z_rec_real = drt.R_inf + K_real @ gamma
+            Z_rec_imag = -K_imag @ gamma
             
         elif method == "Максимальная энтропия":
             status_text.text("Выполняется инверсия методом максимальной энтропии...")
@@ -842,8 +843,9 @@ def main():
             peak_results = find_peaks_drt(tau_grid, gamma)
             
             # Реконструкция
-            Z_rec_real = drt.R_inf + gamma @ drt._build_kernel_matrix(tau_grid)[0]
-            Z_rec_imag = -gamma @ drt._build_kernel_matrix(tau_grid)[1]
+            K_real, K_imag = drt._build_kernel_matrix(tau_grid)
+            Z_rec_real = drt.R_inf + K_real @ gamma
+            Z_rec_imag = -K_imag @ gamma
             
         elif method == "Гауссовские процессы":
             status_text.text("Выполняется GP-инверсия...")
@@ -852,8 +854,9 @@ def main():
             peak_results = find_peaks_drt(tau_grid, gamma)
             
             # Реконструкция
-            Z_rec_real = drt.R_inf + gamma @ drt._build_kernel_matrix(tau_grid)[0]
-            Z_rec_imag = -gamma @ drt._build_kernel_matrix(tau_grid)[1]
+            K_real, K_imag = drt._build_kernel_matrix(tau_grid)
+            Z_rec_real = drt.R_inf + K_real @ gamma
+            Z_rec_imag = -K_imag @ gamma
             
         else:  # Генетическое программирование
             status_text.text("Выполняется ISGP-инверсия (может занять несколько минут)...")
@@ -863,8 +866,9 @@ def main():
             peak_results = find_peaks_drt(tau_grid, gamma)
             
             # Реконструкция
-            Z_rec_real = drt.R_inf + gamma @ drt._build_kernel_matrix(tau_grid)[0]
-            Z_rec_imag = -gamma @ drt._build_kernel_matrix(tau_grid)[1]
+            K_real, K_imag = drt._build_kernel_matrix(tau_grid)
+            Z_rec_real = drt.R_inf + K_real @ gamma
+            Z_rec_imag = -K_imag @ gamma
         
         progress_bar.progress(100)
         status_text.text("Анализ завершен!")
