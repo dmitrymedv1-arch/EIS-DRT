@@ -3423,14 +3423,13 @@ def step4_results():
     with tab1:
         st.subheader("Gaussian Deconvolution Result")
         
-        # Исправленный график деконволюции
         fig, ax = plt.subplots(figsize=(12, 7))
         
         # Применяем логарифмическую шкалу если нужно
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        # Оригинальные данные
+        # Оригинальные данные - они уже в правильном масштабе (7 Ом)
         ax.scatter(deconv_result.x_linear, deconv_result.y_original, 
                    s=15, alpha=0.5, color='black', label='Original DRT Data', zorder=1)
         
@@ -3449,20 +3448,16 @@ def step4_results():
         if deconv_result.peaks:
             colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
             for peak, color in zip(deconv_result.peaks, colors):
-                # Восстанавливаем компоненту в оригинальном масштабе
-                # Используем оригинальную амплитуду peak.amplitude
+                # Используем оригинальную амплитуду peak.amplitude (уже в Омах)
                 y_component = peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 
-                    1.0,  # амплитуда = 1 для формы
+                    1.0,  # форма с амплитудой 1
                     peak.center_log, 
                     peak.sigma_log
                 )
                 
-                # Заполняем под гауссианом
                 ax.fill_between(x_dense, 0, y_component, 
                                 color=color, alpha=0.3, linewidth=0)
-                
-                # Рисуем линию
                 ax.plot(x_dense, y_component, '-', color=color, linewidth=2,
                        label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
         
@@ -3472,31 +3467,33 @@ def step4_results():
                 y_baseline = np.full_like(x_dense, deconv_result.baseline_params[0])
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
             elif deconv_result.baseline_method == 'linear':
-                y_baseline = (deconv_result.baseline_params[0] + 
-                             deconv_result.baseline_params[1] * x_dense_log) * max(deconv_result.y_original)
+                y_baseline = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
             elif deconv_result.baseline_method == 'quadratic':
                 y_baseline = (deconv_result.baseline_params[0] + 
                              deconv_result.baseline_params[1] * x_dense_log +
-                             deconv_result.baseline_params[2] * x_dense_log**2) * max(deconv_result.y_original)
+                             deconv_result.baseline_params[2] * x_dense_log**2)
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
-        # Рисуем общую сумму
-        if deconv_result.fit_y_norm is not None:
-            # Реконструируем общую сумму
-            n_peaks = len(deconv_result.peaks)
-            peak_params = []
+        # Рисуем общую сумму - используем сумму компонент
+        if deconv_result.peaks:
+            # Суммируем все компоненты
+            y_total = np.zeros_like(x_dense)
             for peak in deconv_result.peaks:
-                peak_params.extend([peak.amplitude_norm, peak.center_log, peak.sigma_log])
+                y_total += peak.amplitude * GaussianModelDeconv.gaussian(
+                    x_dense_log, 1.0, peak.center_log, peak.sigma_log
+                )
             
-            if deconv_result.baseline_method != 'none' and deconv_result.baseline_params:
-                # Для общей суммы используем оригинальные значения
-                y_total = GaussianModelDeconv.multi_gaussian_with_baseline(
-                    x_dense_log, n_peaks, peak_params, 
-                    deconv_result.baseline_params, deconv_result.baseline_method
-                ) * max(deconv_result.y_original) / max([p.amplitude_norm for p in deconv_result.peaks])
-            else:
-                y_total = GaussianModelDeconv.multi_gaussian(x_dense_log, *peak_params) * max(deconv_result.y_original) / max([p.amplitude_norm for p in deconv_result.peaks])
+            # Добавляем базовую линию если есть
+            if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+                if deconv_result.baseline_method == 'constant':
+                    y_total += deconv_result.baseline_params[0]
+                elif deconv_result.baseline_method == 'linear':
+                    y_total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
+                elif deconv_result.baseline_method == 'quadratic':
+                    y_total += (deconv_result.baseline_params[0] + 
+                               deconv_result.baseline_params[1] * x_dense_log +
+                               deconv_result.baseline_params[2] * x_dense_log**2)
             
             ax.plot(x_dense, y_total, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
         
@@ -3651,13 +3648,12 @@ def step4_results():
         
         colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
         for peak, color in zip(deconv_result.peaks, colors):
-            # Нормализованная компонента
+            # Нормализованная компонента (максимум = 1)
             y_component = GaussianModelDeconv.gaussian(
-                x_dense_log, peak.amplitude_norm, peak.center_log, peak.sigma_log
+                x_dense_log, 1.0, peak.center_log, peak.sigma_log
             )
-            y_component_norm = y_component * max(deconv_result.y_original) / max_amp
             
-            ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
+            ax.plot(x_dense, y_component, '-', color=color, linewidth=2,
                    label=f'Peak {peak.id} (center: {peak.center:.3e} s)')
             ax.axvline(x=peak.center, color=color, linestyle=':', alpha=0.5, linewidth=1)
         
@@ -3722,12 +3718,42 @@ def step4_results():
             
             st.markdown("**Export Fitting Data**")
             
-            # Create fitting data DataFrame
+            # Create fitting data DataFrame - используем оригинальные значения
+            # Реконструируем fit для каждой точки
+            fit_values = np.zeros_like(deconv_result.x_linear)
+            for i, tau in enumerate(deconv_result.x_linear):
+                if deconv_result.use_log_x:
+                    log_tau = np.log10(tau)
+                else:
+                    log_tau = tau
+                
+                # Суммируем все компоненты
+                total = 0
+                for peak in deconv_result.peaks:
+                    total += peak.amplitude * GaussianModelDeconv.gaussian(
+                        log_tau, 1.0, peak.center_log, peak.sigma_log
+                    )
+                
+                # Добавляем базовую линию
+                if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+                    if deconv_result.baseline_method == 'constant':
+                        total += deconv_result.baseline_params[0]
+                    elif deconv_result.baseline_method == 'linear':
+                        total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
+                    elif deconv_result.baseline_method == 'quadratic':
+                        total += (deconv_result.baseline_params[0] + 
+                                 deconv_result.baseline_params[1] * log_tau +
+                                 deconv_result.baseline_params[2] * log_tau**2)
+                
+                fit_values[i] = total
+            
+            residuals = deconv_result.y_original - fit_values
+            
             fit_data = pd.DataFrame({
                 'tau_s': deconv_result.x_linear,
                 'gamma_tau_Ohm': deconv_result.y_original,
-                'gamma_fit_Ohm': deconv_result.fit_y_norm * max(deconv_result.y_original) if deconv_result.fit_y_norm is not None else np.zeros_like(deconv_result.x_linear),
-                'Residuals_Ohm': deconv_result.quality_metrics.get('Residuals', np.zeros_like(deconv_result.x_linear)) * max(deconv_result.y_original) if deconv_result.quality_metrics else np.zeros_like(deconv_result.x_linear)
+                'gamma_fit_Ohm': fit_values,
+                'Residuals_Ohm': residuals
             })
             
             csv_fit = fit_data.to_csv(index=False)
