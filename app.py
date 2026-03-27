@@ -402,6 +402,8 @@ class AppState:
     drt_calculated: bool = False
     
     # Step 3: Gaussian deconvolution
+    deconvolver: Optional[Any] = None
+    derivatives: Optional[Tuple] = None
     deconv_result: Optional[DeconvolutionResult] = None
     peak_info: Optional[List[Dict]] = None
     initial_peak_params: Optional[List[float]] = None
