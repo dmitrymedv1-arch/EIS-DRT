@@ -2764,7 +2764,11 @@ def step1_data_loading():
                         if freq is not None:
                             st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
                             st.session_state.app_state.data_loaded = True
-                            st.session_state.selected_point_idx = 0  # Initialize selected point index
+                            # Initialize selection state
+                            if 'selected_point_idx' not in st.session_state:
+                                st.session_state.selected_point_idx = 0
+                            if 'freq_range_idx' not in st.session_state:
+                                st.session_state.freq_range_idx = (0, len(freq) - 1)
                             st.success(f"✅ Loaded {len(freq)} data points")
                             st.rerun()
                 except Exception as e:
@@ -2774,7 +2778,10 @@ def step1_data_loading():
             if freq is not None:
                 st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
                 st.session_state.app_state.data_loaded = True
-                st.session_state.selected_point_idx = 0  # Initialize selected point index
+                if 'selected_point_idx' not in st.session_state:
+                    st.session_state.selected_point_idx = 0
+                if 'freq_range_idx' not in st.session_state:
+                    st.session_state.freq_range_idx = (0, len(freq) - 1)
                 st.success(f"✅ Loaded {len(freq)} data points")
                 st.rerun()
     
@@ -2798,75 +2805,120 @@ def step1_data_loading():
         
         data = st.session_state.app_state.impedance_data
         
-        # Initialize session state for selected point if not exists
+        # Initialize session state variables if not exists
         if 'selected_point_idx' not in st.session_state:
             st.session_state.selected_point_idx = 0
+        if 'freq_range_idx' not in st.session_state:
+            st.session_state.freq_range_idx = (0, data.n_points - 1)
         
-        # Point selection slider - placed OUTSIDE the plot container
-        # This prevents replotting when slider changes
-        point_idx = st.slider(
-            "Select point to remove (index)",
-            min_value=0,
-            max_value=data.n_points - 1,
-            value=min(st.session_state.selected_point_idx, data.n_points - 1),
-            step=1,
-            key="point_selector_step1"
-        )
-        
-        # Update session state
-        st.session_state.selected_point_idx = point_idx
-        
-        # Create plots in a container - these will only update when rerun is triggered
-        plot_container = st.empty()
-        
-        with plot_container:
-            fig_nyquist = plot_nyquist_matplotlib(data, highlight_idx=point_idx)
-            fig_bode = plot_bode_matplotlib(data, highlight_idx=point_idx)
+        # Compact Data Preprocessing section
+        with st.container():
+            st.markdown("**✂️ Data Preprocessing**")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.pyplot(fig_nyquist)
-            with col2:
-                st.pyplot(fig_bode)
-            plt.close('all')
-        
-        st.markdown("---")
-        st.subheader("✂️ Data Preprocessing")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            f_min, f_max = st.slider(
-                "Frequency range (Hz)",
-                min_value=float(data.original_freq.min()),
-                max_value=float(data.original_freq.max()),
-                value=(float(data.original_freq.min()), float(data.original_freq.max())),
-                format="%.2e"
-            )
+            col_a, col_b, col_c = st.columns([2, 1.5, 1.5])
             
-            if st.button("📊 Apply Frequency Range", use_container_width=True):
-                data.apply_frequency_range(f_min, f_max)
-                st.session_state.selected_point_idx = 0  # Reset point index
-                st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
-                st.rerun()
-        
-        with col2:
-            if st.button("🗑️ Remove Selected Point", use_container_width=True):
+            with col_a:
+                # Frequency range by point indices
+                f_min_idx, f_max_idx = st.slider(
+                    "Frequency range (by point index)",
+                    min_value=0,
+                    max_value=data.n_points - 1,
+                    value=st.session_state.freq_range_idx,
+                    step=1,
+                    key="freq_range_slider"
+                )
+                
+                # Update session state
+                if (f_min_idx, f_max_idx) != st.session_state.freq_range_idx:
+                    st.session_state.freq_range_idx = (f_min_idx, f_max_idx)
+                
+                # Display actual frequency values
+                f_min_actual = data.freq[f_min_idx]
+                f_max_actual = data.freq[f_max_idx]
+                st.caption(f"Range: {f_min_actual:.2e} Hz - {f_max_actual:.2e} Hz")
+            
+            with col_b:
+                # Point selection for removal
+                point_idx = st.number_input(
+                    "Point index to remove",
+                    min_value=0,
+                    max_value=data.n_points - 1,
+                    value=min(st.session_state.selected_point_idx, data.n_points - 1),
+                    step=1,
+                    key="point_selector_step1"
+                )
+                st.session_state.selected_point_idx = point_idx
+                
+                # Display point info
                 if point_idx < data.n_points:
-                    data.remove_point(point_idx)
-                    # Reset point index to 0 if we removed the last point
-                    if point_idx >= data.n_points - 1:
-                        st.session_state.selected_point_idx = max(0, data.n_points - 1)
-                    st.success(f"Removed point {point_idx}")
+                    st.caption(f"f = {data.freq[point_idx]:.2e} Hz")
+                    st.caption(f"Z = {data.Z_mod[point_idx]:.2e} Ω")
+            
+            with col_c:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ Remove Point", use_container_width=True, key="remove_point_btn"):
+                    if point_idx < data.n_points:
+                        data.remove_point(point_idx)
+                        # Adjust indices after removal
+                        new_max = data.n_points - 1
+                        st.session_state.selected_point_idx = min(point_idx, new_max)
+                        st.session_state.freq_range_idx = (min(st.session_state.freq_range_idx[0], new_max),
+                                                           min(st.session_state.freq_range_idx[1], new_max))
+                        st.success(f"Removed point {point_idx}")
+                        st.rerun()
+                
+                if st.button("🔄 Reset All", use_container_width=True, key="reset_data_btn"):
+                    data.reset()
+                    st.session_state.selected_point_idx = 0
+                    st.session_state.freq_range_idx = (0, data.n_points - 1)
+                    st.success("Data reset to original")
                     st.rerun()
             
-            if st.button("🔄 Reset Data", use_container_width=True):
-                data.reset()
-                st.session_state.selected_point_idx = 0
-                st.success("Data reset to original")
-                st.rerun()
+            # Apply range button
+            col_d, col_e = st.columns([1, 3])
+            with col_d:
+                if st.button("📊 Apply Range", type="primary", use_container_width=True):
+                    f_min = data.freq[f_min_idx]
+                    f_max = data.freq[f_max_idx]
+                    data.apply_frequency_range(f_min, f_max)
+                    st.session_state.selected_point_idx = 0
+                    st.session_state.freq_range_idx = (0, data.n_points - 1)
+                    st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
+                    st.rerun()
+            
+            st.caption(f"📊 Points: {data.n_points} / {len(data.original_freq)}")
         
-        st.info(f"Current points: {data.n_points} / {len(data.original_freq)}")
+        st.markdown("---")
+        
+        # Create plots with caching to prevent rerender on slider move
+        @st.cache_data(ttl=60, show_spinner=False)
+        def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, n_points, original_len):
+            """Cache plots to prevent rerender on slider movement"""
+            temp_data = ImpedanceData(np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple))
+            fig_nyquist = plot_nyquist_matplotlib(temp_data, highlight_idx=point_idx)
+            fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx)
+            return fig_nyquist, fig_bode
+        
+        # Convert data to tuples for caching
+        freq_tuple = tuple(data.freq)
+        re_tuple = tuple(data.re_z)
+        im_tuple = tuple(data.im_z)
+        
+        # Get cached plots
+        fig_nyquist, fig_bode = cached_plots(
+            freq_tuple, re_tuple, im_tuple, 
+            st.session_state.selected_point_idx,
+            data.n_points, len(data.original_freq)
+        )
+        
+        # Display plots
+        col1, col2 = st.columns(2)
+        with col1:
+            st.pyplot(fig_nyquist)
+        with col2:
+            st.pyplot(fig_bode)
+        plt.close('all')
         
         # Navigation buttons
         col_prev, col_next = st.columns(2)
