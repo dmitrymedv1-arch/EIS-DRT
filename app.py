@@ -2696,22 +2696,22 @@ def step3_gaussian_deconvolution():
         st.markdown("---")
         st.subheader("Manual Peak Addition")
         
-        if deconvolver.use_log_x:
-            x_min_display = np.min(deconvolver.x_linear)
-            x_max_display = np.max(deconvolver.x_linear)
-            manual_position = st.slider("Select peak position (τ, s):",
-                                       min_value=float(x_min_display),
-                                       max_value=float(x_max_display),
-                                       value=float((x_min_display + x_max_display) / 2),
-                                       format="%.3e")
-        else:
-            x_min_display = np.min(deconvolver.x_linear)
-            x_max_display = np.max(deconvolver.x_linear)
-            manual_position = st.slider("Select peak position:",
-                                       min_value=float(x_min_display),
-                                       max_value=float(x_max_display),
-                                       value=float((x_min_display + x_max_display) / 2),
-                                       format="%.3e")
+        # Get number of data points for point selection
+        n_points = len(deconvolver.x_linear)
+        
+        # Create slider by point index (1-based for user-friendly)
+        point_index = st.slider("Select peak by point index:",
+                               min_value=1,
+                               max_value=n_points,
+                               value=n_points // 2,
+                               step=1,
+                               help="Select point index (1 to {}) to add peak at that position".format(n_points))
+        
+        # Convert index to actual τ value
+        manual_position = deconvolver.x_linear[point_index - 1]
+        
+        # Display the τ value for reference
+        st.info(f"Selected position: τ = {manual_position:.3e} s (point {point_index}/{n_points})")
         
         st.session_state.app_state.manual_peak_position = manual_position
         
