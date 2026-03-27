@@ -1224,7 +1224,91 @@ def fit_gaussian_peaks(tau_grid: np.ndarray, gamma: np.ndarray, n_peaks: Optiona
     except Exception:
         return gamma, []
 
-
+class GaussianModel:
+    """Model for sum of Gaussians with baseline correction"""
+    
+    @staticmethod
+    def gaussian(x, amp, cen, sigma):
+        """Gaussian function with safe sigma"""
+        return amp * np.exp(-(x - cen)**2 / (2 * max(sigma, np.finfo(float).eps)**2))
+    
+    @staticmethod
+    def multi_gaussian(x, *params):
+        """Sum of multiple Gaussians"""
+        n = len(params) // 3
+        y = np.zeros_like(x, dtype=float)
+        for i in range(n):
+            amp = params[3*i]
+            cen = params[3*i + 1]
+            sigma = abs(params[3*i + 2])
+            y += GaussianModel.gaussian(x, amp, cen, sigma)
+        return y
+    
+    @staticmethod
+    def multi_gaussian_with_baseline(x, n_peaks, peak_params, baseline_params, baseline_method):
+        """Sum of Gaussians with baseline correction"""
+        # Calculate peaks
+        y_peaks = np.zeros_like(x, dtype=float)
+        for i in range(n_peaks):
+            amp = peak_params[3*i]
+            cen = peak_params[3*i + 1]
+            sigma = abs(peak_params[3*i + 2])
+            y_peaks += GaussianModel.gaussian(x, amp, cen, sigma)
+        
+        # Calculate baseline
+        if baseline_method == "constant" and len(baseline_params) >= 1:
+            y_baseline = baseline_params[0]
+        elif baseline_method == "linear" and len(baseline_params) >= 2:
+            y_baseline = baseline_params[0] + baseline_params[1] * x
+        elif baseline_method == "quadratic" and len(baseline_params) >= 3:
+            y_baseline = baseline_params[0] + baseline_params[1] * x + baseline_params[2] * x**2
+        else:
+            y_baseline = 0
+        
+        return y_peaks + y_baseline
+    
+    @staticmethod
+    def calculate_area(amp, sigma):
+        """Area under Gaussian"""
+        return amp * sigma * np.sqrt(2 * np.pi)
+    
+    @staticmethod
+    def calculate_fwhm(sigma):
+        """Full width at half maximum"""
+        return 2 * np.sqrt(2 * np.log(2)) * sigma
+    
+    @staticmethod
+    def estimate_sigma_from_peak(x, y, peak_idx):
+        """Estimate sigma with fallback methods"""
+        try:
+            widths, width_heights, left_ips, right_ips = peak_widths(
+                y, [peak_idx], rel_height=0.5
+            )
+            fwhm = widths[0] * np.mean(np.diff(x))
+            sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
+            return sigma
+        except Exception as e:
+            # Fallback: estimate from distance to nearest minimum
+            left_min = peak_idx
+            right_min = peak_idx
+            
+            # Find left minimum
+            for i in range(peak_idx - 1, 0, -1):
+                if y[i] < y[i-1] and y[i] < y[i+1]:
+                    left_min = i
+                    break
+            
+            # Find right minimum
+            for i in range(peak_idx + 1, len(y) - 1):
+                if y[i] < y[i-1] and y[i] < y[i+1]:
+                    right_min = i
+                    break
+            
+            # Estimate sigma as 1/3 of the width to nearest minima
+            width = (right_min - left_min) * np.mean(np.diff(x))
+            sigma = width / 3.0
+            return max(sigma, 0.01 * (np.max(x) - np.min(x)) / 10)
+            
 # ============================================================================
 # Gaussian Model for Deconvolution (from second code)
 # ============================================================================
@@ -1626,6 +1710,65 @@ class DataPreprocessor:
             if self.show_warnings:
                 warnings.warn(f"Smoothing failed: {e}")
             return y
+    
+    def preprocess_for_fitting(self, x_linear, y_original, use_log_x, use_log_y, smoothing_level='none'):
+        """Preprocess data for fitting with proper handling of edge cases"""
+        # Sort by X to ensure monotonic increasing X
+        sort_idx = np.argsort(x_linear)
+        x_sorted = x_linear[sort_idx]
+        y_sorted = y_original[sort_idx]
+        
+        # Handle negative values
+        if self.clip_negative:
+            negative_mask = y_sorted < 0
+            self.clipped_points = np.sum(negative_mask)
+            if self.clipped_points > 0 and self.show_warnings:
+                warnings.warn(f"Clipped {self.clipped_points} negative values to 0")
+            y_for_fitting = np.maximum(y_sorted, 0)
+        else:
+            y_for_fitting = y_sorted
+        
+        # Apply smoothing if requested
+        if smoothing_level != 'none':
+            y_for_fitting = self.smooth_data(x_sorted, y_for_fitting, 'savgol', smoothing_level, use_log_x)
+        
+        # Small epsilon for log transformations
+        eps = np.finfo(float).eps
+        
+        # Check for very small values when using log
+        if use_log_y and np.any(y_for_fitting < eps * 100):
+            self.small_values_warning = True
+            if self.show_warnings:
+                warnings.warn("Very small Y values detected. Log transformation may cause artifacts.")
+        
+        # Apply logarithmic transformations
+        if use_log_x:
+            x_pos = np.maximum(x_sorted, eps)
+            x = np.log10(x_pos)
+            x_label = 'log₁₀(τ)'
+        else:
+            x = x_sorted
+            x_label = 'τ (s)'
+        
+        if use_log_y:
+            y_pos = np.maximum(y_for_fitting, eps)
+            y = np.log10(y_pos)
+            y_label = 'log₁₀(γ(τ))'
+        else:
+            y = y_for_fitting
+            y_label = 'γ(τ) (Ω)'
+        
+        return {
+            'x_sorted': x_sorted,
+            'y_sorted': y_sorted,
+            'x': x,
+            'y': y,
+            'y_for_fitting': y_for_fitting,
+            'x_label': x_label,
+            'y_label': y_label,
+            'clipped_points': self.clipped_points,
+            'small_values_warning': self.small_values_warning
+        }
 
 
 # ============================================================================
