@@ -2839,7 +2839,7 @@ def step1_data_loading():
             
             with col_b:
                 # Point selection for removal
-                point_idx = st.number_input(
+                point_idx = st.slider(
                     "Point index to remove",
                     min_value=0,
                     max_value=data.n_points - 1,
