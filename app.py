@@ -2206,9 +2206,10 @@ class GaussianDeconvolver:
                 sigma = abs(peak_params[3*i + 2])
                 
                 amp = amp_norm * self.y_max
-                area = GaussianModel.calculate_area(amp_norm, sigma) * self.y_max
+                # Используем правильный метод расчета площади
+                area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
                 
-                component_y_norm = GaussianModel.gaussian(self.x, amp_norm, cen, sigma)
+                component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
                 
                 # Calculate center in linear space
                 if self.use_log_x:
@@ -2414,12 +2415,15 @@ class GaussianDeconvolver:
             )
             peaks.append(peak)
         
+        # Восстанавливаем оригинальный масштаб y_original
+        y_original_restored = self.y_original * self.y_max if self.y_max > 0 else self.y_original
+        
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
             y_norm=self.y_norm,
-            y_original=self.y_original,
+            y_original=y_original_restored,
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
