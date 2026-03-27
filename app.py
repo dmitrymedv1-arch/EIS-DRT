@@ -1780,122 +1780,165 @@ def main():
                               file_name=f"eis_drt_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                               mime="text/plain")
             
-            # Export DRT data in tau domain
+            st.markdown("---")
+            st.subheader("📁 Export DRT Data")
+            
+            # Create two different export formats
+            # Format 1: γ(τ) vs τ (relaxation time in seconds)
             drt_data_tau = pd.DataFrame({
                 'tau_s': result.tau_grid,
-                'log10_tau': np.log10(result.tau_grid),
-                'gamma_tau': result.gamma,
-                'frequency_Hz': 1 / (2 * np.pi * result.tau_grid)
+                'gamma_tau_ohm': result.gamma
             })
             if result.gamma_std is not None:
-                drt_data_tau['gamma_uncertainty'] = result.gamma_std
+                drt_data_tau['gamma_uncertainty_ohm'] = result.gamma_std
             
-            csv_tau = drt_data_tau.to_csv(index=False)
-            st.download_button("📥 Export DRT Data (tau domain) - CSV", 
-                              data=csv_tau,
-                              file_name=f"drt_data_tau_domain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                              mime="text/csv")
-            
-            # Export DRT data in frequency domain (high to low frequency)
+            # Format 2: γ(τ) vs Frequency (Hz)
             frequencies = 1 / (2 * np.pi * result.tau_grid)
-            sort_idx = np.argsort(frequencies)[::-1]  # Sort from high to low frequency
+            # Sort by frequency (high to low for better readability)
+            sort_idx = np.argsort(frequencies)[::-1]
             freqs_sorted = frequencies[sort_idx]
             gamma_sorted = result.gamma[sort_idx]
-            tau_sorted = result.tau_grid[sort_idx]
             
             drt_data_freq = pd.DataFrame({
-                'frequency_Hz': freqs_sorted,
-                'log10_frequency': np.log10(freqs_sorted),
-                'gamma_freq': gamma_sorted,
-                'tau_s': tau_sorted,
-                'log10_tau': np.log10(tau_sorted)
+                'frequency_hz': freqs_sorted,
+                'gamma_tau_ohm': gamma_sorted
             })
             if result.gamma_std is not None:
                 gamma_std_sorted = result.gamma_std[sort_idx]
-                drt_data_freq['gamma_uncertainty'] = gamma_std_sorted
+                drt_data_freq['gamma_uncertainty_ohm'] = gamma_std_sorted
             
-            csv_freq = drt_data_freq.to_csv(index=False)
-            st.download_button("📥 Export DRT Data (frequency domain) - CSV", 
-                              data=csv_freq,
-                              file_name=f"drt_data_freq_domain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                              mime="text/csv")
+            # Export options
+            col1, col2 = st.columns(2)
             
-            # Export DRT data as TXT files (tau domain)
-            txt_tau_content = "# DRT Analysis Results - Tau Domain\n"
-            txt_tau_content += f"# Method: {analysis_method}\n"
-            txt_tau_content += f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            txt_tau_content += f"# R_inf: {result.R_inf:.6f} Ohm\n"
-            txt_tau_content += f"# R_pol: {result.R_pol:.6f} Ohm\n"
-            txt_tau_content += "# Columns: tau (s), log10_tau, gamma (Ohm), frequency (Hz)"
-            if result.gamma_std is not None:
-                txt_tau_content += ", gamma_uncertainty (Ohm)"
-            txt_tau_content += "\n"
+            with col1:
+                st.markdown("**Export as γ(τ) vs τ**")
+                st.markdown("Data format: relaxation time (s) vs DRT amplitude (Ω)")
+                
+                # Create CSV for tau format
+                csv_tau = drt_data_tau.to_csv(index=False)
+                st.download_button(
+                    "📥 Export DRT Data (τ format) - CSV", 
+                    data=csv_tau,
+                    file_name=f"drt_data_tau_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+                
+                # Create TXT for tau format (tab-separated)
+                txt_tau = drt_data_tau.to_csv(sep='\t', index=False)
+                st.download_button(
+                    "📥 Export DRT Data (τ format) - TXT", 
+                    data=txt_tau,
+                    file_name=f"drt_data_tau_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
+                
+                # Show preview
+                with st.expander("Preview - γ(τ) vs τ data"):
+                    st.dataframe(drt_data_tau.head(10))
             
-            for i in range(len(result.tau_grid)):
-                line = f"{result.tau_grid[i]:.6e}\t{np.log10(result.tau_grid[i]):.6f}\t{result.gamma[i]:.6e}\t{1/(2*np.pi*result.tau_grid[i]):.6e}"
-                if result.gamma_std is not None:
-                    line += f"\t{result.gamma_std[i]:.6e}"
-                txt_tau_content += line + "\n"
+            with col2:
+                st.markdown("**Export as γ(τ) vs Frequency**")
+                st.markdown("Data format: frequency (Hz) vs DRT amplitude (Ω)")
+                
+                # Create CSV for frequency format
+                csv_freq = drt_data_freq.to_csv(index=False)
+                st.download_button(
+                    "📥 Export DRT Data (Frequency format) - CSV", 
+                    data=csv_freq,
+                    file_name=f"drt_data_frequency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+                
+                # Create TXT for frequency format (tab-separated)
+                txt_freq = drt_data_freq.to_csv(sep='\t', index=False)
+                st.download_button(
+                    "📥 Export DRT Data (Frequency format) - TXT", 
+                    data=txt_freq,
+                    file_name=f"drt_data_frequency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
+                
+                # Show preview
+                with st.expander("Preview - γ(τ) vs Frequency data"):
+                    st.dataframe(drt_data_freq.head(10))
             
-            st.download_button("📥 Export DRT Data (tau domain) - TXT", 
-                              data=txt_tau_content,
-                              file_name=f"drt_data_tau_domain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                              mime="text/plain")
-            
-            # Export DRT data as TXT files (frequency domain)
-            txt_freq_content = "# DRT Analysis Results - Frequency Domain\n"
-            txt_freq_content += f"# Method: {analysis_method}\n"
-            txt_freq_content += f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            txt_freq_content += f"# R_inf: {result.R_inf:.6f} Ohm\n"
-            txt_freq_content += f"# R_pol: {result.R_pol:.6f} Ohm\n"
-            txt_freq_content += "# Columns: frequency (Hz), log10_frequency, gamma (Ohm), tau (s), log10_tau"
-            if result.gamma_std is not None:
-                txt_freq_content += ", gamma_uncertainty (Ohm)"
-            txt_freq_content += "\n"
-            txt_freq_content += "# Note: Data sorted from high frequency to low frequency (descending)\n"
-            
-            for i in range(len(freqs_sorted)):
-                line = f"{freqs_sorted[i]:.6e}\t{np.log10(freqs_sorted[i]):.6f}\t{gamma_sorted[i]:.6e}\t{tau_sorted[i]:.6e}\t{np.log10(tau_sorted[i]):.6f}"
-                if result.gamma_std is not None:
-                    line += f"\t{gamma_std_sorted[i]:.6e}"
-                txt_freq_content += line + "\n"
-            
-            st.download_button("📥 Export DRT Data (frequency domain) - TXT", 
-                              data=txt_freq_content,
-                              file_name=f"drt_data_freq_domain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                              mime="text/plain")
+            st.markdown("---")
+            st.subheader("📊 Export Peak Analysis")
             
             # Export peaks data
             if peaks:
                 peaks_df = pd.DataFrame(peaks)
+                
+                # Add additional calculated columns if available
+                if 'resistance' in peaks_df.columns:
+                    peaks_df['capacitance_F'] = peaks_df['tau'] / peaks_df['resistance']
+                
+                # Reorder columns for better readability
+                column_order = ['tau', 'frequency', 'amplitude', 'resistance', 'capacitance_F', 'log_tau', 'width']
+                available_cols = [col for col in column_order if col in peaks_df.columns]
+                peaks_df = peaks_df[available_cols]
+                
+                # CSV export
                 peaks_csv = peaks_df.to_csv(index=False)
-                st.download_button("📥 Export Peaks Data (CSV)", 
-                                  data=peaks_csv,
-                                  file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                  mime="text/csv")
+                st.download_button(
+                    "📥 Export Peaks Data - CSV", 
+                    data=peaks_csv,
+                    file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
                 
-                # Export peaks as TXT
-                txt_peaks_content = "# DRT Analysis Results - Detected Peaks\n"
-                txt_peaks_content += f"# Method: {analysis_method}\n"
-                txt_peaks_content += f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                txt_peaks_content += "# Columns: peak_number, tau (s), log10_tau, frequency (Hz), amplitude (Ohm), resistance (Ohm), capacitance (F)\n"
+                # TXT export (tab-separated)
+                peaks_txt = peaks_df.to_csv(sep='\t', index=False)
+                st.download_button(
+                    "📥 Export Peaks Data - TXT", 
+                    data=peaks_txt,
+                    file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
                 
-                for i, peak in enumerate(peaks):
-                    line = f"{i+1}\t{peak['tau']:.6e}\t{np.log10(peak['tau']):.6f}\t{peak['frequency']:.6e}\t{peak['amplitude']:.6e}"
-                    if 'resistance' in peak:
-                        line += f"\t{peak['resistance']:.6e}"
-                    else:
-                        line += f"\t{0:.6e}"
-                    if 'capacitance' in peak:
-                        line += f"\t{peak['capacitance']:.6e}"
-                    else:
-                        line += f"\t{0:.6e}"
-                    txt_peaks_content += line + "\n"
-                
-                st.download_button("📥 Export Peaks Data (TXT)", 
-                                  data=txt_peaks_content,
-                                  file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                                  mime="text/plain")
+                # Show peaks preview
+                with st.expander("Preview - Detected Peaks"):
+                    st.dataframe(peaks_df)
+            else:
+                st.info("No peaks detected to export")
+            
+            st.markdown("---")
+            st.subheader("📈 Export Full Dataset")
+            
+            # Export complete dataset with all information
+            complete_data = pd.DataFrame({
+                'tau_s': result.tau_grid,
+                'log10_tau': np.log10(result.tau_grid),
+                'frequency_hz': 1 / (2 * np.pi * result.tau_grid),
+                'gamma_tau_ohm': result.gamma
+            })
+            
+            if result.gamma_std is not None:
+                complete_data['gamma_uncertainty_ohm'] = result.gamma_std
+            
+            # Sort by frequency for better readability
+            complete_data = complete_data.sort_values('frequency_hz', ascending=False).reset_index(drop=True)
+            
+            # CSV export
+            complete_csv = complete_data.to_csv(index=False)
+            st.download_button(
+                "📥 Export Complete Dataset - CSV", 
+                data=complete_csv,
+                file_name=f"drt_complete_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+            
+            # TXT export (tab-separated)
+            complete_txt = complete_data.to_csv(sep='\t', index=False)
+            st.download_button(
+                "📥 Export Complete Dataset - TXT", 
+                data=complete_txt,
+                file_name=f"drt_complete_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain"
+            )
+            
+            with st.expander("Preview - Complete Dataset"):
+                st.dataframe(complete_data.head(10))
     
     elif not st.session_state.data_loaded:
         st.info("👈 Please load impedance data using the sidebar controls to begin analysis")
