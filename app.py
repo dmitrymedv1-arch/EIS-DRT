@@ -1057,8 +1057,8 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
         ax.plot(re_rec, im_rec, 's-', markersize=3, linewidth=1.0,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax.set_xlabel(r"Re(Z) / $\Omega$", fontweight='bold')
-    ax.set_ylabel(r"-Im(Z) / $\Omega$", fontweight='bold')
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')  # Убрал LaTeX
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')  # Убрал LaTeX
     ax.set_title(title, fontweight='bold')
     ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--')
@@ -1069,7 +1069,6 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
     ax.set_aspect('equal', adjustable='box')
     
     return fig
-
 
 def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
                          im_rec: Optional[np.ndarray] = None) -> plt.Figure:
@@ -1085,7 +1084,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax1.loglog(data.freq, mag_rec, 's-', markersize=3, linewidth=1.0,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax1.set_ylabel(r"$|Z|$ / $\Omega$", fontweight='bold')
+    ax1.set_ylabel("|Z| / Ohm", fontweight='bold')  # Убрал LaTeX
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3, linestyle='--')
     
@@ -1098,7 +1097,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax2.semilogx(data.freq, phase_rec, 's-', markersize=3, linewidth=1.0,
                      label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel(r"Phase / $^\circ$", fontweight='bold')
+    ax2.set_ylabel("Phase / deg", fontweight='bold')  # Убрал символ градуса
     ax2.legend(loc='best')
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
