@@ -3122,16 +3122,15 @@ def step3_gaussian_deconvolution():
     
     drt_result = st.session_state.app_state.drt_result
     
-    # Prepare data for deconvolution
-    # Convert DRT (γ vs τ) to format suitable for Gaussian deconvolution
+    # Prepare data for deconvolution - используем оригинальные ненормированные значения
     log_tau = np.log10(drt_result.tau_grid)
-    gamma_norm = drt_result.gamma / np.max(drt_result.gamma) if np.max(drt_result.gamma) > 0 else drt_result.gamma
+    gamma_original = drt_result.gamma  # Оригинальные ненормированные значения
     
     # Create deconvolver if not exists
     if st.session_state.app_state.deconvolver is None:
         deconvolver = GaussianDeconvolver(
             x_linear=drt_result.tau_grid,
-            y_original=gamma_norm,
+            y_original=gamma_original,  # Используем оригинальные ненормированные значения
             use_log_x=True,
             use_log_y=False,
             clip_negative=st.session_state.app_state.clip_negative,
@@ -3295,7 +3294,7 @@ def step3_gaussian_deconvolution():
                             st.session_state.app_state.last_popt = deconvolver.popt
                             st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
                             st.session_state.app_state.deconv_calculated = True
-                            st.session_state.app_state.current_step = 4  # ADD THIS LINE - переход на шаг 4
+                            st.session_state.app_state.current_step = 4
                             st.success("✅ Deconvolution complete!")
                             st.rerun()
                         else:
@@ -3310,18 +3309,20 @@ def step3_gaussian_deconvolution():
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
+            # Отображаем оригинальные ненормированные значения DRT
             ax.plot(deconvolver.x_linear, deconvolver.y_original, 
                    'o-', markersize=3, linewidth=1, alpha=0.7, 
-                   label='DRT Data', color='black', zorder=1)
+                   label='DRT Data (original scale)', color='black', zorder=1)
             
             source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
             for idx, info in enumerate(st.session_state.app_state.peak_info):
                 source = info.get('source', 'auto')
                 color = source_colors.get(source, '#2ca02c')
-                ax.plot(info['x_linear'], info['y_original'], 'o', 
+                # Используем y_original для отображения
+                ax.plot(info['x_linear'], info.get('y_original', info.get('y', 0)), 'o', 
                        markersize=8, markeredgecolor='darkred', 
                        markerfacecolor=color, zorder=3)
-                ax.text(info['x_linear'], info['y_original'] * 1.05, 
+                ax.text(info['x_linear'], info.get('y_original', info.get('y', 0)) * 1.05, 
                        f'τ={info["x_linear"]:.2e}s', ha='center', 
                        fontsize=8, rotation=45)
             
@@ -3334,9 +3335,9 @@ def step3_gaussian_deconvolution():
                        'ro', markersize=10)
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-            ax.set_ylabel('γ(τ) (norm.)', fontweight='bold')
+            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')  # Изменено с (norm.) на (Ω)
             ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
-            ax.legend(['DRT Data', 'Detected Peaks'], loc='upper left')
+            ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')  # Изменено loc на upper left
             ax.grid(True, alpha=0.3, linestyle='--')
             
             st.pyplot(fig)
@@ -3358,7 +3359,9 @@ def step3_gaussian_deconvolution():
                     with col_c:
                         st.write(f"τ = {info['x_linear']:.4e} s")
                     with col_d:
-                        st.write(f"γ = {info['y_original']:.4e}")
+                        # Отображаем оригинальное значение y
+                        y_value = info.get('y_original', info.get('y', 0))
+                        st.write(f"γ = {y_value:.4e} Ω")
                     with col_e:
                         if st.button("🗑️", key=f"delete_peak_{i}", help=f"Delete peak {i+1}"):
                             if deconvolver.remove_peak_by_id(i+1):
