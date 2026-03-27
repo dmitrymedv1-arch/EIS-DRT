@@ -453,6 +453,8 @@ class TikhonovDRT(DRTCore):
         
         L = self._build_regularization_matrix(n_tau, self.regularization_order)
         
+        lambda_opt = None  # Инициализируем переменную
+        
         if lambda_auto:
             if lambda_range is None:
                 lambda_range = np.logspace(-8, 2, 30)
@@ -489,8 +491,8 @@ class TikhonovDRT(DRTCore):
                 b = np.concatenate([Z_target, np.zeros(L.shape[0])])
                 gamma = self._solve_nnls(A, b)
         else:
-            lam = lambda_value if lambda_value is not None else 1e-4
-            A = np.vstack([K, lam * L])
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K, lambda_opt * L])
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
@@ -507,7 +509,11 @@ class TikhonovDRT(DRTCore):
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            metadata={'lambda': lam if not lambda_auto else lambda_opt, 'order': self.regularization_order}
+            metadata={
+                'lambda': lambda_opt,  # Всегда сохраняем использованное значение λ
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto  # Сохраняем флаг автоматического выбора
+            }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
