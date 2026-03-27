@@ -1582,13 +1582,6 @@ def main():
                 # Reconstruct impedance
                 Z_rec_real, Z_rec_imag = drt_solver.reconstruct_impedance(result.tau_grid, result.gamma)
                 
-                st.sidebar.markdown("---")
-                st.sidebar.subheader("Debug Info")
-                st.sidebar.write(f"R_inf: {result.R_inf:.4f} Ω")
-                st.sidebar.write(f"Integral gamma: {result.get_integral():.4f} Ω")
-                st.sidebar.write(f"R_pol (from data): {result.R_pol:.4f} Ω")
-                st.sidebar.write(f"Reconstruction error: {mean_error:.2f}%")
-                
             except Exception as e:
                 st.error(f"DRT calculation failed: {e}")
                 st.stop()
