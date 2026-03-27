@@ -2415,15 +2415,16 @@ class GaussianDeconvolver:
             )
             peaks.append(peak)
         
-        # Восстанавливаем оригинальный масштаб y_original
-        y_original_restored = self.y_original * self.y_max if self.y_max > 0 else self.y_original
+        # Используем self.y_original напрямую - это уже оригинальные значения
+        # self.y_original хранит оригинальные ненормированные значения
+        y_original_restored = self.y_original.copy()  # Просто копируем, без умножения на y_max
         
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
             y_norm=self.y_norm,
-            y_original=y_original_restored,
+            y_original=y_original_restored,  # Теперь правильные значения (7 Ом)
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
