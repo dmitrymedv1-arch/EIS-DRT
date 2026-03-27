@@ -3226,6 +3226,7 @@ def step3_gaussian_deconvolution():
                             st.session_state.app_state.last_popt = deconvolver.popt
                             st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
                             st.session_state.app_state.deconv_calculated = True
+                            st.session_state.app_state.current_step = 4  # ADD THIS LINE - переход на шаг 4
                             st.success("✅ Deconvolution complete!")
                             st.rerun()
                         else:
