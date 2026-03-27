@@ -73,18 +73,18 @@ def apply_modern_scientific_style():
     plt.style.use('default')
     plt.rcParams.update({
         # Font settings
-        'font.size': 11,
+        'font.size': 12,
         'font.family': 'serif',
         'font.serif': ['Times New Roman', 'DejaVu Serif'],
         
         # Axes settings
-        'axes.labelsize': 12,
+        'axes.labelsize': 14,
         'axes.labelweight': 'bold',
-        'axes.titlesize': 13,
+        'axes.titlesize': 16,
         'axes.titleweight': 'bold',
         'axes.facecolor': '#f8f9fa',
         'axes.edgecolor': '#2c3e50',
-        'axes.linewidth': 1.2,
+        'axes.linewidth': 1.5,
         'axes.grid': True,
         'grid.alpha': 0.3,
         'grid.linestyle': '--',
@@ -92,19 +92,19 @@ def apply_modern_scientific_style():
         # Tick settings
         'xtick.color': '#2c3e50',
         'ytick.color': '#2c3e50',
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
         'xtick.direction': 'out',
         'ytick.direction': 'out',
-        'xtick.major.size': 5,
-        'xtick.minor.size': 3,
-        'ytick.major.size': 5,
-        'ytick.minor.size': 3,
-        'xtick.major.width': 1,
-        'ytick.major.width': 1,
+        'xtick.major.size': 6,
+        'xtick.minor.size': 4,
+        'ytick.major.size': 6,
+        'ytick.minor.size': 4,
+        'xtick.major.width': 1.2,
+        'ytick.major.width': 1.2,
         
         # Legend settings
-        'legend.fontsize': 10,
+        'legend.fontsize': 12,
         'legend.frameon': True,
         'legend.framealpha': 0.95,
         'legend.edgecolor': '#2c3e50',
@@ -117,7 +117,7 @@ def apply_modern_scientific_style():
         'savefig.bbox': 'tight',
         'savefig.pad_inches': 0.05,
         'figure.facecolor': 'white',
-        'figure.figsize': [10, 6],
+        'figure.figsize': [12, 8],
         
         # Lines and markers
         'lines.linewidth': 2,
@@ -1308,7 +1308,8 @@ class GaussianModel:
             width = (right_min - left_min) * np.mean(np.diff(x))
             sigma = width / 3.0
             return max(sigma, 0.01 * (np.max(x) - np.min(x)) / 10)
-            
+
+
 # ============================================================================
 # Gaussian Model for Deconvolution (from second code)
 # ============================================================================
@@ -1486,7 +1487,7 @@ class GaussianFitter:
                 progress_callback(0.3, "Initializing fit...")
             
             def model_func(x, *params):
-                return GaussianModelDeconv.multi_gaussian_with_baseline_flat(
+                return multi_gaussian_with_baseline_flat(
                     x, *params, n_peaks=n_peaks, baseline_method=self.baseline_method
                 )
             
@@ -1588,8 +1589,9 @@ class GaussianFitter:
             else:
                 baseline_params = [0, 0, 0]
         
-        fit_y_norm = GaussianModelDeconv.multi_gaussian_with_baseline(
-            x, n_peaks, peak_params, baseline_params or [], self.baseline_method
+        fit_y_norm = multi_gaussian_with_baseline_flat(
+            x, *peak_params, *baseline_params if baseline_params else [], 
+            n_peaks=n_peaks, baseline_method=self.baseline_method
         )
         
         return fit_y_norm
@@ -2357,6 +2359,39 @@ class GaussianDeconvolver:
             progress_callback=progress_callback
         )
     
+    def remove_peak_by_id(self, peak_id):
+        """Remove a peak by its ID from peak_info and initial_params"""
+        if st.session_state.app_state.peak_info is None:
+            return False
+        
+        # Find the peak in peak_info
+        peak_to_remove = None
+        for i, info in enumerate(st.session_state.app_state.peak_info):
+            if info.get('id', i+1) == peak_id or i+1 == peak_id:
+                peak_to_remove = i
+                break
+        
+        if peak_to_remove is None:
+            return False
+        
+        # Remove from peak_info
+        removed_peak = st.session_state.app_state.peak_info.pop(peak_to_remove)
+        
+        # Remove from initial_params (3 parameters per peak)
+        if st.session_state.app_state.initial_peak_params is not None:
+            start_idx = peak_to_remove * 3
+            del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
+        
+        # Also remove from manual_peaks or residuals_peaks if present
+        if removed_peak.get('source') == 'manual':
+            st.session_state.app_state.manual_peaks = [p for p in st.session_state.app_state.manual_peaks 
+                                                        if p.get('x_linear') != removed_peak.get('x_linear')]
+        elif removed_peak.get('source') == 'residuals':
+            st.session_state.app_state.residuals_peaks = [p for p in st.session_state.app_state.residuals_peaks 
+                                                           if p.get('x_linear') != removed_peak.get('x_linear')]
+        
+        return True
+    
     def create_deconvolution_result(self) -> DeconvolutionResult:
         """Create result container from current components"""
         peaks = []
@@ -2393,6 +2428,7 @@ class GaussianDeconvolver:
             max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
         )
 
+
 # ============================================================================
 # Visualization Functions (from both codes)
 # ============================================================================
@@ -2401,25 +2437,30 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
                            im_rec: Optional[np.ndarray] = None, title: str = "Nyquist Plot",
                            highlight_idx: Optional[int] = None) -> plt.Figure:
     """Create publication-quality Nyquist plot"""
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=(9, 7))
     
-    ax.plot(data.re_z, data.im_z, 'o-', markersize=4, linewidth=1.5, 
-            label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
+    ax.plot(data.re_z, data.im_z, 'o-', markersize=5, linewidth=1.8, 
+            label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
     
     if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
         ax.plot(data.re_z[highlight_idx], data.im_z[highlight_idx], 'ro', 
-                markersize=10, markeredgecolor='red', markerfacecolor='none', linewidth=2,
+                markersize=12, markeredgecolor='red', markerfacecolor='none', linewidth=2.5,
                 label='Selected Point')
     
     if re_rec is not None and im_rec is not None:
-        ax.plot(re_rec, im_rec, 's-', markersize=3, linewidth=1.0,
+        ax.plot(re_rec, im_rec, 's-', markersize=4, linewidth=1.2,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
-    ax.set_title(title, fontweight='bold')
-    ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black')
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=14)
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=14)
+    ax.set_title(title, fontweight='bold', fontsize=16)
+    ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black', fontsize=12)
     ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Scientific formatting
+    ax.ticklabel_format(style='scientific', scilimits=(-2, 2))
+    ax.xaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
     
     x_range = ax.get_xlim()
     y_range = ax.get_ylim()
@@ -2429,36 +2470,56 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
 
 
 def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
-                         im_rec: Optional[np.ndarray] = None) -> plt.Figure:
-    """Create publication-quality Bode plot"""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 7))
+                         im_rec: Optional[np.ndarray] = None,
+                         highlight_idx: Optional[int] = None) -> plt.Figure:
+    """Create publication-quality Bode plot with highlight point"""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
     
     mag = data.Z_mod
-    ax1.loglog(data.freq, mag, 'o-', markersize=4, linewidth=1.5, 
-               label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
+    ax1.loglog(data.freq, mag, 'o-', markersize=5, linewidth=1.8, 
+               label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
+    
+    if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
+        ax1.loglog(data.freq[highlight_idx], mag[highlight_idx], 'ro', 
+                   markersize=12, markeredgecolor='red', markerfacecolor='none', linewidth=2.5)
+    
     if re_rec is not None and im_rec is not None:
         mag_rec = np.sqrt(re_rec**2 + im_rec**2)
-        ax1.loglog(data.freq, mag_rec, 's-', markersize=3, linewidth=1.0,
+        ax1.loglog(data.freq, mag_rec, 's-', markersize=4, linewidth=1.2,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
-    ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
-    ax1.legend(loc='best')
+    
+    ax1.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14)
+    ax1.set_ylabel("|Z| / Ohm", fontweight='bold', fontsize=14)
+    ax1.legend(loc='best', fontsize=12)
     ax1.grid(True, alpha=0.3, linestyle='--')
     
+    # Scientific formatting for log axes
+    ax1.xaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    ax1.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    
     phase = data.phase
-    ax2.semilogx(data.freq, phase, 'o-', markersize=4, linewidth=1.5,
-                 label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
+    ax2.semilogx(data.freq, phase, 'o-', markersize=5, linewidth=1.8,
+                 label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
+    
+    if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
+        ax2.semilogx(data.freq[highlight_idx], phase[highlight_idx], 'ro', 
+                     markersize=12, markeredgecolor='red', markerfacecolor='none', linewidth=2.5)
+    
     if re_rec is not None and im_rec is not None:
         phase_rec = np.arctan2(im_rec, re_rec) * 180 / np.pi
-        ax2.semilogx(data.freq, phase_rec, 's-', markersize=3, linewidth=1.0,
+        ax2.semilogx(data.freq, phase_rec, 's-', markersize=4, linewidth=1.2,
                      label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
-    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel("Phase / deg", fontweight='bold')
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3, linestyle='--')
-    ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
     
-    fig.suptitle("Bode Plot", fontweight='bold')
+    ax2.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14)
+    ax2.set_ylabel("Phase / deg", fontweight='bold', fontsize=14)
+    ax2.legend(loc='best', fontsize=12)
+    ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
+    
+    # Scientific formatting
+    ax2.xaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    
+    fig.suptitle("Bode Plot", fontweight='bold', fontsize=16)
     plt.tight_layout()
     
     return fig
@@ -2467,7 +2528,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
 def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None,
                        title: str = "Distribution of Relaxation Times") -> plt.Figure:
     """Create publication-quality DRT plot with both tau and frequency axes"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
     if result.gamma_std is not None:
         ax1.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
@@ -2729,17 +2790,32 @@ def step1_data_loading():
         
         data = st.session_state.app_state.impedance_data
         
+        # Create a container for dynamic updates
+        plot_container = st.empty()
+        
         col1, col2 = st.columns(2)
         
-        with col1:
-            fig_nyquist = plot_nyquist_matplotlib(data)
-            st.pyplot(fig_nyquist)
-            plt.close()
+        # Point selection slider - this will trigger rerun and update the plot
+        point_idx = st.slider(
+            "Select point to remove (index)",
+            min_value=0,
+            max_value=data.n_points - 1,
+            value=min(0, data.n_points - 1),
+            step=1,
+            key="point_selector"
+        )
         
-        with col2:
-            fig_bode = plot_bode_matplotlib(data)
-            st.pyplot(fig_bode)
-            plt.close()
+        # Update the plot dynamically based on slider value
+        with plot_container:
+            fig_nyquist = plot_nyquist_matplotlib(data, highlight_idx=point_idx)
+            fig_bode = plot_bode_matplotlib(data, highlight_idx=point_idx)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.pyplot(fig_nyquist)
+            with col2:
+                st.pyplot(fig_bode)
+            plt.close('all')
         
         st.markdown("---")
         st.subheader("✂️ Data Preprocessing")
@@ -2761,25 +2837,15 @@ def step1_data_loading():
                 st.rerun()
         
         with col2:
-            point_idx = st.slider(
-                "Select point to remove (index)",
-                min_value=0,
-                max_value=data.n_points - 1,
-                value=0,
-                step=1
-            )
+            if st.button("🗑️ Remove Selected Point", use_container_width=True):
+                data.remove_point(point_idx)
+                st.success(f"Removed point {point_idx}")
+                st.rerun()
             
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if st.button("🗑️ Remove Point", use_container_width=True):
-                    data.remove_point(point_idx)
-                    st.success(f"Removed point {point_idx}")
-                    st.rerun()
-            with col_b:
-                if st.button("🔄 Reset Data", use_container_width=True):
-                    data.reset()
-                    st.success("Data reset to original")
-                    st.rerun()
+            if st.button("🔄 Reset Data", use_container_width=True):
+                data.reset()
+                st.success("Data reset to original")
+                st.rerun()
         
         st.info(f"Current points: {data.n_points} / {len(data.original_freq)}")
         
@@ -2990,9 +3056,8 @@ def step3_gaussian_deconvolution():
     log_tau = np.log10(drt_result.tau_grid)
     gamma_norm = drt_result.gamma / np.max(drt_result.gamma) if np.max(drt_result.gamma) > 0 else drt_result.gamma
     
-    # Create deconvolver if not exists or if parameters changed
-    if st.session_state.app_state.deconv_result is None:
-        # Use log_tau as x and gamma_norm as y for deconvolution
+    # Create deconvolver if not exists
+    if st.session_state.app_state.deconvolver is None:
         deconvolver = GaussianDeconvolver(
             x_linear=drt_result.tau_grid,
             y_original=gamma_norm,
@@ -3004,6 +3069,18 @@ def step3_gaussian_deconvolution():
             smoothing_level=st.session_state.app_state.smoothing_level
         )
         st.session_state.app_state.deconvolver = deconvolver
+        
+        # Auto-detect peaks immediately on entry
+        with st.spinner("Auto-detecting peaks..."):
+            peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
+                sensitivity=st.session_state.app_state.sensitivity,
+                min_distance=st.session_state.app_state.min_distance
+            )
+            st.session_state.app_state.peak_info = peak_info
+            st.session_state.app_state.derivatives = derivatives
+            st.session_state.app_state.initial_peak_params = initial_params
+            st.session_state.app_state.manual_peaks = []
+            st.session_state.app_state.residuals_peaks = []
     
     deconvolver = st.session_state.app_state.deconvolver
     
@@ -3018,8 +3095,20 @@ def step3_gaussian_deconvolution():
         min_distance = st.slider("Minimum distance between peaks", 1, 20,
                                 value=st.session_state.app_state.min_distance, step=1)
         
-        st.session_state.app_state.sensitivity = sensitivity
-        st.session_state.app_state.min_distance = min_distance
+        if sensitivity != st.session_state.app_state.sensitivity or min_distance != st.session_state.app_state.min_distance:
+            st.session_state.app_state.sensitivity = sensitivity
+            st.session_state.app_state.min_distance = min_distance
+            # Redetect peaks
+            with st.spinner("Re-detecting peaks..."):
+                peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
+                    sensitivity=sensitivity, min_distance=min_distance
+                )
+                st.session_state.app_state.peak_info = peak_info
+                st.session_state.app_state.derivatives = derivatives
+                st.session_state.app_state.initial_peak_params = initial_params
+                st.session_state.app_state.manual_peaks = []
+                st.session_state.app_state.residuals_peaks = []
+            st.rerun()
         
         st.markdown("---")
         st.subheader("Manual Peak Addition")
@@ -3049,6 +3138,8 @@ def step3_gaussian_deconvolution():
                 new_peak, new_params = deconvolver.add_manual_peak(manual_position)
                 if st.session_state.app_state.peak_info is None:
                     st.session_state.app_state.peak_info = []
+                # Assign ID for tracking
+                new_peak['id'] = len(st.session_state.app_state.peak_info) + 1
                 st.session_state.app_state.peak_info.append(new_peak)
                 if st.session_state.app_state.initial_peak_params is None:
                     st.session_state.app_state.initial_peak_params = []
@@ -3073,6 +3164,7 @@ def step3_gaussian_deconvolution():
                     
                     if missing_peaks:
                         for p in missing_peaks:
+                            p['id'] = len(st.session_state.app_state.peak_info) + 1
                             st.session_state.app_state.peak_info.append(p)
                             st.session_state.app_state.initial_peak_params.extend([p['amp_est'], p['cen_est'], p['sigma_est']])
                             st.session_state.app_state.residuals_peaks.append(p)
@@ -3104,45 +3196,26 @@ def step3_gaussian_deconvolution():
                     if st.session_state.app_state.initial_peak_params is None or len(st.session_state.app_state.initial_peak_params) == 0:
                         st.error("No peaks detected. Please adjust sensitivity or add manual peaks.")
                     else:
-                        if st.session_state.app_state.preview_mode:
-                            preview_fit = deconvolver.preview_fit(st.session_state.app_state.initial_peak_params)
-                            if preview_fit is not None:
-                                st.session_state.app_state.preview_fit = preview_fit
-                                st.success("Preview generated")
-                            else:
-                                st.error("Preview failed. Check peak parameters.")
-                        else:
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            
-                            def update_progress(progress, message):
-                                progress_bar.progress(progress)
-                                status_text.text(message)
-                            
-                            # Ensure initial_params is a list, not None
-                            initial_params = st.session_state.app_state.initial_peak_params
-                            if isinstance(initial_params, np.ndarray):
-                                initial_params = initial_params.tolist()
-                            
-                            success = deconvolver.fit(
-                                initial_params=initial_params,
-                                method=st.session_state.app_state.fitting_method,
-                                maxfev=st.session_state.app_state.max_nfev,
-                                fit_quality=st.session_state.app_state.fit_quality,
-                                progress_callback=update_progress
-                            )
-                            
-                            progress_bar.empty()
-                            status_text.empty()
-                            
-                            if success:
-                                st.session_state.app_state.last_popt = deconvolver.popt
-                                st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
-                                st.session_state.app_state.deconv_calculated = True
-                                st.success("✅ Deconvolution complete!")
-                                st.rerun()
-                            else:
-                                st.error("Deconvolution failed. Try adjusting sensitivity or adding more manual peaks.")
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        def update_progress(progress, message):
+                            progress_bar.progress(progress)
+                            status_text.text(message)
+                        
+                        # Ensure initial_params is a list, not None
+                        initial_params = st.session_state.app_state.initial_peak_params
+                        if isinstance(initial_params, np.ndarray):
+                            initial_params = initial_params.tolist()
+                        
+                        success = deconvolver.fit(
+                            initial_params=initial_params,
+                            method=st.session_state.app_state.fitting_method,
+                            maxfev=st.session_state.app_state.max_nfev,
+                            fit_quality=st.session_state.app_state.fit_quality,
+                            last_popt=st.session_state.app_state.last_popt,
+                            progress_callback=update_progress
+                        )
                         
                         progress_bar.empty()
                         status_text.empty()
@@ -3170,7 +3243,7 @@ def step3_gaussian_deconvolution():
                    label='DRT Data', color='black', zorder=1)
             
             source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
-            for info in st.session_state.app_state.peak_info:
+            for idx, info in enumerate(st.session_state.app_state.peak_info):
                 source = info.get('source', 'auto')
                 color = source_colors.get(source, '#2ca02c')
                 ax.plot(info['x_linear'], info['y_original'], 'o', 
@@ -3197,22 +3270,42 @@ def step3_gaussian_deconvolution():
             st.pyplot(fig)
             plt.close()
             
-            # Peak info table
+            # Peak info table with delete buttons
             if st.session_state.app_state.peak_info:
-                peak_data = []
+                st.subheader("Peak List")
+                
                 for i, info in enumerate(st.session_state.app_state.peak_info):
+                    col_a, col_b, col_c, col_d, col_e = st.columns([0.5, 2, 2, 2, 1])
                     source = info.get('source', 'auto')
                     source_icon = "🟢" if source == 'auto' else "🟠" if source == 'manual' else "🔵"
-                    peak_data.append({
-                        'Peak': i + 1,
-                        'Source': f"{source_icon} {source}",
-                        'τ (s)': f"{info['x_linear']:.4e}",
-                        'γ(τ)': f"{info['y_original']:.4e}",
-                        'σ (log)': f"{info.get('sigma_est', 0):.4f}"
-                    })
+                    
+                    with col_a:
+                        st.write(f"{i+1}")
+                    with col_b:
+                        st.write(f"{source_icon} {source}")
+                    with col_c:
+                        st.write(f"τ = {info['x_linear']:.4e} s")
+                    with col_d:
+                        st.write(f"γ = {info['y_original']:.4e}")
+                    with col_e:
+                        if st.button("🗑️", key=f"delete_peak_{i}", help=f"Delete peak {i+1}"):
+                            if deconvolver.remove_peak_by_id(i+1):
+                                st.success(f"Peak {i+1} removed")
+                                st.rerun()
                 
-                df_peaks = pd.DataFrame(peak_data)
-                st.dataframe(df_peaks, use_container_width=True)
+                st.markdown("---")
+                
+                # Additional statistics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    auto_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', 'auto') == 'auto')
+                    st.metric("Auto-detected", auto_count)
+                with col2:
+                    manual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'manual')
+                    st.metric("Manually added", manual_count)
+                with col3:
+                    residual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'residuals')
+                    st.metric("From residuals", residual_count)
         
         elif st.session_state.app_state.deconv_calculated and st.session_state.app_state.deconv_result:
             st.success("✅ Deconvolution completed!")
