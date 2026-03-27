@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter, LogLocator, AutoMinorLocator
 from scipy import optimize, linalg, interpolate, integrate
 from scipy.signal import savgol_filter, find_peaks
-from scipy.integrate import trapezoid, cumtrapz
+from scipy.integrate import trapezoid
 from scipy.special import gamma as gamma_func
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
