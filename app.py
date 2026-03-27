@@ -188,6 +188,8 @@ def apply_publication_style():
         'lines.linewidth': 1.5,
         'lines.markersize': 6,
         'errorbar.capsize': 3,
+        'text.usetex': False, 
+        'mathtext.default': 'regular', 
     })
 
 apply_publication_style()
