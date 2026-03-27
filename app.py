@@ -30,6 +30,7 @@ from scipy.signal import savgol_filter, find_peaks, peak_widths
 from scipy.integrate import trapezoid
 from scipy.special import gamma as gamma_func
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import curve_fit, least_squares
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
@@ -1630,16 +1631,17 @@ class DataPreprocessor:
 # ============================================================================
 # Gaussian Deconvolver (from second code)
 # ============================================================================
-
 class GaussianDeconvolver:
     """Main class for spectral deconvolution with baseline correction"""
     
     def __init__(self, x_linear, y_original, use_log_x=True, use_log_y=False,
                  clip_negative=True, show_warnings=True, baseline_method='none',
                  smoothing_level='none'):
+        # Store original data WITHOUT ANY MODIFICATIONS for display purposes
         self.x_original = np.array(x_linear).copy()
         self.y_original_raw = np.array(y_original).copy()
         
+        # Working arrays that may be modified
         self.x_linear = np.array(x_linear)
         self.y_original = np.array(y_original)
         self.use_log_x = use_log_x
@@ -1647,25 +1649,42 @@ class GaussianDeconvolver:
         self.baseline_method = baseline_method
         self.smoothing_level = smoothing_level
         
+        # Sort by X to ensure monotonic increasing X
         sort_idx = np.argsort(self.x_linear)
         self.x_linear = self.x_linear[sort_idx]
         self.y_original = self.y_original[sort_idx]
         
+        # Store sorted original data for display
         self.x_sorted = self.x_linear.copy()
         self.y_sorted = self.y_original.copy()
         
+        # Preprocess data
         self.preprocessor = DataPreprocessor(clip_negative, show_warnings)
+        preprocessed = self.preprocessor.preprocess_for_fitting(
+            self.x_linear, self.y_original, use_log_x, use_log_y, smoothing_level
+        )
         
-        self.x = np.log10(self.x_linear) if use_log_x else self.x_linear
-        self.y = self.y_original.copy()
+        # Update with preprocessed data
+        self.x_sorted = preprocessed['x_sorted']
+        self.y_sorted = preprocessed['y_sorted']
+        self.x = preprocessed['x']
+        self.y = preprocessed['y']
+        self.y_for_fitting = preprocessed['y_for_fitting']
+        self.x_label = preprocessed['x_label']
+        self.y_label = preprocessed['y_label']
+        self.clipped_points = preprocessed['clipped_points']
+        self.small_values_warning = preprocessed['small_values_warning']
         
-        self.y_max = np.percentile(self.y_original, 95) if np.any(self.y_original > 0) else 1.0
+        # Normalization - use 95th percentile instead of max for robustness
+        self.y_max = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
         
+        # For fitting, we normalize but keep track for denormalization
         if self.y_max > 0:
             self.y_norm = self.y / self.y_max
         else:
             self.y_norm = self.y
         
+        # Results containers
         self.components = []
         self.fit_y_norm = None
         self.popt = None
@@ -1673,10 +1692,17 @@ class GaussianDeconvolver:
         self.quality_metrics = {}
         self.convergence_history = []
         self.total_area = 0
+        
+        # Fitter
         self.fitter = None
+        
+        # For compatibility with existing code
+        self.multi_gaussian = GaussianModel.multi_gaussian
+        self.gaussian = GaussianModel.gaussian
     
     def auto_detect_peaks(self, sensitivity=0.03, min_distance=5):
         """Automatic peak detection using derivatives"""
+        # Smoothing
         window_length = min(11, len(self.y_norm) // 5 * 2 + 1)
         if window_length % 2 == 0:
             window_length += 1
@@ -1686,19 +1712,24 @@ class GaussianDeconvolver:
         else:
             y_smooth = self.y_norm
         
+        # Calculate derivatives
         dy, d2y, y_smooth = DerivativeAnalyzer.calculate_derivatives(self.x, y_smooth)
         
+        # Peak search with different methods
         height_threshold = sensitivity * np.max(y_smooth)
         peaks1, _ = find_peaks(y_smooth, height=height_threshold, distance=min_distance)
         peaks2 = DerivativeAnalyzer.find_peaks_by_derivatives(self.x, y_smooth, dy, d2y, sensitivity)
         
+        # Combine results
         all_peaks = sorted(set(np.concatenate([peaks1, peaks2])))
         
+        # Filter close peaks
         filtered_peaks = []
         for peak in all_peaks:
             if not filtered_peaks or abs(self.x[peak] - self.x[filtered_peaks[-1]]) > min_distance * np.mean(np.diff(self.x)):
                 filtered_peaks.append(peak)
         
+        # Estimate parameters
         peak_info = []
         initial_params = []
         
@@ -1706,14 +1737,17 @@ class GaussianDeconvolver:
             cen = self.x[peak_idx]
             amp = y_smooth[peak_idx]
             
-            sigma = self._estimate_sigma_from_peak(self.x, y_smooth, peak_idx)
+            # Estimate sigma with fallback
+            sigma = GaussianModel.estimate_sigma_from_peak(self.x, y_smooth, peak_idx)
             sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / max(len(filtered_peaks), 1))
             
+            # Get original Y value for display
             if self.use_log_x:
                 x_linear = 10**self.x[peak_idx]
             else:
                 x_linear = self.x[peak_idx]
             
+            # Find closest index in original data - always in linear space
             idx = np.argmin(np.abs(self.x_sorted - x_linear))
             y_original_value = self.y_sorted[idx]
             
@@ -1735,50 +1769,30 @@ class GaussianDeconvolver:
         
         return filtered_peaks, peak_info, initial_params, (dy, d2y, y_smooth)
     
-    def _estimate_sigma_from_peak(self, x, y, peak_idx):
-        """Estimate sigma with fallback methods"""
-        try:
-            widths, width_heights, left_ips, right_ips = peak_widths(
-                y, [peak_idx], rel_height=0.5
-            )
-            fwhm = widths[0] * np.mean(np.diff(x))
-            sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
-            return sigma
-        except Exception as e:
-            left_min = peak_idx
-            right_min = peak_idx
-            
-            for i in range(peak_idx - 1, 0, -1):
-                if y[i] < y[i-1] and y[i] < y[i+1]:
-                    left_min = i
-                    break
-            
-            for i in range(peak_idx + 1, len(y) - 1):
-                if y[i] < y[i-1] and y[i] < y[i+1]:
-                    right_min = i
-                    break
-            
-            width = (right_min - left_min) * np.mean(np.diff(x))
-            sigma = width / 3.0
-            return max(sigma, 0.01 * (np.max(x) - np.min(x)) / 10)
-    
     def add_manual_peak(self, x_position_linear, amplitude=None, sigma_est=None):
         """Add a peak manually at specified linear X position"""
+        # Convert to log space if needed
         if self.use_log_x:
             x_position = np.log10(x_position_linear)
         else:
             x_position = x_position_linear
         
+        # Find index for amplitude estimation
         idx = np.argmin(np.abs(self.x_sorted - x_position_linear))
         
+        # Estimate amplitude if not provided
         if amplitude is None:
+            # Get normalized amplitude at this position
             if self.use_log_x:
+                # Find closest index in log space
                 log_idx = np.argmin(np.abs(self.x - x_position))
                 amplitude = self.y_norm[log_idx] if log_idx < len(self.y_norm) else 0.1
             else:
                 amplitude = self.y_norm[idx] if idx < len(self.y_norm) else 0.1
         
+        # Estimate sigma if not provided
         if sigma_est is None:
+            # Estimate based on distance to nearest minimum
             if self.use_log_x:
                 x_search = self.x
                 y_search = self.y_norm
@@ -1786,6 +1800,7 @@ class GaussianDeconvolver:
                 x_search = self.x_linear
                 y_search = self.y_original / self.y_max
             
+            # Find nearest minima to left and right
             left_idx = idx
             right_idx = idx
             for i in range(idx - 1, 0, -1):
@@ -1797,9 +1812,11 @@ class GaussianDeconvolver:
                     right_idx = i
                     break
             
+            # Estimate sigma
             width = (x_search[right_idx] - x_search[left_idx]) if right_idx > left_idx else 0.1
             sigma_est = max(width / 3.0, 0.01 * (np.max(x_search) - np.min(x_search)) / 20)
         
+        # Add peak info
         peak_info_entry = {
             'index': idx,
             'x': x_position,
@@ -1821,6 +1838,7 @@ class GaussianDeconvolver:
         if not peak_info:
             return [], []
         
+        # Build initial model with current peaks
         n_peaks = len(peak_info)
         if n_peaks == 0:
             return [], []
@@ -1829,12 +1847,16 @@ class GaussianDeconvolver:
         for info in peak_info:
             peak_params.extend([info['amp_est'], info['cen_est'], info['sigma_est']])
         
-        y_initial_fit = GaussianModelDeconv.multi_gaussian(self.x, *peak_params)
+        # Calculate initial fit
+        y_initial_fit = GaussianModel.multi_gaussian(self.x, *peak_params)
         
+        # Calculate residuals
         residuals = self.y_norm - y_initial_fit
         
+        # Detect peaks in residuals
         height_threshold = sensitivity * np.max(np.abs(residuals))
         
+        # Smooth residuals for better peak detection
         window_length = min(11, len(residuals) // 5 * 2 + 1)
         if window_length % 2 == 0:
             window_length += 1
@@ -1844,15 +1866,20 @@ class GaussianDeconvolver:
         else:
             residuals_smooth = residuals
         
+        # Find positive peaks (where data exceeds fit)
         positive_peaks, _ = find_peaks(residuals_smooth, height=height_threshold, distance=min_distance)
+        
+        # Find negative peaks (where fit exceeds data - potential shoulders)
         negative_peaks, _ = find_peaks(-residuals_smooth, height=height_threshold, distance=min_distance)
         
+        # Combine and filter
         all_candidate_indices = sorted(set(positive_peaks) | set(negative_peaks))
         
         missing_peaks = []
         missing_params = []
         
         for idx in all_candidate_indices:
+            # Skip if too close to existing peaks
             too_close = False
             for info in peak_info:
                 if abs(self.x[idx] - info['cen_est']) < min_distance * np.mean(np.diff(self.x)):
@@ -1864,14 +1891,16 @@ class GaussianDeconvolver:
             
             cen = self.x[idx]
             amp = abs(residuals_smooth[idx])
-            sigma = self._estimate_sigma_from_peak(self.x, residuals_smooth, idx)
+            sigma = GaussianModel.estimate_sigma_from_peak(self.x, residuals_smooth, idx)
             sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / 20)
             
+            # Get original Y value for display
             if self.use_log_x:
                 x_linear = 10**cen
             else:
                 x_linear = cen
             
+            # Find closest index in original data
             orig_idx = np.argmin(np.abs(self.x_sorted - x_linear))
             y_original_value = self.y_sorted[orig_idx]
             
@@ -1893,6 +1922,30 @@ class GaussianDeconvolver:
         
         return missing_peaks, missing_params
     
+    def _create_bounds(self, x, y_norm, n_peaks, n_baseline):
+        """Create bounds for fitting"""
+        lower_bounds = []
+        upper_bounds = []
+        x_range = np.max(x) - np.min(x)
+        
+        # Peak bounds
+        for i in range(n_peaks):
+            lower_bounds.extend([0, np.min(x), x_range * 0.001])
+            upper_bounds.extend([2 * np.max(y_norm), np.max(x), x_range * 0.5])
+        
+        # Baseline bounds
+        if n_baseline >= 1:  # constant
+            lower_bounds.append(-np.max(y_norm))
+            upper_bounds.append(np.max(y_norm))
+        if n_baseline >= 2:  # linear term
+            lower_bounds.append(-x_range)
+            upper_bounds.append(x_range)
+        if n_baseline >= 3:  # quadratic term
+            lower_bounds.append(-x_range**2)
+            upper_bounds.append(x_range**2)
+        
+        return lower_bounds, upper_bounds
+    
     def fit(self, initial_params=None, method='trf', maxfev=5000, 
             fit_quality='balanced', last_popt=None, progress_callback=None):
         """Perform fitting with selected method and baseline"""
@@ -1902,42 +1955,155 @@ class GaussianDeconvolver:
         if len(initial_params) == 0:
             return False
         
-        self.fitter = GaussianFitter(
-            method=method, 
-            max_nfev=maxfev,
-            baseline_method=self.baseline_method,
-            fit_quality=fit_quality,
-            last_popt=last_popt
-        )
+        n_peaks = len(initial_params) // 3
+        n_baseline = self._get_n_baseline_params()
         
-        success, popt, components, baseline_params = self.fitter.fit(
-            self.x, self.y_norm, initial_params, self.y_max,
-            progress_callback=progress_callback
-        )
+        # Use last good parameters if available
+        if last_popt is not None:
+            expected_len = n_peaks * 3 + n_baseline
+            if len(last_popt) == expected_len:
+                initial_params = last_popt.copy()
+            else:
+                initial_params = self._prepare_initial_params(initial_params, n_baseline)
+        else:
+            initial_params = self._prepare_initial_params(initial_params, n_baseline)
         
-        if success:
+        # Create bounds
+        lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
+        
+        # Ensure initial_params are within bounds
+        for i in range(len(initial_params)):
+            initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
+        
+        try:
+            if progress_callback:
+                progress_callback(0.3, "Initializing fit...")
+            
+            # Define the model function for curve_fit
+            def model_func(x, *params):
+                if n_baseline == 0:
+                    return GaussianModel.multi_gaussian(x, *params)
+                else:
+                    peak_params = params[:n_peaks*3]
+                    baseline_params = params[n_peaks*3:]
+                    return GaussianModel.multi_gaussian_with_baseline(
+                        x, n_peaks, peak_params, baseline_params, self.baseline_method
+                    )
+            
+            # Set tolerances based on fit quality
+            if fit_quality == 'fast':
+                xtol, ftol, gtol = 1e-3, 1e-3, 1e-3
+                maxfev = min(maxfev, 2000)
+            elif fit_quality == 'balanced':
+                xtol, ftol, gtol = 1e-5, 1e-5, 1e-5
+                maxfev = min(maxfev, 5000)
+            else:  # precise
+                xtol, ftol, gtol = 1e-8, 1e-8, 1e-8
+                maxfev = min(maxfev, 10000)
+            
+            # Perform fit
+            popt, pcov = curve_fit(
+                model_func,
+                self.x,
+                self.y_norm,
+                p0=initial_params,
+                bounds=(lower_bounds, upper_bounds),
+                method=method,
+                maxfev=maxfev,
+                xtol=xtol,
+                ftol=ftol,
+                gtol=gtol
+            )
+            
+            if progress_callback:
+                progress_callback(0.8, "Calculating components...")
+            
+            # Calculate fit
+            fit_y_norm = model_func(self.x, *popt)
+            
+            # Extract components
+            components = []
+            peak_params = popt[:n_peaks*3]
+            baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
+            
+            for i in range(n_peaks):
+                amp_norm = peak_params[3*i]
+                cen = peak_params[3*i + 1]
+                sigma = abs(peak_params[3*i + 2])
+                
+                amp = amp_norm * self.y_max
+                area = GaussianModel.calculate_area(amp_norm, sigma) * self.y_max
+                
+                component_y_norm = GaussianModel.gaussian(self.x, amp_norm, cen, sigma)
+                
+                # Calculate center in linear space
+                if self.use_log_x:
+                    cen_linear = 10**cen
+                else:
+                    cen_linear = cen
+                
+                components.append({
+                    'id': i + 1,
+                    'amp_norm': amp_norm,
+                    'amp': amp,
+                    'cen_log': cen,
+                    'cen_linear': cen_linear,
+                    'sigma_log': sigma,
+                    'fwhm': GaussianModel.calculate_fwhm(sigma),
+                    'area': area,
+                    'fraction': 0,
+                    'y_norm': component_y_norm
+                })
+            
+            # Calculate fractions
+            total_area = sum([c['area'] for c in components])
+            for c in components:
+                c['fraction'] = c['area'] / total_area if total_area > 0 else 0
+                c['fraction_percent'] = c['fraction'] * 100
+            
+            # Store results
             self.popt = popt
             self.components = components
             self.baseline_params = baseline_params
+            self.fit_y_norm = fit_y_norm
+            self.total_area = total_area
             
-            n_peaks = len(components)
-            peak_params = []
-            for c in components:
-                peak_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
-            
-            self.fit_y_norm = GaussianModelDeconv.multi_gaussian_with_baseline(
-                self.x, n_peaks, peak_params, baseline_params or [], self.baseline_method
-            )
-            
-            self.total_area = sum([c['area'] for c in self.components])
-            
+            # Calculate quality metrics
             self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
                 self.y_norm, self.fit_y_norm, len(popt)
             )
             
+            if progress_callback:
+                progress_callback(1.0, "Fit complete!")
+            
             return True
-        
-        return False
+            
+        except Exception as e:
+            if progress_callback:
+                progress_callback(1.0, f"Fit failed: {e}")
+            return False
+    
+    def _get_n_baseline_params(self):
+        """Get number of baseline parameters"""
+        return {
+            'none': 0,
+            'constant': 1,
+            'linear': 2,
+            'quadratic': 3
+        }.get(self.baseline_method, 0)
+    
+    def _prepare_initial_params(self, peak_params, n_baseline):
+        """Prepare initial parameters with baseline if needed"""
+        params = list(peak_params)
+        if n_baseline > 0:
+            if self.baseline_method == 'constant':
+                baseline_init = [np.percentile(self.y_norm, 5)]
+            elif self.baseline_method == 'linear':
+                baseline_init = [np.percentile(self.y_norm, 5), 0]
+            else:  # quadratic
+                baseline_init = [np.percentile(self.y_norm, 5), 0, 0]
+            params.extend(baseline_init[:n_baseline])
+        return params
     
     def preview_fit(self, initial_params=None):
         """Preview fit without optimization (fast)"""
@@ -1947,14 +2113,21 @@ class GaussianDeconvolver:
         if len(initial_params) == 0:
             return None
         
-        fitter = GaussianFitter(baseline_method=self.baseline_method)
+        n_peaks = len(initial_params) // 3
+        n_baseline = self._get_n_baseline_params()
         
-        n_baseline = fitter.get_n_baseline_params()
-        baseline_params = [0] * n_baseline if n_baseline > 0 else None
+        # Prepare parameters with baseline
+        full_params = self._prepare_initial_params(initial_params, n_baseline)
         
-        fit_y_norm = fitter.preview_fit(
-            self.x, initial_params, self.y_max, baseline_params
-        )
+        # Calculate fit
+        if n_baseline == 0:
+            fit_y_norm = GaussianModel.multi_gaussian(self.x, *full_params)
+        else:
+            peak_params = full_params[:n_peaks*3]
+            baseline_params = full_params[n_peaks*3:]
+            fit_y_norm = GaussianModel.multi_gaussian_with_baseline(
+                self.x, n_peaks, peak_params, baseline_params, self.baseline_method
+            )
         
         return fit_y_norm
     
@@ -1963,6 +2136,7 @@ class GaussianDeconvolver:
         if peak_id > len(self.components):
             return False
         
+        # Store the operation
         st.session_state.app_state.pending_remove = peak_id
         return True
     
@@ -1971,11 +2145,13 @@ class GaussianDeconvolver:
         if peak_id > len(self.components):
             return False
         
+        # Store the operation
         st.session_state.app_state.pending_split = (peak_id, split_position)
         return True
     
     def apply_pending_operations(self, fit_quality='balanced', progress_callback=None):
         """Apply all pending operations and perform fit"""
+        # Get current parameters
         if self.components:
             current_params = []
             for c in self.components:
@@ -1983,6 +2159,7 @@ class GaussianDeconvolver:
         else:
             return False
         
+        # Apply pending remove
         if st.session_state.app_state.pending_remove is not None:
             remove_id = st.session_state.app_state.pending_remove
             new_params = []
@@ -1992,6 +2169,7 @@ class GaussianDeconvolver:
             current_params = new_params
             st.session_state.app_state.pending_remove = None
         
+        # Apply pending split
         if st.session_state.app_state.pending_split is not None:
             peak_id, split_position = st.session_state.app_state.pending_split
             peak = self.components[peak_id - 1]
@@ -2019,6 +2197,7 @@ class GaussianDeconvolver:
             current_params = new_params
             st.session_state.app_state.pending_split = None
         
+        # Perform fit
         return self.fit(
             initial_params=current_params,
             method=st.session_state.app_state.fitting_method,
