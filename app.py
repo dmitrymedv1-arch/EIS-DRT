@@ -1108,38 +1108,100 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     
     return fig
 
-
 def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None,
                        title: str = "Distribution of Relaxation Times") -> plt.Figure:
-    """Create publication-quality DRT plot"""
-    fig, ax = plt.subplots(figsize=(7, 5))
+    """Create publication-quality DRT plot with both tau and frequency axes"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # ========================================================================
+    # Left plot: γ(τ) vs τ (log scale)
+    # ========================================================================
     
     # Plot DRT with uncertainty if available
     if result.gamma_std is not None:
-        ax.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
+        ax1.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
                         result.gamma + 2*result.gamma_std,
                         alpha=0.3, color='gray', label='±2σ uncertainty')
-    ax.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
+    ax1.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
     
-    # Plot peaks
+    # Plot peaks on left plot
     if peaks and len(peaks) > 0:
         peak_tau = [p['tau'] for p in peaks]
         peak_drt = [p['amplitude'] for p in peaks]
-        ax.plot(peak_tau, peak_drt, 'rv', markersize=8, label='Detected peaks')
+        ax1.plot(peak_tau, peak_drt, 'rv', markersize=8, label='Detected peaks')
         
-        # Add peak labels
+        # Add peak labels for left plot
         for i, (t, d) in enumerate(zip(peak_tau, peak_drt)):
             freq = 1/(2*np.pi*t)
-            ax.annotate(f'τ={t:.2e}s\nf={freq:.2e}Hz',
+            ax1.annotate(f'τ={t:.2e}s\nf={freq:.2e}Hz',
                        xy=(t, d), xytext=(t*1.5, d*1.2),
                        fontsize=8, ha='center',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
-    ax.set_xlabel(r"Relaxation Time $\tau$ / s", fontweight='bold')
-    ax.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
-    ax.set_title(title, fontweight='bold')
-    ax.legend(loc='best', frameon=True)
-    ax.grid(True, alpha=0.3, linestyle='--', which='both')
+    ax1.set_xlabel(r"Relaxation Time $\tau$ / s", fontweight='bold')
+    ax1.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
+    ax1.set_title(r"$\gamma(\tau)$ vs $\tau$", fontweight='bold')
+    ax1.legend(loc='best', frameon=True)
+    ax1.grid(True, alpha=0.3, linestyle='--', which='both')
+    
+    # ========================================================================
+    # Right plot: γ(τ) vs Frequency (Hz) - high to low frequency
+    # ========================================================================
+    
+    # Convert tau to frequency: f = 1/(2πτ)
+    frequencies = 1 / (2 * np.pi * result.tau_grid)
+    
+    # Sort frequencies in descending order (high to low)
+    sort_idx = np.argsort(frequencies)[::-1]  # Descending order
+    freqs_sorted = frequencies[sort_idx]
+    gamma_sorted = result.gamma[sort_idx]
+    
+    # Plot DRT vs frequency
+    if result.gamma_std is not None:
+        gamma_std_sorted = result.gamma_std[sort_idx]
+        ax2.fill_between(freqs_sorted, gamma_sorted - 2*gamma_std_sorted, 
+                        gamma_sorted + 2*gamma_std_sorted,
+                        alpha=0.3, color='gray', label='±2σ uncertainty')
+    ax2.semilogx(freqs_sorted, gamma_sorted, '-', linewidth=2, color='#2ca02c', label='DRT')
+    
+    # Plot peaks on frequency plot
+    if peaks and len(peaks) > 0:
+        peak_freqs = [p['frequency'] for p in peaks]
+        peak_amplitudes = [p['amplitude'] for p in peaks]
+        # Sort peaks by frequency (descending)
+        peak_pairs = sorted(zip(peak_freqs, peak_amplitudes), key=lambda x: x[0], reverse=True)
+        peak_freqs_sorted, peak_amplitudes_sorted = zip(*peak_pairs) if peak_pairs else ([], [])
+        
+        ax2.plot(peak_freqs_sorted, peak_amplitudes_sorted, 'rv', markersize=8, label='Detected peaks')
+        
+        # Add peak labels for right plot
+        for i, (f, d) in enumerate(zip(peak_freqs_sorted, peak_amplitudes_sorted)):
+            tau_val = 1/(2*np.pi*f)
+            ax2.annotate(f'f={f:.2e}Hz\nτ={tau_val:.2e}s',
+                       xy=(f, d), xytext=(f*1.5, d*1.2),
+                       fontsize=8, ha='center',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
+    
+    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
+    ax2.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
+    ax2.set_title(r"$\gamma(\tau)$ vs Frequency (High → Low)", fontweight='bold')
+    ax2.legend(loc='best', frameon=True)
+    ax2.grid(True, alpha=0.3, linestyle='--', which='both')
+    
+    # Ensure x-axis is log scale and shows from high to low
+    ax2.set_xscale('log')
+    # Invert x-axis to show high frequency on left, low on right
+    ax2.invert_xaxis()
+    
+    # Set x-axis limits to match data range
+    ax2.set_xlim(freqs_sorted[0], freqs_sorted[-1])
+    
+    # Add minor ticks for better readability
+    ax2.xaxis.set_minor_locator(AutoMinorLocator())
+    
+    # Main title
+    fig.suptitle(title, fontweight='bold', fontsize=14)
+    plt.tight_layout()
     
     return fig
 
