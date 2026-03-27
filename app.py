@@ -432,9 +432,11 @@ class TikhonovDRT(DRTCore):
             return np.eye(M)
     
     def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Solve non-negative least squares problem"""
         from scipy.optimize import nnls
-        x, _ = nnls(A, b)
+        x, resid = nnls(A, b)
+        # Проверка сходимости
+        if resid > 1e-6 * np.linalg.norm(b):
+            logging.warning(f"NNLS residual: {resid}")
         return x
     
     def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
@@ -491,9 +493,7 @@ class TikhonovDRT(DRTCore):
             gamma = self._solve_nnls(A, b)
         
         # Normalize DRT
-        integral = np.trapezoid(gamma, np.log(tau_grid))
-        if integral > 0:
-            gamma = gamma / integral * self.R_pol
+        pass
         
         # Estimate uncertainty from curvature of solution
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
@@ -572,10 +572,7 @@ class BayesianDRT(DRTCore):
         gamma_std = np.std(gamma_samples, axis=0)
         
         # Normalize
-        integral = np.trapezoid(gamma_mean, np.log(tau_grid))
-        if integral > 0:
-            gamma_mean = gamma_mean / integral * self.R_pol
-            gamma_std = gamma_std / integral * self.R_pol
+        pass
         
         # Check convergence using R-hat
         r_hat = az.rhat(trace).to_array().values
@@ -685,9 +682,7 @@ class MaxEntropyDRT(DRTCore):
             lambda_opt = lam
         
         # Normalize
-        integral = np.trapezoid(gamma, np.log(tau_grid))
-        if integral > 0:
-            gamma = gamma / integral * self.R_pol
+        pass
         
         # Estimate uncertainty
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
@@ -792,10 +787,7 @@ class FiniteGaussianProcessDRT(DRTCore):
             gamma_std += weights_std[i] * phi
         
         # Normalize
-        integral = np.trapezoid(gamma, np.log(tau_grid))
-        if integral > 0:
-            gamma = gamma / integral * self.R_pol
-            gamma_std = gamma_std / integral * self.R_pol
+        pass
         
         return DRTResult(
             tau_grid=tau_grid,
@@ -934,9 +926,7 @@ class LoewnerFrameworkDRT(DRTCore):
             gamma = np.maximum(gamma, 0)
         
         # Normalize
-        integral = np.trapezoid(gamma, np.log(tau_grid))
-        if integral > 0:
-            gamma = gamma / integral * self.R_pol
+        pass
         
         return DRTResult(
             tau_grid=tau_grid,
@@ -1591,6 +1581,13 @@ def main():
                 
                 # Reconstruct impedance
                 Z_rec_real, Z_rec_imag = drt_solver.reconstruct_impedance(result.tau_grid, result.gamma)
+                
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("Debug Info")
+                st.sidebar.write(f"R_inf: {result.R_inf:.4f} Ω")
+                st.sidebar.write(f"Integral gamma: {result.get_integral():.4f} Ω")
+                st.sidebar.write(f"R_pol (from data): {result.R_pol:.4f} Ω")
+                st.sidebar.write(f"Reconstruction error: {mean_error:.2f}%")
                 
             except Exception as e:
                 st.error(f"DRT calculation failed: {e}")
