@@ -75,8 +75,7 @@ class DRTResult:
         return np.log10(self.tau_grid)
     
     def get_integral(self) -> float:
-        return np.trapz(self.gamma, np.log(self.tau_grid))
-
+        return np.trapezoid(self.gamma, np.log(self.tau_grid))
 
 @dataclass
 class ImpedanceData:
@@ -492,7 +491,7 @@ class TikhonovDRT(DRTCore):
             gamma = self._solve_nnls(A, b)
         
         # Normalize DRT
-        integral = np.trapz(gamma, np.log(tau_grid))
+        integral = np.trapezoid(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
         
@@ -573,7 +572,7 @@ class BayesianDRT(DRTCore):
         gamma_std = np.std(gamma_samples, axis=0)
         
         # Normalize
-        integral = np.trapz(gamma_mean, np.log(tau_grid))
+        integral = np.trapezoid(gamma_mean, np.log(tau_grid))
         if integral > 0:
             gamma_mean = gamma_mean / integral * self.R_pol
             gamma_std = gamma_std / integral * self.R_pol
@@ -686,7 +685,7 @@ class MaxEntropyDRT(DRTCore):
             lambda_opt = lam
         
         # Normalize
-        integral = np.trapz(gamma, np.log(tau_grid))
+        integral = np.trapezoid(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
         
@@ -793,7 +792,7 @@ class FiniteGaussianProcessDRT(DRTCore):
             gamma_std += weights_std[i] * phi
         
         # Normalize
-        integral = np.trapz(gamma, np.log(tau_grid))
+        integral = np.trapezoid(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
             gamma_std = gamma_std / integral * self.R_pol
@@ -935,7 +934,7 @@ class LoewnerFrameworkDRT(DRTCore):
             gamma = np.maximum(gamma, 0)
         
         # Normalize
-        integral = np.trapz(gamma, np.log(tau_grid))
+        integral = np.trapezoid(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
         
@@ -999,7 +998,7 @@ def calculate_resistances(tau: np.ndarray, drt: np.ndarray, peaks_idx: List[int]
         else:
             end = (peaks_idx[i] + peaks_idx[i+1]) // 2
         
-        area = np.trapz(drt[start:end], np.log(tau[start:end]))
+        area = np.trapezoid(drt[start:end], np.log(tau[start:end]))
         resistances.append(area)
     
     return resistances
