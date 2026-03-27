@@ -1774,11 +1774,12 @@ def main():
             report = create_report(data, result, peaks, analysis_method, kk_passed, max_res)
             st.text(report)
             
-            # Download report
+            # Download report with key parameter to prevent rerun
             st.download_button("📥 Download Full Report (TXT)", 
                               data=report,
                               file_name=f"eis_drt_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                              mime="text/plain")
+                              mime="text/plain",
+                              key="download_report")
             
             st.markdown("---")
             st.subheader("📁 Export DRT Data")
@@ -1807,7 +1808,7 @@ def main():
                 gamma_std_sorted = result.gamma_std[sort_idx]
                 drt_data_freq['gamma_uncertainty_ohm'] = gamma_std_sorted
             
-            # Export options
+            # Export options with unique keys
             col1, col2 = st.columns(2)
             
             with col1:
@@ -1820,7 +1821,8 @@ def main():
                     "📥 Export DRT Data (τ format) - CSV", 
                     data=csv_tau,
                     file_name=f"drt_data_tau_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    key="download_tau_csv"
                 )
                 
                 # Create TXT for tau format (tab-separated)
@@ -1829,7 +1831,8 @@ def main():
                     "📥 Export DRT Data (τ format) - TXT", 
                     data=txt_tau,
                     file_name=f"drt_data_tau_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
+                    mime="text/plain",
+                    key="download_tau_txt"
                 )
                 
                 # Show preview
@@ -1846,7 +1849,8 @@ def main():
                     "📥 Export DRT Data (Frequency format) - CSV", 
                     data=csv_freq,
                     file_name=f"drt_data_frequency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    key="download_freq_csv"
                 )
                 
                 # Create TXT for frequency format (tab-separated)
@@ -1855,7 +1859,8 @@ def main():
                     "📥 Export DRT Data (Frequency format) - TXT", 
                     data=txt_freq,
                     file_name=f"drt_data_frequency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
+                    mime="text/plain",
+                    key="download_freq_txt"
                 )
                 
                 # Show preview
@@ -1884,7 +1889,8 @@ def main():
                     "📥 Export Peaks Data - CSV", 
                     data=peaks_csv,
                     file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    key="download_peaks_csv"
                 )
                 
                 # TXT export (tab-separated)
@@ -1893,7 +1899,8 @@ def main():
                     "📥 Export Peaks Data - TXT", 
                     data=peaks_txt,
                     file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
+                    mime="text/plain",
+                    key="download_peaks_txt"
                 )
                 
                 # Show peaks preview
@@ -1925,7 +1932,8 @@ def main():
                 "📥 Export Complete Dataset - CSV", 
                 data=complete_csv,
                 file_name=f"drt_complete_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
+                mime="text/csv",
+                key="download_complete_csv"
             )
             
             # TXT export (tab-separated)
@@ -1934,7 +1942,8 @@ def main():
                 "📥 Export Complete Dataset - TXT", 
                 data=complete_txt,
                 file_name=f"drt_complete_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
+                mime="text/plain",
+                key="download_complete_txt"
             )
             
             with st.expander("Preview - Complete Dataset"):
