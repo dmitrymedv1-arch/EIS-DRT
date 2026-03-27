@@ -3423,7 +3423,97 @@ def step4_results():
     with tab1:
         st.subheader("Gaussian Deconvolution Result")
         
-        fig = plot_deconvolution_result(deconv_result, show_components=True, show_baseline=True)
+        # Исправленный график деконволюции
+        fig, ax = plt.subplots(figsize=(12, 7))
+        
+        # Применяем логарифмическую шкалу если нужно
+        if deconv_result.use_log_x:
+            ax.set_xscale('log')
+        
+        # Оригинальные данные
+        ax.scatter(deconv_result.x_linear, deconv_result.y_original, 
+                   s=15, alpha=0.5, color='black', label='Original DRT Data', zorder=1)
+        
+        # Создаем плотную сетку для плавных кривых
+        if deconv_result.use_log_x:
+            x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
+            x_max = np.max(deconv_result.x_linear)
+            x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 2000)
+            x_dense_log = np.log10(x_dense)
+        else:
+            x_dense = np.linspace(np.min(deconv_result.x_linear), 
+                                  np.max(deconv_result.x_linear), 2000)
+            x_dense_log = x_dense
+        
+        # Рисуем компоненты (гауссианы) в оригинальном масштабе
+        if deconv_result.peaks:
+            colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+            for peak, color in zip(deconv_result.peaks, colors):
+                # Восстанавливаем компоненту в оригинальном масштабе
+                # Используем оригинальную амплитуду peak.amplitude
+                y_component = GaussianModelDeconv.gaussian(
+                    x_dense_log, 
+                    peak.amplitude_norm,  # нормализованная амплитуда для расчета формы
+                    peak.center_log, 
+                    peak.sigma_log
+                ) * max(deconv_result.y_original)  # денормализуем с помощью max оригинальных данных
+                
+                # Заполняем под гауссианом
+                ax.fill_between(x_dense, 0, y_component, 
+                                color=color, alpha=0.3, linewidth=0)
+                
+                # Рисуем линию
+                ax.plot(x_dense, y_component, '-', color=color, linewidth=2,
+                       label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
+        
+        # Рисуем базовую линию если есть
+        if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+            if deconv_result.baseline_method == 'constant':
+                y_baseline = np.full_like(x_dense, deconv_result.baseline_params[0] * max(deconv_result.y_original))
+                ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+            elif deconv_result.baseline_method == 'linear':
+                y_baseline = (deconv_result.baseline_params[0] + 
+                             deconv_result.baseline_params[1] * x_dense_log) * max(deconv_result.y_original)
+                ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+            elif deconv_result.baseline_method == 'quadratic':
+                y_baseline = (deconv_result.baseline_params[0] + 
+                             deconv_result.baseline_params[1] * x_dense_log +
+                             deconv_result.baseline_params[2] * x_dense_log**2) * max(deconv_result.y_original)
+                ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+        
+        # Рисуем общую сумму
+        if deconv_result.fit_y_norm is not None:
+            # Реконструируем общую сумму
+            n_peaks = len(deconv_result.peaks)
+            peak_params = []
+            for peak in deconv_result.peaks:
+                peak_params.extend([peak.amplitude_norm, peak.center_log, peak.sigma_log])
+            
+            if deconv_result.baseline_method != 'none' and deconv_result.baseline_params:
+                y_total = GaussianModelDeconv.multi_gaussian_with_baseline(
+                    x_dense_log, n_peaks, peak_params, 
+                    deconv_result.baseline_params, deconv_result.baseline_method
+                ) * max(deconv_result.y_original)
+            else:
+                y_total = GaussianModelDeconv.multi_gaussian(x_dense_log, *peak_params) * max(deconv_result.y_original)
+            
+            ax.plot(x_dense, y_total, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
+        
+        ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
+        ax.set_ylabel('γ(τ) (Ω)', fontweight='bold', fontsize=12)
+        ax.set_title('Gaussian Deconvolution of DRT Spectrum', fontweight='bold', fontsize=14)
+        ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        
+        # Добавляем метрики качества
+        if deconv_result.quality_metrics:
+            metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
+            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
+            ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
+                    fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
+        
+        plt.tight_layout()
         st.pyplot(fig)
         plt.close()
         
@@ -3502,12 +3592,13 @@ def step4_results():
                 'Peak ID': peak.id,
                 'Center (τ, s)': f"{peak.center:.4e}",
                 'Center (log τ)': f"{peak.center_log:.4f}",
-                'Amplitude': f"{peak.amplitude:.4e}",
+                'Amplitude (Ω)': f"{peak.amplitude:.4e}",
                 'Amplitude (norm)': f"{peak.amplitude_norm:.4f}",
                 'Sigma (log)': f"{peak.sigma_log:.4f}",
                 'FWHM': f"{peak.fwhm:.4f}",
-                'Area': f"{peak.area:.4e}",
-                'Fraction (%)': f"{peak.fraction_percent:.2f}"
+                'Area (Ω·s)': f"{peak.area:.4e}",
+                'Fraction (%)': f"{peak.fraction_percent:.2f}",
+                'Source': peak.source
             })
         
         df = pd.DataFrame(data)
@@ -3539,7 +3630,43 @@ def step4_results():
     with tab4:
         st.subheader("Normalized View (Max Peak = 1)")
         
-        fig = plot_deconvolution_components_comparison(deconv_result)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        if deconv_result.use_log_x:
+            ax.set_xscale('log')
+        
+        # Создаем плотную сетку
+        if deconv_result.use_log_x:
+            x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
+            x_max = np.max(deconv_result.x_linear)
+            x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 2000)
+            x_dense_log = np.log10(x_dense)
+        else:
+            x_dense = np.linspace(np.min(deconv_result.x_linear), 
+                                  np.max(deconv_result.x_linear), 2000)
+            x_dense_log = x_dense
+        
+        max_amp = max([p.amplitude for p in deconv_result.peaks]) if deconv_result.peaks else 1.0
+        
+        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        for peak, color in zip(deconv_result.peaks, colors):
+            # Нормализованная компонента
+            y_component = GaussianModelDeconv.gaussian(
+                x_dense_log, peak.amplitude_norm, peak.center_log, peak.sigma_log
+            )
+            y_component_norm = y_component * max(deconv_result.y_original) / max_amp
+            
+            ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
+                   label=f'Peak {peak.id} (center: {peak.center:.3e} s)')
+            ax.axvline(x=peak.center, color=color, linestyle=':', alpha=0.5, linewidth=1)
+        
+        ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
+        ax.set_ylabel('Normalized Intensity', fontweight='bold')
+        ax.set_title('Normalized Components Comparison (Max Peak = 1)', fontweight='bold')
+        ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
         st.pyplot(fig)
         plt.close()
         
@@ -3548,13 +3675,12 @@ def step4_results():
         st.subheader("Normalized Parameters")
         
         norm_data = []
-        max_amp = deconv_result.max_amplitude
         for peak in deconv_result.peaks:
             norm_data.append({
                 'Peak': peak.id,
                 'Center (τ, s)': f"{peak.center:.4e}",
                 'Normalized Amplitude': f"{peak.amplitude / max_amp:.4f}",
-                'Original Amplitude': f"{peak.amplitude:.4e}",
+                'Original Amplitude (Ω)': f"{peak.amplitude:.4e}",
                 'Fraction (%)': f"{peak.fraction_percent:.2f}"
             })
         
@@ -3574,14 +3700,14 @@ def step4_results():
                 'Peak_ID': p.id,
                 'Center_tau_s': p.center,
                 'Center_log_tau': p.center_log,
-                'Amplitude': p.amplitude,
+                'Amplitude_Ohm': p.amplitude,
                 'Amplitude_Normalized': p.amplitude_norm,
                 'Sigma_log': p.sigma_log,
                 'FWHM': p.fwhm,
-                'Area': p.area,
+                'Area_Ohm_s': p.area,
                 'Fraction': p.fraction,
                 'Fraction_Percent': p.fraction_percent,
-                'Source': getattr(p, 'source', 'auto')
+                'Source': p.source
             } for p in deconv_result.peaks])
             
             csv_peaks = peaks_df.to_csv(index=False)
@@ -3598,9 +3724,9 @@ def step4_results():
             # Create fitting data DataFrame
             fit_data = pd.DataFrame({
                 'tau_s': deconv_result.x_linear,
-                'gamma_tau': deconv_result.y_original,
-                'gamma_fit': deconv_result.fit_y_norm * deconv_result.y_original.max(),
-                'Residuals': deconv_result.quality_metrics.get('Residuals', np.zeros_like(deconv_result.x_linear)) * deconv_result.y_original.max()
+                'gamma_tau_Ohm': deconv_result.y_original,
+                'gamma_fit_Ohm': deconv_result.fit_y_norm * max(deconv_result.y_original) if deconv_result.fit_y_norm is not None else np.zeros_like(deconv_result.x_linear),
+                'Residuals_Ohm': deconv_result.quality_metrics.get('Residuals', np.zeros_like(deconv_result.x_linear)) * max(deconv_result.y_original) if deconv_result.quality_metrics else np.zeros_like(deconv_result.x_linear)
             })
             
             csv_fit = fit_data.to_csv(index=False)
@@ -3616,10 +3742,17 @@ def step4_results():
             st.markdown("**Generate Report**")
             
             if st.button("📄 Generate Detailed Report", use_container_width=True):
+                max_amp = max([p.amplitude for p in deconv_result.peaks]) if deconv_result.peaks else 1.0
+                
                 report = f"""GAUSSIAN DECONVOLUTION REPORT
 {"="*80}
 
 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Number of points: {len(deconv_result.x_linear)}
+τ range: [{deconv_result.x_linear[0]:.2e}, {deconv_result.x_linear[-1]:.2e}] s
+Logarithmic X scale: {deconv_result.use_log_x}
+Baseline method: {deconv_result.baseline_method}
+Smoothing level: {st.session_state.app_state.smoothing_level}
 
 QUALITY METRICS:
 {"-"*40}
@@ -3641,15 +3774,27 @@ Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
                 
                 report += f"""PEAK PARAMETERS:
 {"-"*80}
-ID    Center (s)      Amplitude       Area           Fraction(%)
+ID    Center (s)      Amplitude (Ω)    Area (Ω·s)       Fraction(%)
 {"-"*80}"""
                 
                 for p in deconv_result.peaks:
                     report += f"\n{p.id:<4} {p.center:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
                 
                 report += f"""
+
+NORMALIZED PARAMETERS (Max Peak = 1):
+{"-"*80}
+ID    Center (s)      Norm. Amplitude    Original Amplitude    Fraction(%)
+{"-"*80}"""
+                
+                for p in deconv_result.peaks:
+                    norm_amp = p.amplitude / max_amp
+                    report += f"\n{p.id:<4} {p.center:.4e}   {norm_amp:<18.4f} {p.amplitude:<20.4e} {p.fraction_percent:<10.2f}"
+                
+                report += f"""
 {"="*80}
-Total Area: {deconv_result.total_area:.6e}
+Total Area: {deconv_result.total_area:.6e} Ω·s
+Maximum Amplitude: {max_amp:.6e} Ω
 Number of Peaks: {len(deconv_result.peaks)}
 {"="*80}"""
                 
@@ -3660,60 +3805,13 @@ Number of Peaks: {len(deconv_result.peaks)}
                     mime="text/plain",
                     use_container_width=True
                 )
-            
-            st.markdown("---")
-            st.markdown("**Start New Analysis**")
-            
-            if st.button("🔄 New Analysis", use_container_width=True):
-                st.session_state.app_state = AppState()
-                st.rerun()
-    
-    # Additional: Compare with original DRT
-    if st.session_state.app_state.drt_result:
+        
         st.markdown("---")
-        st.subheader("Comparison with Original DRT")
+        st.markdown("**Start New Analysis**")
         
-        drt_result = st.session_state.app_state.drt_result
-        peaks_drt = find_peaks_drt(drt_result.tau_grid, drt_result.gamma)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.semilogx(drt_result.tau_grid, drt_result.gamma, 'b-', linewidth=2, label='Original DRT')
-            
-            for peak in deconv_result.peaks:
-                ax.axvline(x=peak.center, color='red', linestyle='--', alpha=0.5)
-                ax.text(peak.center, np.max(drt_result.gamma) * 0.9, 
-                       f'Peak {peak.id}', ha='center', fontsize=9)
-            
-            ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-            ax.set_ylabel('γ(τ)', fontweight='bold')
-            ax.set_title('DRT with Deconvolved Peak Positions', fontweight='bold')
-            ax.legend()
-            ax.grid(True, alpha=0.3, linestyle='--')
-            st.pyplot(fig)
-            plt.close()
-        
-        with col2:
-            # Comparison table
-            comparison_data = []
-            for i, peak in enumerate(deconv_result.peaks):
-                matching_drt = None
-                for p in peaks_drt:
-                    if abs(np.log10(p['tau']) - peak.center_log) < 0.3:
-                        matching_drt = p
-                        break
-                
-                comparison_data.append({
-                    'Deconvolved Peak': i + 1,
-                    'τ (s)': f"{peak.center:.4e}",
-                    'DRT τ (s)': f"{matching_drt['tau']:.4e}" if matching_drt else "N/A",
-                    'Match': "✓" if matching_drt else "✗"
-                })
-            
-            df_comp = pd.DataFrame(comparison_data)
-            st.dataframe(df_comp, use_container_width=True)
+        if st.button("🔄 New Analysis", use_container_width=True):
+            st.session_state.app_state = AppState()
+            st.rerun()
 
 
 # ============================================================================
