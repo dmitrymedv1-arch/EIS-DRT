@@ -3627,14 +3627,24 @@ def step4_results():
             st.dataframe(baseline_df, use_container_width=True)
     
     with tab4:
-        st.subheader("Normalized View (Max Peak = 1)")
+        st.subheader("Normalized Gaussian Deconvolution Result")
         
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(12, 7))
         
+        # Применяем логарифмическую шкалу если нужно
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        # Создаем плотную сетку
+        # Находим максимальную амплитуду для нормализации
+        max_amp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
+        
+        # Нормализованные оригинальные данные
+        y_original_norm = deconv_result.y_original / max_amp
+        
+        ax.scatter(deconv_result.x_linear, y_original_norm, 
+                   s=15, alpha=0.5, color='black', label='Original DRT Data (normalized)', zorder=1)
+        
+        # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
             x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
             x_max = np.max(deconv_result.x_linear)
@@ -3645,45 +3655,79 @@ def step4_results():
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
-        max_amp = max([p.amplitude for p in deconv_result.peaks]) if deconv_result.peaks else 1.0
+        # Рисуем нормализованные компоненты (гауссианы)
+        if deconv_result.peaks:
+            colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+            for peak, color in zip(deconv_result.peaks, colors):
+                # Нормализуем компоненту (делим на максимальную амплитуду)
+                y_component_norm = (peak.amplitude * GaussianModelDeconv.gaussian(
+                    x_dense_log, 
+                    1.0,
+                    peak.center_log, 
+                    peak.sigma_log
+                )) / max_amp
+                
+                ax.fill_between(x_dense, 0, y_component_norm, 
+                                color=color, alpha=0.3, linewidth=0)
+                ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
+                       label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
         
-        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
-        for peak, color in zip(deconv_result.peaks, colors):
-            # Нормализованная компонента (максимум = 1)
-            y_component = GaussianModelDeconv.gaussian(
-                x_dense_log, 1.0, peak.center_log, peak.sigma_log
-            )
+        # Рисуем нормализованную базовую линию если есть
+        if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+            if deconv_result.baseline_method == 'constant':
+                y_baseline_norm = deconv_result.baseline_params[0] / max_amp
+                ax.axhline(y=y_baseline_norm, color='gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+            elif deconv_result.baseline_method == 'linear':
+                y_baseline_norm = (deconv_result.baseline_params[0] + 
+                                  deconv_result.baseline_params[1] * x_dense_log) / max_amp
+                ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+            elif deconv_result.baseline_method == 'quadratic':
+                y_baseline_norm = (deconv_result.baseline_params[0] + 
+                                  deconv_result.baseline_params[1] * x_dense_log +
+                                  deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
+                ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+        
+        # Рисуем нормализованную общую сумму
+        if deconv_result.peaks:
+            y_total_norm = np.zeros_like(x_dense)
+            for peak in deconv_result.peaks:
+                y_total_norm += (peak.amplitude * GaussianModelDeconv.gaussian(
+                    x_dense_log, 1.0, peak.center_log, peak.sigma_log
+                )) / max_amp
             
-            ax.plot(x_dense, y_component, '-', color=color, linewidth=2,
-                   label=f'Peak {peak.id} (center: {peak.center:.3e} s)')
-            ax.axvline(x=peak.center, color=color, linestyle=':', alpha=0.5, linewidth=1)
+            if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+                if deconv_result.baseline_method == 'constant':
+                    y_total_norm += deconv_result.baseline_params[0] / max_amp
+                elif deconv_result.baseline_method == 'linear':
+                    y_total_norm += (deconv_result.baseline_params[0] + 
+                                    deconv_result.baseline_params[1] * x_dense_log) / max_amp
+                elif deconv_result.baseline_method == 'quadratic':
+                    y_total_norm += (deconv_result.baseline_params[0] + 
+                                    deconv_result.baseline_params[1] * x_dense_log +
+                                    deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
+            
+            ax.plot(x_dense, y_total_norm, 'r--', linewidth=2.5, label='Total Fit (normalized)', zorder=3)
         
-        ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-        ax.set_ylabel('Normalized Intensity', fontweight='bold')
-        ax.set_title('Normalized Components Comparison (Max Peak = 1)', fontweight='bold')
+        ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
+        ax.set_ylabel('Normalized Intensity (γ(τ) / γ_max)', fontweight='bold', fontsize=12)
+        ax.set_title('Normalized Gaussian Deconvolution Result', fontweight='bold', fontsize=14)
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
+        
+        # Добавляем метрики качества
+        if deconv_result.quality_metrics:
+            metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
+            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
+            ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
+                    fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
         
         plt.tight_layout()
         st.pyplot(fig)
         plt.close()
         
-        # Normalized parameters table
-        st.markdown("---")
-        st.subheader("Normalized Parameters")
-        
-        norm_data = []
-        for peak in deconv_result.peaks:
-            norm_data.append({
-                'Peak': peak.id,
-                'Center (τ, s)': f"{peak.center:.4e}",
-                'Normalized Amplitude': f"{peak.amplitude / max_amp:.4f}",
-                'Original Amplitude (Ω)': f"{peak.amplitude:.4e}",
-                'Fraction (%)': f"{peak.fraction_percent:.2f}"
-            })
-        
-        df_norm = pd.DataFrame(norm_data)
-        st.dataframe(df_norm, use_container_width=True)
+        # Добавляем пояснение
+        st.caption(f"Нормализовано к максимальному значению γ_max = {max_amp:.4e} Ω")
     
     with tab5:
         st.subheader("Export Results")
