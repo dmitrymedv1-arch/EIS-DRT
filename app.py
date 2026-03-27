@@ -2763,31 +2763,58 @@ def step3_gaussian_deconvolution():
         with col_next:
             if st.button("🎯 Perform Deconvolution", type="primary", use_container_width=True):
                 with st.spinner("Performing Gaussian deconvolution..."):
-                    if st.session_state.app_state.peak_info is None:
-                        _, st.session_state.app_state.peak_info, st.session_state.app_state.initial_peak_params, _ = deconvolver.auto_detect_peaks(
+                    # Ensure peak_info is initialized
+                    if st.session_state.app_state.peak_info is None or len(st.session_state.app_state.peak_info) == 0:
+                        peaks, peak_info, initial_params, _ = deconvolver.auto_detect_peaks(
                             sensitivity=sensitivity, min_distance=min_distance
                         )
+                        st.session_state.app_state.peak_info = peak_info
+                        st.session_state.app_state.initial_peak_params = initial_params
+                        st.success(f"Auto-detected {len(peak_info)} peaks")
                     
-                    if st.session_state.app_state.preview_mode:
-                        preview_fit = deconvolver.preview_fit(st.session_state.app_state.initial_peak_params)
-                        if preview_fit is not None:
-                            st.session_state.app_state.preview_fit = preview_fit
-                            st.success("Preview generated")
+                    # Check if we have peaks to fit
+                    if st.session_state.app_state.initial_peak_params is None or len(st.session_state.app_state.initial_peak_params) == 0:
+                        st.error("No peaks detected. Please adjust sensitivity or add manual peaks.")
                     else:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        def update_progress(progress, message):
-                            progress_bar.progress(progress)
-                            status_text.text(message)
-                        
-                        success = deconvolver.fit(
-                            initial_params=st.session_state.app_state.initial_peak_params,
-                            method=st.session_state.app_state.fitting_method,
-                            maxfev=st.session_state.app_state.max_nfev,
-                            fit_quality=st.session_state.app_state.fit_quality,
-                            progress_callback=update_progress
-                        )
+                        if st.session_state.app_state.preview_mode:
+                            preview_fit = deconvolver.preview_fit(st.session_state.app_state.initial_peak_params)
+                            if preview_fit is not None:
+                                st.session_state.app_state.preview_fit = preview_fit
+                                st.success("Preview generated")
+                            else:
+                                st.error("Preview failed. Check peak parameters.")
+                        else:
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            def update_progress(progress, message):
+                                progress_bar.progress(progress)
+                                status_text.text(message)
+                            
+                            # Ensure initial_params is a list, not None
+                            initial_params = st.session_state.app_state.initial_peak_params
+                            if isinstance(initial_params, np.ndarray):
+                                initial_params = initial_params.tolist()
+                            
+                            success = deconvolver.fit(
+                                initial_params=initial_params,
+                                method=st.session_state.app_state.fitting_method,
+                                maxfev=st.session_state.app_state.max_nfev,
+                                fit_quality=st.session_state.app_state.fit_quality,
+                                progress_callback=update_progress
+                            )
+                            
+                            progress_bar.empty()
+                            status_text.empty()
+                            
+                            if success:
+                                st.session_state.app_state.last_popt = deconvolver.popt
+                                st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
+                                st.session_state.app_state.deconv_calculated = True
+                                st.success("✅ Deconvolution complete!")
+                                st.rerun()
+                            else:
+                                st.error("Deconvolution failed. Try adjusting sensitivity or adding more manual peaks.")
                         
                         progress_bar.empty()
                         status_text.empty()
