@@ -1372,7 +1372,21 @@ def create_report(data: ImpedanceData, result: DRTResult, peaks_data: List[Dict[
     DRT Parameters:
     - Time constant range: {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
     - Total integral: {result.get_integral():.4f} Ω
+    """
     
+    # Add regularization info if available
+    if 'lambda' in result.metadata:
+        lambda_val = result.metadata['lambda']
+        lambda_auto = result.metadata.get('lambda_auto', False)
+        if lambda_auto:
+            report += f"    - Regularization parameter λ: {lambda_val:.3e} (automatically selected via L-curve)\n"
+        else:
+            report += f"    - Regularization parameter λ: {lambda_val:.3e} (manually specified)\n"
+    
+    if 'order' in result.metadata:
+        report += f"    - Regularization order: {result.metadata['order']}\n"
+    
+    report += f"""
     Detected Processes:
     """
     
@@ -1673,6 +1687,20 @@ def main():
         with tab1:
             st.subheader("Distribution of Relaxation Times")
             
+            # Display regularization parameter if available
+            if 'lambda' in result.metadata:
+                lambda_val = result.metadata['lambda']
+                lambda_auto = result.metadata.get('lambda_auto', False)
+                
+                if lambda_auto:
+                    st.info(f"📊 **Automatic λ selection**: Optimal regularization parameter λ = **{lambda_val:.3e}** selected via L-curve criterion")
+                else:
+                    st.info(f"⚙️ **Manual λ selection**: Regularization parameter λ = **{lambda_val:.3e}**")
+            
+            # Display regularization order if available
+            if 'order' in result.metadata:
+                st.info(f"🔧 **Regularization order**: {result.metadata['order']}")
+            
             # Publication-quality DRT plot
             fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
@@ -1687,7 +1715,8 @@ def main():
             st.download_button("📥 Download DRT Plot (PNG, 600 dpi)", 
                               data=buf.getvalue(),
                               file_name=f"drt_spectrum_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                              mime="image/png")
+                              mime="image/png",
+                              key="download_drt_plot")
             
             # Display peak information
             if peaks:
