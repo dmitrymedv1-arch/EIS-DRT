@@ -85,8 +85,8 @@ def apply_modern_scientific_style():
         'axes.edgecolor': '#2c3e50',
         'axes.linewidth': 1.2,
         'axes.grid': True,
-        'axes.grid.alpha': 0.3,
-        'axes.grid.linestyle': '--',
+        'grid.alpha': 0.3,
+        'grid.linestyle': '--',
         
         # Tick settings
         'xtick.color': '#2c3e50',
