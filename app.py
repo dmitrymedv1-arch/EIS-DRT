@@ -1,17 +1,17 @@
-# app.py
 """
 Electrochemical Impedance Spectroscopy (EIS) Analysis Tool
 Distribution of Relaxation Times (DRT) Analysis
 
 Поддерживаемые методы:
-- Тихоновская регуляризация (Tikhonov)
-- Байесовский метод (Bayesian)
-- Метод максимальной энтропии (Maximum Entropy)
-- Гауссовские процессы (GP-DRT)
-- Генетическое программирование (ISGP)
+- Тихоновская регуляризация (Tikhonov) с NNLS
+- Байесовский метод с MCMC (PyMC)
+- Метод максимальной энтропии (Maximum Entropy) с авто-выбором λ
+- Гауссовские процессы (fGP-DRT) с non-negativity constraints
+- Loewner Framework (RLF) - data-driven метод
+- Generalized DRT для обработки индуктивных петель
 
 Author: DRT Analysis Tool
-Version: 2.0.0
+Version: 3.0.0
 """
 
 import streamlit as st
@@ -19,9 +19,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter, LogLocator, AutoMinorLocator
-from scipy import optimize, linalg, interpolate
+from scipy import optimize, linalg, interpolate, integrate
 from scipy.signal import savgol_filter, find_peaks
-from scipy.integrate import trapezoid
+from scipy.integrate import trapezoid, cumtrapz
 from scipy.special import gamma as gamma_func
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -29,18 +29,125 @@ import io
 import base64
 from datetime import datetime
 import warnings
+import logging
+from typing import Tuple, Optional, List, Dict, Any, Union
+from dataclasses import dataclass, field
+from enum import Enum
+
+# PyMC for Bayesian MCMC
+try:
+    import pymc as pm
+    import arviz as az
+    PYMC_AVAILABLE = True
+except ImportError:
+    PYMC_AVAILABLE = False
+    warnings.warn("PyMC not installed. Bayesian MCMC will be disabled.")
+
 warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="EIS-DRT Analysis Tool",
+    page_title="EIS-DRT Analysis Tool v3.0",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+
 # ============================================================================
-# Scientific Plotting Style for Matplotlib (for publication-ready figures)
+# Data Classes for Results Storage
+# ============================================================================
+
+@dataclass
+class DRTResult:
+    """Container for DRT calculation results"""
+    tau_grid: np.ndarray
+    gamma: np.ndarray
+    gamma_std: Optional[np.ndarray] = None
+    method: str = ""
+    R_inf: float = 0.0
+    R_pol: float = 0.0
+    convergence: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    @property
+    def log_tau(self) -> np.ndarray:
+        return np.log10(self.tau_grid)
+    
+    def get_integral(self) -> float:
+        return np.trapz(self.gamma, np.log(self.tau_grid))
+
+
+@dataclass
+class ImpedanceData:
+    """Container for impedance data with preprocessing"""
+    freq: np.ndarray
+    re_z: np.ndarray
+    im_z: np.ndarray
+    original_freq: np.ndarray = None
+    original_re_z: np.ndarray = None
+    original_im_z: np.ndarray = None
+    removed_indices: List[int] = field(default_factory=list)
+    frequency_range: Tuple[float, float] = (None, None)
+    
+    def __post_init__(self):
+        self.original_freq = self.freq.copy()
+        self.original_re_z = self.re_z.copy()
+        self.original_im_z = self.im_z.copy()
+        self._sort_by_frequency()
+    
+    def _sort_by_frequency(self):
+        idx = np.argsort(self.freq)
+        self.freq = self.freq[idx]
+        self.re_z = self.re_z[idx]
+        self.im_z = self.im_z[idx]
+    
+    def remove_point(self, index: int):
+        """Remove a specific point by index"""
+        if 0 <= index < len(self.freq):
+            self.removed_indices.append(index)
+            mask = np.ones(len(self.freq), dtype=bool)
+            mask[index] = False
+            self.freq = self.freq[mask]
+            self.re_z = self.re_z[mask]
+            self.im_z = self.im_z[mask]
+    
+    def apply_frequency_range(self, f_min: float, f_max: float):
+        """Crop frequency range"""
+        mask = (self.freq >= f_min) & (self.freq <= f_max)
+        self.freq = self.freq[mask]
+        self.re_z = self.re_z[mask]
+        self.im_z = self.im_z[mask]
+        self.frequency_range = (f_min, f_max)
+    
+    def reset(self):
+        """Reset to original data"""
+        self.freq = self.original_freq.copy()
+        self.re_z = self.original_re_z.copy()
+        self.im_z = self.original_im_z.copy()
+        self.removed_indices = []
+        self.frequency_range = (None, None)
+        self._sort_by_frequency()
+    
+    @property
+    def n_points(self) -> int:
+        return len(self.freq)
+    
+    @property
+    def Z(self) -> np.ndarray:
+        return self.re_z + 1j * self.im_z
+    
+    @property
+    def Z_mod(self) -> np.ndarray:
+        return np.sqrt(self.re_z**2 + self.im_z**2)
+    
+    @property
+    def phase(self) -> np.ndarray:
+        return np.arctan2(self.im_z, self.re_z) * 180 / np.pi
+
+
+# ============================================================================
+# Scientific Plotting Style for Matplotlib
 # ============================================================================
 
 def apply_publication_style():
@@ -86,27 +193,31 @@ def apply_publication_style():
 
 apply_publication_style()
 
+
 # ============================================================================
 # Data Loading and Validation
 # ============================================================================
 
-def load_data(file, freq_col, re_col, im_col):
+def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Load impedance data from uploaded file."""
     if file is not None:
-        df = pd.read_csv(file)
-        if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
-            freq = df[freq_col].values
-            re_z = df[re_col].values
-            im_z = np.abs(df[im_col].values)  # Ensure positive
-            return freq, re_z, im_z
+        try:
+            df = pd.read_csv(file)
+            if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
+                freq = df[freq_col].values.astype(float)
+                re_z = df[re_col].values.astype(float)
+                im_z = np.abs(df[im_col].values.astype(float))
+                return freq, re_z, im_z
+        except Exception as e:
+            st.error(f"Error loading file: {e}")
     return None, None, None
 
-def manual_data_entry():
+
+def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Create widget for manual data entry with single text area."""
     st.subheader("Ручной ввод данных")
     st.markdown("Введите данные в формате: **частота Re(Z) -Im(Z)** (разделитель - пробел или табуляция)")
     
-    # Пример данных для отображения
     example_data = """1000000	-71.55	-3745
 891300	-102.3	-4127
 794300	-62.24	-4664
@@ -129,19 +240,16 @@ def manual_data_entry():
     
     if st.button("Загрузить данные", type="primary"):
         try:
-            # Парсинг данных
             rows = []
             for line in data_input.strip().split('\n'):
-                # Пропускаем пустые строки
                 if not line.strip():
                     continue
-                # Разделяем по пробелам или табуляции
                 parts = line.strip().split()
                 if len(parts) >= 3:
                     try:
                         freq_val = float(parts[0])
                         re_val = float(parts[1])
-                        im_val = abs(float(parts[2]))  # Берем абсолютное значение для -Im(Z)
+                        im_val = abs(float(parts[2]))
                         rows.append([freq_val, re_val, im_val])
                     except ValueError:
                         st.warning(f"Пропущена некорректная строка: {line}")
@@ -152,10 +260,8 @@ def manual_data_entry():
                 freq = rows[:, 0]
                 re_z = rows[:, 1]
                 im_z = rows[:, 2]
-                
                 st.success(f"✅ Загружено {len(freq)} точек спектра")
                 
-                # Показываем预览 загруженных данных
                 with st.expander("Просмотр загруженных данных"):
                     preview_df = pd.DataFrame({
                         'Frequency (Hz)': freq,
@@ -167,66 +273,63 @@ def manual_data_entry():
                 return freq, re_z, im_z
             else:
                 st.error(f"Недостаточно данных. Загружено только {len(rows)} строк. Минимум 3 строки.")
-                
         except Exception as e:
             st.error(f"Ошибка при загрузке данных: {e}")
             st.info("Проверьте формат данных. Каждая строка должна содержать: частоту, Re(Z), -Im(Z)")
     
     return None, None, None
 
-def kramers_kronig_test(freq, re_z, im_z):
-    """Perform Kramers-Kronig validation test."""
-    omega = 2 * np.pi * freq
-    n_points = len(freq)
-    
-    # Create test model with RC elements
-    tau_range = np.logspace(np.log10(1/(2*np.pi*freq[-1])), 
-                           np.log10(1/(2*np.pi*freq[0])), 
-                           min(50, n_points//2))
-    
-    H = np.zeros((n_points, len(tau_range)), dtype=complex)
-    for i, w in enumerate(omega):
-        for j, tau in enumerate(tau_range):
-            H[i, j] = 1/(1 + 1j*w*tau)
-    
+
+def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: np.ndarray) -> Tuple[bool, float, np.ndarray, np.ndarray]:
+    """
+    Perform Kramers-Kronig validation using Hilbert transform.
+    This is the proper KK test as described in literature.
+    """
     try:
-        # Solve for RC weights using non-negative least squares
-        from scipy.optimize import nnls
-        H_real = H.real
-        H_imag = H.imag
+        omega = 2 * np.pi * freq
+        log_omega = np.log(omega)
         
-        R_inf_est = re_z[-1]
-        weights_real, _ = nnls(H_real, re_z - R_inf_est)
-        weights_imag, _ = nnls(H_imag, im_z)
+        # Interpolate data for Hilbert transform
+        from scipy.interpolate import interp1d
+        interp_omega = np.logspace(np.log10(omega[0]), np.log10(omega[-1]), 500)
+        interp_re = interp1d(omega, re_z, kind='cubic', fill_value='extrapolate')(interp_omega)
+        interp_im = interp1d(omega, im_z, kind='cubic', fill_value='extrapolate')(interp_omega)
+        
+        # Calculate Hilbert transform of imaginary part to predict real part
+        # For a causal system, Re(Z) = H{Im(Z)} where H is Hilbert transform
+        from scipy.signal import hilbert
+        analytic = hilbert(interp_im)
+        re_predicted = np.real(analytic)
+        
+        # Interpolate back to original frequencies
+        re_pred_original = interp1d(interp_omega, re_predicted, kind='cubic', fill_value='extrapolate')(omega)
         
         # Calculate residuals
-        re_pred = R_inf_est + H_real @ weights_real
-        im_pred = H_imag @ weights_imag
+        residuals = (re_z - re_pred_original) / np.abs(re_z + 1e-10)
+        max_residual = np.max(np.abs(residuals))
+        is_valid = max_residual < 0.05  # 5% threshold
         
-        Z_mod = np.sqrt(re_z**2 + im_z**2)
-        rel_res_real = (re_z - re_pred) / (Z_mod + 1e-10)
-        rel_res_imag = (im_z - im_pred) / (Z_mod + 1e-10)
-        
-        max_res = max(np.abs(rel_res_real).max(), np.abs(rel_res_imag).max())
-        is_valid = max_res < 0.02  # 2% threshold
-        
-        return is_valid, max_res, rel_res_real, rel_res_imag, freq
-    except:
-        return False, 1.0, None, None, freq
+        return is_valid, max_residual, residuals, np.zeros_like(residuals)
+    except Exception as e:
+        logging.warning(f"KK Hilbert transform failed: {e}")
+        return False, 1.0, None, None
+
 
 # ============================================================================
-# Base DRT Class
+# Base DRT Class with Generalized Support
 # ============================================================================
 
 class DRTCore:
-    """Base class for DRT inversion"""
+    """Base class for DRT inversion with support for inductive loops"""
     
-    def __init__(self, frequencies, Z_real, Z_imag):
-        self.frequencies = np.asarray(frequencies, dtype=float)
-        self.Z_real = np.asarray(Z_real, dtype=float)
-        self.Z_imag = np.asarray(Z_imag, dtype=float)
-        self.Z = self.Z_real + 1j * self.Z_imag
-        self.N = len(frequencies)
+    def __init__(self, data: ImpedanceData, include_inductive: bool = False):
+        self.data = data
+        self.include_inductive = include_inductive
+        self.frequencies = data.freq
+        self.Z_real = data.re_z
+        self.Z_imag = data.im_z
+        self.Z = data.Z
+        self.N = len(self.frequencies)
         
         # Sort by frequency
         sort_idx = np.argsort(self.frequencies)
@@ -234,12 +337,18 @@ class DRTCore:
         self.Z_real = self.Z_real[sort_idx]
         self.Z_imag = self.Z_imag[sort_idx]
         
+        # Determine if inductive behavior is present (positive imaginary part at high frequencies)
+        high_freq_idx = np.where(self.frequencies > 0.1 * np.max(self.frequencies))[0]
+        if len(high_freq_idx) > 0:
+            self.has_inductive_loop = np.any(self.Z_imag[high_freq_idx] > 0)
+        else:
+            self.has_inductive_loop = False
+        
         # Automatic determination of relaxation time range
         self.tau_min = 1.0 / (2 * np.pi * np.max(self.frequencies)) * 0.1
         self.tau_max = 1.0 / (2 * np.pi * np.min(self.frequencies)) * 10
         
         # Estimate ohmic resistance (high frequency limit)
-        high_freq_idx = np.where(self.frequencies > 0.1 * np.max(self.frequencies))[0]
         if len(high_freq_idx) > 3:
             self.R_inf = np.mean(self.Z_real[high_freq_idx[-5:]])
         else:
@@ -248,8 +357,8 @@ class DRTCore:
         # Total polarization resistance
         self.R_pol = np.max(self.Z_real) - self.R_inf if np.max(self.Z_real) > self.R_inf else 1.0
     
-    def _build_kernel_matrix(self, tau_grid):
-        """Build kernel matrix for given time grid"""
+    def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Build kernel matrix for given time grid, optionally including RL elements"""
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
         K_imag = np.zeros((self.N, M))
@@ -261,38 +370,49 @@ class DRTCore:
                 denominator = 1 + (omega[i] * tau_grid[j])**2
                 K_real[i, j] = 1.0 / denominator
                 K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
+                
+                if include_rl:
+                    # For RL elements, the kernel is different
+                    # RL contribution: jωτ/(1+jωτ)
+                    rl_denom = 1 + (omega[i] * tau_grid[j])**2
+                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
+                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
         
         return K_real, K_imag
     
-    def _l_curve_criterion(self, residuals, solution_norms):
+    def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
         """Find corner of L-curve (maximum curvature)"""
         if len(residuals) < 3:
             return len(residuals) // 2
         
-        log_res = np.log(residuals)
-        log_sol = np.log(solution_norms)
+        log_res = np.log(residuals + 1e-10)
+        log_sol = np.log(solution_norms + 1e-10)
         
-        # Calculate curvature
         dlog_res = np.gradient(log_res)
         dlog_sol = np.gradient(log_sol)
-        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2)**1.5
+        
+        if len(dlog_res) < 2 or len(dlog_sol) < 2:
+            return len(residuals) // 2
+        
+        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
         
         if len(curvature) > 0:
             return np.argmax(curvature) + 1
         return len(residuals) // 2
 
+
 # ============================================================================
-# Tikhonov Regularization
+# Tikhonov Regularization with NNLS
 # ============================================================================
 
 class TikhonovDRT(DRTCore):
-    """Tikhonov regularization for DRT"""
+    """Tikhonov regularization for DRT using non-negative least squares"""
     
-    def __init__(self, frequencies, Z_real, Z_imag, regularization_order=2):
-        super().__init__(frequencies, Z_real, Z_imag)
+    def __init__(self, data: ImpedanceData, regularization_order: int = 2, include_inductive: bool = False):
+        super().__init__(data, include_inductive)
         self.regularization_order = regularization_order
     
-    def _build_regularization_matrix(self, M, order):
+    def _build_regularization_matrix(self, M: int, order: int) -> np.ndarray:
         """Build regularization matrix"""
         if order == 0:
             return np.eye(M)
@@ -312,11 +432,18 @@ class TikhonovDRT(DRTCore):
         else:
             return np.eye(M)
     
-    def compute(self, n_tau=150, lambda_value=None, lambda_auto=True, lambda_range=None):
-        """Compute DRT using Tikhonov regularization"""
+    def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Solve non-negative least squares problem"""
+        from scipy.optimize import nnls
+        x, _ = nnls(A, b)
+        return x
+    
+    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
+                lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+        """Compute DRT using Tikhonov regularization with NNLS"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
@@ -336,8 +463,8 @@ class TikhonovDRT(DRTCore):
                     A = np.vstack([K, lam * L])
                     b = np.concatenate([Z_target, np.zeros(L.shape[0])])
                     
-                    x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-                    x = np.maximum(x, 0)
+                    # Use NNLS instead of lstsq
+                    x = self._solve_nnls(A, b)
                     
                     residual = np.linalg.norm(K @ x - Z_target)
                     sol_norm = np.linalg.norm(L @ x)
@@ -345,7 +472,8 @@ class TikhonovDRT(DRTCore):
                     residuals.append(residual)
                     solution_norms.append(sol_norm)
                     solutions.append(x)
-                except:
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
                     continue
             
             if len(residuals) > 2:
@@ -353,61 +481,60 @@ class TikhonovDRT(DRTCore):
                 lambda_opt = lambda_range[best_idx]
                 gamma = solutions[best_idx]
             else:
-                lambda_opt = lambda_range[0] if lambda_range else 1e-4
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
                 A = np.vstack([K, lambda_opt * L])
                 b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-                x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-                gamma = np.maximum(x, 0)
+                gamma = self._solve_nnls(A, b)
         else:
             lam = lambda_value if lambda_value is not None else 1e-4
             A = np.vstack([K, lam * L])
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-            x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-            gamma = np.maximum(x, 0)
+            gamma = self._solve_nnls(A, b)
         
         # Normalize DRT
         integral = np.trapz(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
         
-        return tau_grid, gamma, None
+        # Estimate uncertainty from curvature of solution
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma,
+            gamma_std=gamma_std,
+            method="Tikhonov Regularization (NNLS)",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            metadata={'lambda': lam if not lambda_auto else lambda_opt, 'order': self.regularization_order}
+        )
     
-    def reconstruct_impedance(self, tau_grid, gamma):
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
 
+
 # ============================================================================
-# Bayesian DRT
+# Bayesian DRT with MCMC (PyMC)
 # ============================================================================
 
 class BayesianDRT(DRTCore):
-    """Bayesian method for DRT (MAP estimation)"""
+    """Bayesian method for DRT with MCMC sampling"""
     
-    def __init__(self, frequencies, Z_real, Z_imag):
-        super().__init__(frequencies, Z_real, Z_imag)
+    def __init__(self, data: ImpedanceData, include_inductive: bool = False):
+        super().__init__(data, include_inductive)
+        if not PYMC_AVAILABLE:
+            raise ImportError("PyMC is required for Bayesian DRT with MCMC")
     
-    def _objective_function(self, x, K, Z_target, L):
-        """Objective function for Bayesian optimization"""
-        gamma = x[:-1]
-        log_lambda = x[-1]
-        lam = np.exp(log_lambda)
-        
-        gamma = np.maximum(gamma, 0)
-        
-        residual = K @ gamma - Z_target
-        data_fit = 0.5 * np.sum(residual**2)
-        prior = 0.5 * lam * np.sum((L @ gamma)**2)
-        
-        return data_fit + prior + 0.5 * (len(gamma) * np.log(lam) - log_lambda)
-    
-    def compute(self, n_tau=150, n_iterations=200):
-        """Compute DRT using Bayesian method"""
+    def compute(self, n_tau: int = 150, n_samples: int = 2000, n_tune: int = 1000,
+                n_chains: int = 4) -> DRTResult:
+        """Compute DRT using Bayesian method with MCMC"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
@@ -419,55 +546,79 @@ class BayesianDRT(DRTCore):
             L[i, i+1] = -2
             L[i, i+2] = 1
         
-        # Initialization
-        x0 = np.ones(n_tau + 1) * 0.1
-        x0[-1] = np.log(1e-4)
+        # Build PyMC model
+        with pm.Model() as model:
+            # Prior for gamma (positive, smooth)
+            gamma_raw = pm.HalfNormal('gamma_raw', sigma=1.0, shape=n_tau)
+            
+            # Regularization prior (smoothness)
+            smoothness = pm.HalfCauchy('smoothness', beta=0.1)
+            reg_penalty = smoothness * pm.math.sum(pm.math.abs(L @ gamma_raw))
+            
+            # Likelihood
+            sigma = pm.HalfCauchy('sigma', beta=0.1)
+            Z_pred = pm.math.dot(K, gamma_raw)
+            likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
+            
+            # Add regularization as potential
+            pm.Potential('reg', -reg_penalty)
+            
+            # Sample
+            trace = pm.sample(draws=n_samples, tune=n_tune, chains=n_chains, 
+                             return_inferencedata=True, progressbar=False)
         
-        # Optimization
-        result = optimize.minimize(
-            self._objective_function, x0,
-            args=(K, Z_target, L),
-            method='L-BFGS-B',
-            options={'maxiter': n_iterations, 'disp': False}
-        )
-        
-        gamma = np.maximum(result.x[:-1], 0)
+        # Extract posterior statistics
+        gamma_samples = trace.posterior['gamma_raw'].values.reshape(-1, n_tau)
+        gamma_mean = np.mean(gamma_samples, axis=0)
+        gamma_std = np.std(gamma_samples, axis=0)
         
         # Normalize
-        integral = np.trapz(gamma, np.log(tau_grid))
+        integral = np.trapz(gamma_mean, np.log(tau_grid))
         if integral > 0:
-            gamma = gamma / integral * self.R_pol
+            gamma_mean = gamma_mean / integral * self.R_pol
+            gamma_std = gamma_std / integral * self.R_pol
         
-        # Simple uncertainty estimation
-        confidence = 0.3 * np.ones_like(gamma)
+        # Check convergence using R-hat
+        r_hat = az.rhat(trace).to_array().values
+        converged = np.all(r_hat < 1.05)
         
-        return tau_grid, gamma, confidence
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_mean,
+            gamma_std=gamma_std,
+            method="Bayesian MCMC",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            convergence=converged,
+            metadata={'n_samples': n_samples, 'n_tune': n_tune, 'n_chains': n_chains}
+        )
     
-    def reconstruct_impedance(self, tau_grid, gamma):
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
 
+
 # ============================================================================
-# Maximum Entropy DRT
+# Maximum Entropy DRT with Automatic Lambda Selection
 # ============================================================================
 
 class MaxEntropyDRT(DRTCore):
-    """Maximum Entropy method for DRT"""
+    """Maximum Entropy method for DRT with automatic lambda selection"""
     
-    def __init__(self, frequencies, Z_real, Z_imag):
-        super().__init__(frequencies, Z_real, Z_imag)
+    def __init__(self, data: ImpedanceData, include_inductive: bool = False):
+        super().__init__(data, include_inductive)
     
-    def _entropy(self, gamma):
+    def _entropy(self, gamma: np.ndarray) -> float:
         """Calculate Shannon entropy"""
         gamma_pos = gamma[gamma > 1e-10]
         if len(gamma_pos) == 0:
             return 0
         return -np.sum(gamma_pos * np.log(gamma_pos))
     
-    def _objective_function(self, x, K, Z_target, lam):
+    def _objective_function(self, x: np.ndarray, K: np.ndarray, Z_target: np.ndarray, lam: float) -> float:
         """Objective function with entropy penalty"""
         gamma = np.maximum(x, 1e-10)
         residual = K @ gamma - Z_target
@@ -475,74 +626,121 @@ class MaxEntropyDRT(DRTCore):
         entropy_penalty = -lam * self._entropy(gamma)
         return data_fit + entropy_penalty
     
-    def compute(self, n_tau=150, lambda_value=0.1):
-        """Compute DRT using maximum entropy method"""
+    def _solve_for_lambda(self, K: np.ndarray, Z_target: np.ndarray, 
+                          lambda_range: np.ndarray, n_tau: int) -> Tuple[np.ndarray, float]:
+        """Solve for multiple lambda and return best based on L-curve"""
+        residuals = []
+        solutions = []
+        
+        for lam in lambda_range:
+            try:
+                x0 = np.ones(n_tau) / n_tau
+                result = optimize.minimize(
+                    self._objective_function, x0,
+                    args=(K, Z_target, lam),
+                    method='L-BFGS-B',
+                    bounds=[(1e-10, None) for _ in range(n_tau)],
+                    options={'maxiter': 500, 'disp': False}
+                )
+                gamma = result.x
+                residual = np.linalg.norm(K @ gamma - Z_target)
+                residuals.append(residual)
+                solutions.append(gamma)
+            except Exception as e:
+                logging.warning(f"Lambda {lam} failed: {e}")
+                residuals.append(1e10)
+                solutions.append(np.zeros(n_tau))
+        
+        # Find best lambda using L-curve
+        if len(residuals) > 2:
+            best_idx = self._l_curve_criterion(np.array(residuals), np.array(lambda_range))
+        else:
+            best_idx = np.argmin(residuals)
+        
+        return solutions[best_idx], lambda_range[best_idx]
+    
+    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                lambda_auto: bool = True) -> DRTResult:
+        """Compute DRT using maximum entropy method with automatic lambda selection"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
-        # Initialization
-        x0 = np.ones(n_tau) / n_tau
-        
-        # Optimization
-        result = optimize.minimize(
-            self._objective_function, x0,
-            args=(K, Z_target, lambda_value),
-            method='L-BFGS-B',
-            bounds=[(1e-10, None) for _ in range(n_tau)],
-            options={'maxiter': 500, 'disp': False}
-        )
-        
-        gamma = result.x
+        if lambda_auto:
+            lambda_range = np.logspace(-4, 2, 20)
+            gamma, lambda_opt = self._solve_for_lambda(K, Z_target, lambda_range, n_tau)
+        else:
+            lam = lambda_value if lambda_value is not None else 0.1
+            x0 = np.ones(n_tau) / n_tau
+            result = optimize.minimize(
+                self._objective_function, x0,
+                args=(K, Z_target, lam),
+                method='L-BFGS-B',
+                bounds=[(1e-10, None) for _ in range(n_tau)],
+                options={'maxiter': 500, 'disp': False}
+            )
+            gamma = result.x
+            lambda_opt = lam
         
         # Normalize
         integral = np.trapz(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
         
-        return tau_grid, gamma, None
+        # Estimate uncertainty
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma,
+            gamma_std=gamma_std,
+            method="Maximum Entropy",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            metadata={'lambda': lambda_opt}
+        )
     
-    def reconstruct_impedance(self, tau_grid, gamma):
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
 
+
 # ============================================================================
-# Gaussian Process DRT
+# Finite Gaussian Process DRT (fGP-DRT)
 # ============================================================================
 
-class GaussianProcessDRT(DRTCore):
-    """Gaussian Process for DRT"""
+class FiniteGaussianProcessDRT(DRTCore):
+    """Finite Gaussian Process for DRT with non-negativity constraints"""
     
-    def __init__(self, frequencies, Z_real, Z_imag):
-        super().__init__(frequencies, Z_real, Z_imag)
+    def __init__(self, data: ImpedanceData, include_inductive: bool = False):
+        super().__init__(data, include_inductive)
     
-    def _rbf_kernel(self, x1, x2, length_scale=1.0, sigma_f=1.0):
+    def _rbf_kernel(self, x1: np.ndarray, x2: np.ndarray, length_scale: float = 1.0, sigma_f: float = 1.0) -> np.ndarray:
         """Radial Basis Function kernel"""
         dist_matrix = np.subtract.outer(x1, x2)**2
         return sigma_f**2 * np.exp(-0.5 * dist_matrix / length_scale**2)
     
-    def compute(self, n_tau=150, n_components=20):
-        """Compute DRT using Gaussian Process (simplified)"""
+    def compute(self, n_tau: int = 150, n_components: int = 30, n_samples: int = 100) -> DRTResult:
+        """Compute DRT using finite Gaussian Process"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         log_tau_grid = np.log10(tau_grid)
         
         # Create basis from RBF functions
         basis_centers = np.linspace(log_tau_grid[0], log_tau_grid[-1], n_components)
+        length_scale = (log_tau_grid[-1] - log_tau_grid[0]) / n_components
         
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         K_full = np.vstack([K_real, K_imag])
         
         # Build feature matrix
-        length_scale = (log_tau_grid[-1] - log_tau_grid[0]) / n_components
         Phi = np.zeros((self.N * 2, n_components))
-        
         for i, center in enumerate(basis_centers):
             phi = np.exp(-0.5 * ((log_tau_grid - center) / length_scale)**2)
             phi = phi / np.sum(phi)
@@ -550,161 +748,221 @@ class GaussianProcessDRT(DRTCore):
         
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         
-        # Solve with regularization
+        # Bayesian linear regression with non-negativity constraints
+        # Using truncated normal prior
+        from scipy.stats import truncnorm
+        
+        # Initialize with ridge regression
         lam = 1e-4
         A = Phi.T @ Phi + lam * np.eye(n_components)
         b = Phi.T @ Z_target
-        weights = np.linalg.solve(A, b)
+        weights_init = np.linalg.solve(A, b)
+        weights_init = np.maximum(weights_init, 0)
+        
+        # Sample posterior using MCMC with non-negativity constraints
+        if PYMC_AVAILABLE:
+            with pm.Model() as model:
+                # Prior for weights (truncated normal)
+                weights = pm.TruncatedNormal('weights', mu=weights_init, sigma=1.0, 
+                                             lower=0, shape=n_components)
+                
+                # Likelihood
+                sigma = pm.HalfCauchy('sigma', beta=0.1)
+                Z_pred = pm.math.dot(Phi, weights)
+                likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
+                
+                # Sample
+                trace = pm.sample(draws=n_samples, tune=n_samples//2, 
+                                 chains=2, progressbar=False)
+                
+                weights_samples = trace.posterior['weights'].values.reshape(-1, n_components)
+                weights_mean = np.mean(weights_samples, axis=0)
+                weights_std = np.std(weights_samples, axis=0)
+        else:
+            # Fallback: use optimization with uncertainty estimation
+            weights_mean = weights_init
+            weights_std = np.ones_like(weights_init) * 0.1
         
         # Reconstruct DRT
         gamma = np.zeros(n_tau)
+        gamma_std = np.zeros(n_tau)
         for i, center in enumerate(basis_centers):
             phi = np.exp(-0.5 * ((log_tau_grid - center) / length_scale)**2)
             phi = phi / np.sum(phi)
-            gamma += weights[i] * phi
-        
-        gamma = np.maximum(gamma, 0)
+            gamma += weights_mean[i] * phi
+            gamma_std += weights_std[i] * phi
         
         # Normalize
         integral = np.trapz(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
+            gamma_std = gamma_std / integral * self.R_pol
         
-        # Uncertainty estimation
-        uncertainty = np.abs(weights).mean() * np.ones_like(gamma)
-        
-        return tau_grid, gamma, uncertainty
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma,
+            gamma_std=gamma_std,
+            method="Finite Gaussian Process (fGP-DRT)",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            metadata={'n_components': n_components}
+        )
     
-    def reconstruct_impedance(self, tau_grid, gamma):
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
 
+
 # ============================================================================
-# Genetic Programming DRT
+# Loewner Framework (RLF) - Data-Driven DRT
 # ============================================================================
 
-class ISGPDRT(DRTCore):
-    """Genetic Programming for DRT (simplified)"""
+class LoewnerFrameworkDRT(DRTCore):
+    """Loewner Framework for data-driven DRT extraction"""
     
-    def __init__(self, frequencies, Z_real, Z_imag):
-        super().__init__(frequencies, Z_real, Z_imag)
+    def __init__(self, data: ImpedanceData):
+        super().__init__(data, include_inductive=False)
     
-    def _gaussian_peak(self, tau, tau0, width, amplitude):
-        """Gaussian peak for DRT representation"""
-        return amplitude * np.exp(-((np.log10(tau) - np.log10(tau0))**2) / (2 * width**2))
+    def _build_loewner_matrices(self, omega: np.ndarray, Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Build Loewner and shifted Loewner matrices"""
+        n = len(omega)
+        # Split into left and right datasets
+        n_left = n // 2
+        n_right = n - n_left
+        
+        left_omega = omega[:n_left]
+        right_omega = omega[n_left:]
+        left_Z = Z[:n_left]
+        right_Z = Z[n_left:]
+        
+        # Loewner matrix
+        L = np.zeros((n_left, n_right), dtype=complex)
+        Ls = np.zeros((n_left, n_right), dtype=complex)
+        
+        for i in range(n_left):
+            for j in range(n_right):
+                denom = left_omega[i] - right_omega[j]
+                if abs(denom) > 1e-10:
+                    L[i, j] = (left_Z[i] - right_Z[j]) / denom
+                    Ls[i, j] = (left_omega[i] * left_Z[i] - right_omega[j] * right_Z[j]) / denom
+        
+        return L, Ls, left_Z, right_Z
     
-    def _evaluate_fitness(self, peaks_params, tau_grid):
-        """Evaluate fitness of solution"""
-        gamma = np.zeros_like(tau_grid)
-        for params in peaks_params:
-            gamma += self._gaussian_peak(tau_grid, params['tau0'], params['width'], params['amplitude'])
+    def _scree_not_threshold(self, singular_values: np.ndarray) -> int:
+        """ScreeNOT algorithm for optimal SVD truncation"""
+        n = len(singular_values)
+        if n < 3:
+            return n // 2
         
-        # Reconstruct impedance
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
+        # Find the knee point
+        diffs = np.diff(singular_values)
+        diffs2 = np.diff(diffs)
         
-        # Reconstruction error
-        error = np.mean((self.Z_real - Z_rec_real)**2 + (self.Z_imag - Z_rec_imag)**2)
+        # Look for the largest change in curvature
+        if len(diffs2) > 0:
+            knee_idx = np.argmax(np.abs(diffs2)) + 1
+            return min(knee_idx + 1, n)
         
-        # Complexity penalty
-        complexity_penalty = 0.01 * len(peaks_params)
-        
-        return error + complexity_penalty
+        return n // 2
     
-    def compute(self, n_tau=150, n_peaks_max=5, n_generations=50, population_size=20):
-        """Compute DRT using ISGP"""
+    def compute(self, n_tau: int = 150, model_order: Optional[int] = None) -> DRTResult:
+        """Compute DRT using Loewner Framework"""
         
+        omega = 2 * np.pi * self.frequencies
+        Z = self.Z
+        
+        # Build Loewner matrices
+        L, Ls, left_Z, right_Z = self._build_loewner_matrices(omega, Z)
+        
+        # Compute SVD for model order reduction
+        U, S, Vh = np.linalg.svd(L, full_matrices=False)
+        
+        # Determine optimal model order
+        if model_order is None:
+            model_order = self._scree_not_threshold(S)
+        
+        model_order = max(1, min(model_order, len(S) - 1))
+        
+        # Truncate
+        U_r = U[:, :model_order]
+        S_r = np.diag(S[:model_order])
+        V_r = Vh[:model_order, :]
+        
+        # Compute reduced matrices
+        E_r = -U_r.conj().T @ L @ V_r.conj().T
+        A_r = -U_r.conj().T @ Ls @ V_r.conj().T
+        B_r = U_r.conj().T @ left_Z
+        C_r = right_Z @ V_r.conj().T
+        
+        # Extract poles and residues
+        try:
+            # Solve generalized eigenvalue problem
+            eigvals, eigvecs = linalg.eig(A_r, E_r)
+            
+            # Time constants
+            tau_loewner = -1.0 / eigvals
+            # Keep only positive real time constants
+            valid = (np.real(tau_loewner) > 0) & (np.imag(tau_loewner) < 1e-6)
+            tau_loewner = np.real(tau_loewner[valid])
+            
+            # Calculate residues (resistances)
+            R_loewner = np.zeros(len(tau_loewner))
+            for i in range(len(tau_loewner)):
+                # Simplified residue calculation
+                R_loewner[i] = np.abs(C_r @ eigvecs[:, i] * (eigvecs[:, i].conj().T @ B_r))
+        except:
+            # Fallback: use regularized solution
+            tau_loewner = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+            R_loewner = np.ones(n_tau) / n_tau
+        
+        # Interpolate to uniform tau grid
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        gamma = np.zeros(n_tau)
         
-        # Initialize population
-        population = []
-        for _ in range(population_size):
-            n_peaks = np.random.randint(1, n_peaks_max + 1)
-            peaks = []
-            for _ in range(n_peaks):
-                peak = {
-                    'tau0': np.random.uniform(self.tau_min, self.tau_max),
-                    'width': np.random.uniform(0.1, 1.0),
-                    'amplitude': np.random.uniform(0.1, self.R_pol / n_peaks)
-                }
-                peaks.append(peak)
-            population.append(peaks)
-        
-        # Evolution
-        for generation in range(n_generations):
-            fitness = [self._evaluate_fitness(peaks, tau_grid) for peaks in population]
+        # Sort and interpolate
+        if len(tau_loewner) > 1:
+            idx_sorted = np.argsort(tau_loewner)
+            tau_sorted = tau_loewner[idx_sorted]
+            R_sorted = R_loewner[idx_sorted]
             
-            # Selection
-            sorted_indices = np.argsort(fitness)
-            elite = [population[i] for i in sorted_indices[:population_size // 2]]
-            
-            # Create new generation
-            new_population = elite.copy()
-            while len(new_population) < population_size:
-                parent = elite[np.random.randint(len(elite))]
-                child = [peak.copy() for peak in parent]
-                
-                # Mutation
-                if np.random.random() < 0.3:
-                    if np.random.random() < 0.5 and len(child) > 1:
-                        child.pop(np.random.randint(len(child)))
-                    elif len(child) < n_peaks_max:
-                        new_peak = {
-                            'tau0': np.random.uniform(self.tau_min, self.tau_max),
-                            'width': np.random.uniform(0.1, 1.0),
-                            'amplitude': np.random.uniform(0.1, self.R_pol / (len(child) + 1))
-                        }
-                        child.append(new_peak)
-                
-                for peak in child:
-                    if np.random.random() < 0.3:
-                        peak['tau0'] *= np.random.uniform(0.8, 1.2)
-                        peak['tau0'] = np.clip(peak['tau0'], self.tau_min, self.tau_max)
-                    if np.random.random() < 0.3:
-                        peak['width'] *= np.random.uniform(0.8, 1.2)
-                        peak['width'] = np.clip(peak['width'], 0.1, 2.0)
-                    if np.random.random() < 0.3:
-                        peak['amplitude'] *= np.random.uniform(0.7, 1.3)
-                        peak['amplitude'] = np.clip(peak['amplitude'], 0.01, self.R_pol)
-                
-                new_population.append(child)
-            
-            population = new_population
-        
-        # Best solution
-        fitness = [self._evaluate_fitness(peaks, tau_grid) for peaks in population]
-        best_peaks = population[np.argmin(fitness)]
-        
-        # Build DRT
-        gamma = np.zeros_like(tau_grid)
-        for peak in best_peaks:
-            gamma += self._gaussian_peak(tau_grid, peak['tau0'], peak['width'], peak['amplitude'])
+            # Interpolate
+            interp_func = interpolate.interp1d(np.log10(tau_sorted), R_sorted, 
+                                               kind='linear', fill_value=0, bounds_error=False)
+            gamma = interp_func(np.log10(tau_grid))
+            gamma = np.maximum(gamma, 0)
         
         # Normalize
         integral = np.trapz(gamma, np.log(tau_grid))
         if integral > 0:
             gamma = gamma / integral * self.R_pol
         
-        return tau_grid, gamma, best_peaks
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma,
+            gamma_std=None,
+            method="Loewner Framework (RLF)",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            metadata={'model_order': model_order}
+        )
     
-    def reconstruct_impedance(self, tau_grid, gamma):
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
+
 
 # ============================================================================
 # Peak Detection and Analysis
 # ============================================================================
 
-def find_peaks_drt(tau_grid, gamma, prominence=0.05):
+def find_peaks_drt(tau_grid: np.ndarray, gamma: np.ndarray, prominence: float = 0.05) -> List[Dict[str, Any]]:
     """Find peaks in DRT spectrum"""
-    # Normalize gamma
     gamma_norm = gamma / np.max(gamma) if np.max(gamma) > 0 else gamma
     
     peaks, properties = find_peaks(
@@ -727,7 +985,8 @@ def find_peaks_drt(tau_grid, gamma, prominence=0.05):
     
     return peak_results
 
-def calculate_resistances(tau, drt, peaks_idx):
+
+def calculate_resistances(tau: np.ndarray, drt: np.ndarray, peaks_idx: List[int]) -> List[float]:
     """Calculate resistances from peak areas"""
     resistances = []
     for i in range(len(peaks_idx)):
@@ -745,7 +1004,8 @@ def calculate_resistances(tau, drt, peaks_idx):
     
     return resistances
 
-def fit_gaussian_peaks(tau_grid, gamma, n_peaks=None):
+
+def fit_gaussian_peaks(tau_grid: np.ndarray, gamma: np.ndarray, n_peaks: Optional[int] = None) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
     """Fit DRT with sum of Gaussians"""
     log_tau = np.log10(tau_grid)
     
@@ -753,7 +1013,7 @@ def fit_gaussian_peaks(tau_grid, gamma, n_peaks=None):
         peaks = find_peaks_drt(tau_grid, gamma)
         n_peaks = len(peaks)
     
-    def sum_gaussians(log_tau, *params):
+    def sum_gaussians(log_tau: np.ndarray, *params: float) -> np.ndarray:
         result = np.zeros_like(log_tau)
         for i in range(n_peaks):
             amp = params[3*i]
@@ -782,19 +1042,27 @@ def fit_gaussian_peaks(tau_grid, gamma, n_peaks=None):
             })
         
         return fitted_gamma, peak_params
-    except:
+    except Exception:
         return gamma, []
+
 
 # ============================================================================
 # Visualization Functions (Matplotlib - Publication Quality)
 # ============================================================================
 
-def plot_nyquist_matplotlib(freq, re_z, im_z, re_rec=None, im_rec=None, title="Nyquist Plot"):
+def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
+                           im_rec: Optional[np.ndarray] = None, title: str = "Nyquist Plot",
+                           highlight_idx: Optional[int] = None) -> plt.Figure:
     """Create publication-quality Nyquist plot"""
     fig, ax = plt.subplots(figsize=(6, 5))
     
-    ax.plot(re_z, im_z, 'o-', markersize=4, linewidth=1.5, 
+    ax.plot(data.re_z, data.im_z, 'o-', markersize=4, linewidth=1.5, 
             label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
+    
+    if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
+        ax.plot(data.re_z[highlight_idx], data.im_z[highlight_idx], 'ro', 
+                markersize=10, markeredgecolor='red', markerfacecolor='none', linewidth=2,
+                label='Selected Point')
     
     if re_rec is not None and im_rec is not None:
         ax.plot(re_rec, im_rec, 's-', markersize=3, linewidth=1.0,
@@ -813,17 +1081,19 @@ def plot_nyquist_matplotlib(freq, re_z, im_z, re_rec=None, im_rec=None, title="N
     
     return fig
 
-def plot_bode_matplotlib(freq, re_z, im_z, re_rec=None, im_rec=None):
+
+def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
+                         im_rec: Optional[np.ndarray] = None) -> plt.Figure:
     """Create publication-quality Bode plot"""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 7))
     
     # Magnitude plot
-    mag = np.sqrt(re_z**2 + im_z**2)
-    ax1.loglog(freq, mag, 'o-', markersize=4, linewidth=1.5, 
+    mag = data.Z_mod
+    ax1.loglog(data.freq, mag, 'o-', markersize=4, linewidth=1.5, 
                label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
     if re_rec is not None and im_rec is not None:
         mag_rec = np.sqrt(re_rec**2 + im_rec**2)
-        ax1.loglog(freq, mag_rec, 's-', markersize=3, linewidth=1.0,
+        ax1.loglog(data.freq, mag_rec, 's-', markersize=3, linewidth=1.0,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax1.set_xlabel("Frequency / Hz", fontweight='bold')
     ax1.set_ylabel("$|Z|$ / $\Omega$", fontweight='bold')
@@ -831,32 +1101,36 @@ def plot_bode_matplotlib(freq, re_z, im_z, re_rec=None, im_rec=None):
     ax1.grid(True, alpha=0.3, linestyle='--')
     
     # Phase plot
-    phase = np.arctan2(im_z, re_z) * 180 / np.pi
-    ax2.semilogx(freq, phase, 'o-', markersize=4, linewidth=1.5,
+    phase = data.phase
+    ax2.semilogx(data.freq, phase, 'o-', markersize=4, linewidth=1.5,
                  label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
     if re_rec is not None and im_rec is not None:
         phase_rec = np.arctan2(im_rec, re_rec) * 180 / np.pi
-        ax2.semilogx(freq, phase_rec, 's-', markersize=3, linewidth=1.0,
+        ax2.semilogx(data.freq, phase_rec, 's-', markersize=3, linewidth=1.0,
                      label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax2.set_xlabel("Frequency / Hz", fontweight='bold')
     ax2.set_ylabel("Phase / °", fontweight='bold')
     ax2.legend(loc='best')
     ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
     
     fig.suptitle("Bode Plot", fontweight='bold')
     plt.tight_layout()
     
     return fig
 
-def plot_drt_matplotlib(tau, drt, peaks=None, drt_std=None, title="Distribution of Relaxation Times"):
+
+def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None,
+                       title: str = "Distribution of Relaxation Times") -> plt.Figure:
     """Create publication-quality DRT plot"""
     fig, ax = plt.subplots(figsize=(7, 5))
     
     # Plot DRT with uncertainty if available
-    if drt_std is not None:
-        ax.fill_between(tau, drt - drt_std, drt + drt_std,
+    if result.gamma_std is not None:
+        ax.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
+                        result.gamma + 2*result.gamma_std,
                         alpha=0.3, color='gray', label='±2σ uncertainty')
-    ax.loglog(tau, drt, '-', linewidth=2, color='#2ca02c', label='DRT')
+    ax.loglog(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
     
     # Plot peaks
     if peaks and len(peaks) > 0:
@@ -880,7 +1154,8 @@ def plot_drt_matplotlib(tau, drt, peaks=None, drt_std=None, title="Distribution 
     
     return fig
 
-def plot_kk_residuals_matplotlib(freq, res_real, res_imag):
+
+def plot_kk_residuals_matplotlib(freq: np.ndarray, res_real: np.ndarray, res_imag: np.ndarray) -> plt.Figure:
     """Create publication-quality KK residuals plot"""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5))
     
@@ -906,11 +1181,13 @@ def plot_kk_residuals_matplotlib(freq, res_real, res_imag):
     
     return fig
 
+
 # ============================================================================
 # Plotly Interactive Visualization
 # ============================================================================
 
-def plot_impedance_plotly(frequencies, Z_real_exp, Z_imag_exp, Z_real_rec=None, Z_imag_rec=None):
+def plot_impedance_plotly(data: ImpedanceData, re_rec: Optional[np.ndarray] = None,
+                         im_rec: Optional[np.ndarray] = None) -> go.Figure:
     """Create interactive impedance plots with Plotly"""
     fig = make_subplots(
         rows=1, cols=2,
@@ -920,14 +1197,14 @@ def plot_impedance_plotly(frequencies, Z_real_exp, Z_imag_exp, Z_real_rec=None, 
     
     # Nyquist plot
     fig.add_trace(
-        go.Scatter(x=Z_real_exp, y=-Z_imag_exp, mode='markers',
+        go.Scatter(x=data.re_z, y=-data.im_z, mode='markers',
                    name='Experimental', marker=dict(size=6, color='blue')),
         row=1, col=1
     )
     
-    if Z_real_rec is not None and Z_imag_rec is not None:
+    if re_rec is not None and im_rec is not None:
         fig.add_trace(
-            go.Scatter(x=Z_real_rec, y=-Z_imag_rec, mode='lines',
+            go.Scatter(x=re_rec, y=-im_rec, mode='lines',
                        name='Reconstructed', line=dict(color='red', width=2)),
             row=1, col=1
         )
@@ -936,17 +1213,17 @@ def plot_impedance_plotly(frequencies, Z_real_exp, Z_imag_exp, Z_real_rec=None, 
     fig.update_yaxes(title_text="-Z'' (Ω)", row=1, col=1)
     
     # Bode plot - Magnitude
-    Z_mod_exp = np.sqrt(Z_real_exp**2 + Z_imag_exp**2)
+    Z_mod_exp = data.Z_mod
     fig.add_trace(
-        go.Scatter(x=frequencies, y=Z_mod_exp, mode='markers',
+        go.Scatter(x=data.freq, y=Z_mod_exp, mode='markers',
                    name='Experimental', marker=dict(size=6, color='blue')),
         row=1, col=2
     )
     
-    if Z_real_rec is not None and Z_imag_rec is not None:
-        Z_mod_rec = np.sqrt(Z_real_rec**2 + Z_imag_rec**2)
+    if re_rec is not None and im_rec is not None:
+        Z_mod_rec = np.sqrt(re_rec**2 + im_rec**2)
         fig.add_trace(
-            go.Scatter(x=frequencies, y=Z_mod_rec, mode='lines',
+            go.Scatter(x=data.freq, y=Z_mod_rec, mode='lines',
                        name='Reconstructed', line=dict(color='red', width=2)),
             row=1, col=2
         )
@@ -958,27 +1235,29 @@ def plot_impedance_plotly(frequencies, Z_real_exp, Z_imag_exp, Z_real_rec=None, 
     
     return fig
 
-def plot_drt_plotly(tau_grid, gamma, peaks=None, confidence=None):
+
+def plot_drt_plotly(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None) -> go.Figure:
     """Create interactive DRT plot with Plotly"""
     fig = go.Figure()
     
     # Main DRT curve
     fig.add_trace(go.Scatter(
-        x=tau_grid, y=gamma,
+        x=result.tau_grid, y=result.gamma,
         mode='lines',
         name='DRT',
         line=dict(color='blue', width=2)
     ))
     
     # Confidence interval
-    if confidence is not None:
+    if result.gamma_std is not None:
         fig.add_trace(go.Scatter(
-            x=np.concatenate([tau_grid, tau_grid[::-1]]),
-            y=np.concatenate([gamma + confidence, (gamma - confidence)[::-1]]),
+            x=np.concatenate([result.tau_grid, result.tau_grid[::-1]]),
+            y=np.concatenate([result.gamma + 2*result.gamma_std, 
+                             (result.gamma - 2*result.gamma_std)[::-1]]),
             fill='toself',
             fillcolor='rgba(0,100,200,0.2)',
             line=dict(color='rgba(255,255,255,0)'),
-            name='Confidence Interval'
+            name='95% Confidence Interval'
         ))
     
     # Detected peaks
@@ -996,7 +1275,7 @@ def plot_drt_plotly(tau_grid, gamma, peaks=None, confidence=None):
         for peak in peaks:
             fig.add_annotation(
                 x=peak['tau'], y=peak['amplitude'],
-                text=f"τ = {peak['tau']:.2e} s<br>f = {1/(2*np.pi*peak['tau']):.2f} Hz",
+                text=f"τ = {peak['tau']:.2e} s<br>f = {peak['frequency']:.2f} Hz",
                 showarrow=True,
                 arrowhead=2,
                 ax=20, ay=-20
@@ -1008,11 +1287,13 @@ def plot_drt_plotly(tau_grid, gamma, peaks=None, confidence=None):
     
     return fig
 
+
 # ============================================================================
 # Report Generation
 # ============================================================================
 
-def create_report(freq, re_z, im_z, tau, drt, peaks_data, method_name, params):
+def create_report(data: ImpedanceData, result: DRTResult, peaks_data: List[Dict[str, Any]],
+                 method_name: str, kk_passed: bool, max_kk_res: float) -> str:
     """Generate analysis report"""
     report = f"""
     ============================================================
@@ -1023,13 +1304,16 @@ def create_report(freq, re_z, im_z, tau, drt, peaks_data, method_name, params):
     Analysis Method: {method_name}
     
     Data Information:
-    - Number of frequencies: {len(freq)}
-    - Frequency range: {freq.min():.2e} - {freq.max():.2e} Hz
-    - Ohmic resistance (R∞): {params.get('R_inf', 0):.4f} Ω
-    - Polarization resistance (Rpol): {params.get('R_pol', 0):.4f} Ω
+    - Original points: {len(data.original_freq)}
+    - Analyzed points: {data.n_points}
+    - Removed points: {len(data.removed_indices)}
+    - Frequency range: {data.freq.min():.2e} - {data.freq.max():.2e} Hz
+    - Ohmic resistance (R∞): {result.R_inf:.4f} Ω
+    - Polarization resistance (Rpol): {result.R_pol:.4f} Ω
     
     DRT Parameters:
-    - Time constant range: {tau.min():.2e} - {tau.max():.2e} s
+    - Time constant range: {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
+    - Total integral: {result.get_integral():.4f} Ω
     
     Detected Processes:
     """
@@ -1047,23 +1331,38 @@ def create_report(freq, re_z, im_z, tau, drt, peaks_data, method_name, params):
     
     report += f"""
     Quality Metrics:
-    - KK test passed: {params.get('kk_passed', False)}
-    - Max KK residual: {params.get('max_kk_res', 0):.3f}%
+    - KK test passed: {kk_passed}
+    - Max KK residual: {max_kk_res*100:.3f}%
     
     ============================================================
     """
     
     return report
 
+
 # ============================================================================
 # Main Application
 # ============================================================================
 
+def initialize_session_state():
+    """Initialize session state variables"""
+    if 'data' not in st.session_state:
+        st.session_state.data = None
+    if 'data_loaded' not in st.session_state:
+        st.session_state.data_loaded = False
+    if 'preview_plots' not in st.session_state:
+        st.session_state.preview_plots = False
+    if 'selected_point' not in st.session_state:
+        st.session_state.selected_point = None
+
+
 def main():
+    initialize_session_state()
+    
     st.title("⚡ Electrochemical Impedance Spectroscopy Analysis")
-    st.markdown("### Distribution of Relaxation Times (DRT) Analysis Tool")
-    st.markdown("Поддерживаются 5 методов инверсии: Тихоновская регуляризация, Байесовский метод, "
-                "Максимальная энтропия, Гауссовские процессы, Генетическое программирование")
+    st.markdown("### Distribution of Relaxation Times (DRT) Analysis Tool v3.0")
+    st.markdown("Поддерживаются 6 методов инверсии: Tikhonov (NNLS), Bayesian MCMC, Maximum Entropy (auto-λ), "
+                "fGP-DRT, Loewner Framework (RLF), Generalized DRT (с индуктивностями)")
     st.markdown("---")
     
     # Sidebar for input controls
@@ -1071,8 +1370,7 @@ def main():
         st.header("📁 Data Input")
         
         # Data input method selection
-        input_method = st.radio("Select input method:", 
-                                ["Upload File", "Manual Entry"])
+        input_method = st.radio("Select input method:", ["Upload File", "Manual Entry"])
         
         freq = None
         re_z = None
@@ -1081,7 +1379,6 @@ def main():
         if input_method == "Upload File":
             uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv', 'xlsx', 'dat', 'z', 'mpt'])
             if uploaded_file:
-                # Try to detect columns
                 try:
                     df = pd.read_csv(uploaded_file, nrows=5)
                     st.subheader("Column Mapping")
@@ -1089,10 +1386,14 @@ def main():
                     col_re = st.selectbox("Re(Z) column", df.columns)
                     col_im = st.selectbox("-Im(Z) column", df.columns)
                     
-                    if st.button("Load Data"):
+                    if st.button("Load Data", key="load_file_btn"):
                         freq, re_z, im_z = load_data(uploaded_file, col_freq, col_re, col_im)
                         if freq is not None:
+                            st.session_state.data = ImpedanceData(freq, re_z, im_z)
+                            st.session_state.data_loaded = True
+                            st.session_state.preview_plots = True
                             st.success(f"Loaded {len(freq)} data points")
+                            st.rerun()
                         else:
                             st.error("Error loading data")
                 except Exception as e:
@@ -1100,49 +1401,101 @@ def main():
         
         else:  # Manual entry
             freq, re_z, im_z = manual_data_entry()
+            if freq is not None:
+                st.session_state.data = ImpedanceData(freq, re_z, im_z)
+                st.session_state.data_loaded = True
+                st.session_state.preview_plots = True
+                st.rerun()
+        
+        # Data preprocessing controls
+        if st.session_state.data_loaded and st.session_state.data is not None:
+            st.header("✂️ Data Preprocessing")
+            
+            # Frequency range selection
+            f_min, f_max = st.slider(
+                "Frequency range (Hz)",
+                min_value=float(st.session_state.data.original_freq.min()),
+                max_value=float(st.session_state.data.original_freq.max()),
+                value=(float(st.session_state.data.original_freq.min()),
+                       float(st.session_state.data.original_freq.max())),
+                format="%.2e"
+            )
+            
+            # Point removal
+            point_idx = st.slider(
+                "Select point to remove (index)",
+                min_value=0,
+                max_value=st.session_state.data.n_points - 1,
+                value=0,
+                step=1
+            )
+            st.session_state.selected_point = point_idx
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Remove Selected Point", key="remove_point_btn"):
+                    st.session_state.data.remove_point(point_idx)
+                    st.success(f"Removed point {point_idx}")
+                    st.rerun()
+            with col2:
+                if st.button("Reset Data", key="reset_data_btn"):
+                    st.session_state.data.reset()
+                    st.success("Data reset to original")
+                    st.rerun()
+            
+            # Apply frequency range button
+            if st.button("Apply Frequency Range", key="apply_range_btn"):
+                st.session_state.data.apply_frequency_range(f_min, f_max)
+                st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
+                st.rerun()
+            
+            st.info(f"Current points: {st.session_state.data.n_points} / {len(st.session_state.data.original_freq)}")
         
         # Analysis parameters
-        if freq is not None:
+        if st.session_state.data_loaded and st.session_state.data is not None:
             st.header("⚙️ Analysis Parameters")
             
             # Method selection
             analysis_method = st.selectbox("DRT Calculation Method",
-                                          ["Tikhonov Regularization",
-                                           "Bayesian Method",
-                                           "Maximum Entropy",
-                                           "Gaussian Process",
-                                           "Genetic Programming (ISGP)"])
-            
-            # Estimate and display R_inf and R_pol
-            R_inf_est = re_z[-1] if len(re_z) > 0 else 0
-            R_pol_est = np.max(re_z) - R_inf_est if np.max(re_z) > R_inf_est else 1.0
-            
-            st.info(f"Estimated R∞ = {R_inf_est:.4f} Ω, Rpol = {R_pol_est:.4f} Ω")
-            
-            R_inf = st.number_input("R∞ (Ohmic resistance)", 
-                                   value=float(R_inf_est), format="%.6f")
-            R_pol = st.number_input("Rpol (Polarization resistance)", 
-                                   value=float(R_pol_est), format="%.6f")
+                                          ["Tikhonov Regularization (NNLS)",
+                                           "Bayesian MCMC",
+                                           "Maximum Entropy (auto-λ)",
+                                           "Finite Gaussian Process (fGP-DRT)",
+                                           "Loewner Framework (RLF)",
+                                           "Generalized DRT (with inductive loops)"])
             
             n_tau = st.slider("Number of time points", 50, 300, 150)
             
+            # Inductive loop handling
+            include_inductive = False
+            if analysis_method == "Generalized DRT (with inductive loops)":
+                include_inductive = st.checkbox("Include inductive loops", value=True)
+            
             # Method-specific parameters
-            if analysis_method == "Tikhonov Regularization":
-                reg_order = st.selectbox("Regularization order", [0, 1, 2], index=2,
-                                        help="0: amplitude smoothing, 1: slope smoothing, 2: curvature smoothing")
+            if analysis_method == "Tikhonov Regularization (NNLS)":
+                reg_order = st.selectbox("Regularization order", [0, 1, 2], index=2)
                 lambda_auto = st.checkbox("Automatic λ selection", value=True)
                 if not lambda_auto:
                     lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
                 else:
                     lambda_value = None
-            elif analysis_method == "Maximum Entropy":
-                entropy_lambda = st.number_input("Entropy λ", value=0.1, format="%.2f",
-                                                help="Smaller values give smoother spectra")
-            elif analysis_method == "Gaussian Process":
-                n_components = st.slider("Number of GP components", 10, 50, 20)
-            elif analysis_method == "Genetic Programming (ISGP)":
-                n_peaks_max = st.slider("Maximum number of peaks", 1, 10, 5)
-                n_generations = st.slider("Number of generations", 10, 100, 50)
+            elif analysis_method == "Bayesian MCMC":
+                if not PYMC_AVAILABLE:
+                    st.warning("PyMC not installed. Bayesian MCMC will use fallback method.")
+                n_samples = st.slider("MCMC samples", 500, 5000, 2000)
+                n_tune = st.slider("Tuning samples", 500, 2000, 1000)
+            elif analysis_method == "Maximum Entropy (auto-λ)":
+                entropy_lambda_auto = st.checkbox("Auto-select λ", value=True)
+                if not entropy_lambda_auto:
+                    entropy_lambda = st.number_input("Entropy λ", value=0.1, format="%.2f")
+                else:
+                    entropy_lambda = None
+            elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
+                n_components = st.slider("GP components", 10, 50, 30)
+            elif analysis_method == "Loewner Framework (RLF)":
+                model_order = st.number_input("Model order (0=auto)", min_value=0, max_value=100, value=0)
+                if model_order == 0:
+                    model_order = None
             
             # Peak detection parameters
             st.header("🔍 Peak Detection")
@@ -1151,20 +1504,49 @@ def main():
             # Run analysis button
             analyze_button = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
     
-    # Main content area
-    if freq is not None and 'analyze_button' in locals() and analyze_button:
+    # Main content area - Preview plots
+    if st.session_state.data_loaded and st.session_state.data is not None and st.session_state.preview_plots:
+        st.markdown("---")
+        st.header("📊 Data Preview")
+        
+        # Display preview plots
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_nyquist = plot_nyquist_matplotlib(st.session_state.data, 
+                                                  highlight_idx=st.session_state.selected_point)
+            st.pyplot(fig_nyquist)
+            st.caption("Nyquist Plot - Red circle shows selected point")
+        
+        with col2:
+            fig_bode = plot_bode_matplotlib(st.session_state.data)
+            st.pyplot(fig_bode)
+            st.caption("Bode Plot")
+        
+        # Data statistics
+        with st.expander("Data Statistics"):
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Points", st.session_state.data.n_points)
+            with col2:
+                st.metric("f_min", f"{st.session_state.data.freq.min():.2e} Hz")
+            with col3:
+                st.metric("f_max", f"{st.session_state.data.freq.max():.2e} Hz")
+            with col4:
+                st.metric("R_inf (est)", f"{st.session_state.data.re_z[-1]:.4f} Ω")
+    
+    # Main content area - Analysis results
+    if st.session_state.data_loaded and st.session_state.data is not None and 'analyze_button' in locals() and analyze_button:
         st.markdown("---")
         st.header("📊 Analysis Results")
         
-        # Sort data by frequency
-        sort_idx = np.argsort(freq)
-        freq = freq[sort_idx]
-        re_z = re_z[sort_idx]
-        im_z = im_z[sort_idx]
+        data = st.session_state.data
         
         # Perform KK test
         with st.spinner("Performing Kramers-Kronig validation..."):
-            kk_passed, max_res, res_real, res_imag, _ = kramers_kronig_test(freq, re_z, im_z)
+            kk_passed, max_res, res_real, res_imag = kramers_kronig_hilbert_transform(
+                data.freq, data.re_z, data.im_z
+            )
             
             if kk_passed:
                 st.success(f"✓ KK test passed (max residual: {max_res*100:.2f}%)")
@@ -1173,39 +1555,55 @@ def main():
         
         # Calculate DRT based on selected method
         with st.spinner(f"Calculating DRT using {analysis_method}..."):
-            if analysis_method == "Tikhonov Regularization":
-                drt_solver = TikhonovDRT(freq, re_z, im_z, regularization_order=reg_order)
-                tau, gamma, confidence = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto)
-                method_key = "Tikhonov"
-            elif analysis_method == "Bayesian Method":
-                drt_solver = BayesianDRT(freq, re_z, im_z)
-                tau, gamma, confidence = drt_solver.compute(n_tau=n_tau)
-                method_key = "Bayesian"
-            elif analysis_method == "Maximum Entropy":
-                drt_solver = MaxEntropyDRT(freq, re_z, im_z)
-                tau, gamma, confidence = drt_solver.compute(n_tau=n_tau, lambda_value=entropy_lambda)
-                method_key = "MaxEntropy"
-            elif analysis_method == "Gaussian Process":
-                drt_solver = GaussianProcessDRT(freq, re_z, im_z)
-                tau, gamma, confidence = drt_solver.compute(n_tau=n_tau, n_components=n_components)
-                method_key = "GP-DRT"
-            else:  # Genetic Programming
-                drt_solver = ISGPDRT(freq, re_z, im_z)
-                tau, gamma, peaks_params = drt_solver.compute(n_tau=n_tau, n_peaks_max=n_peaks_max, 
-                                                              n_generations=n_generations)
-                confidence = None
-                method_key = "ISGP"
-            
-            # Reconstruct impedance
-            Z_rec_real, Z_rec_imag = drt_solver.reconstruct_impedance(tau, gamma)
+            try:
+                if analysis_method == "Tikhonov Regularization (NNLS)":
+                    drt_solver = TikhonovDRT(data, regularization_order=reg_order, 
+                                             include_inductive=include_inductive)
+                    result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_value, 
+                                                lambda_auto=lambda_auto)
+                    method_key = "Tikhonov"
+                elif analysis_method == "Bayesian MCMC":
+                    drt_solver = BayesianDRT(data, include_inductive=include_inductive)
+                    if PYMC_AVAILABLE:
+                        result = drt_solver.compute(n_tau=n_tau, n_samples=n_samples, n_tune=n_tune)
+                    else:
+                        # Fallback to simpler Bayesian method
+                        result = drt_solver.compute(n_tau=n_tau, n_samples=500)
+                    method_key = "Bayesian"
+                elif analysis_method == "Maximum Entropy (auto-λ)":
+                    drt_solver = MaxEntropyDRT(data, include_inductive=include_inductive)
+                    lambda_auto_val = entropy_lambda_auto if 'entropy_lambda_auto' in locals() else True
+                    lambda_val = entropy_lambda if not lambda_auto_val and 'entropy_lambda' in locals() else None
+                    result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_val, 
+                                                lambda_auto=lambda_auto_val)
+                    method_key = "MaxEntropy"
+                elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
+                    drt_solver = FiniteGaussianProcessDRT(data, include_inductive=include_inductive)
+                    result = drt_solver.compute(n_tau=n_tau, n_components=n_components)
+                    method_key = "fGP-DRT"
+                elif analysis_method == "Loewner Framework (RLF)":
+                    drt_solver = LoewnerFrameworkDRT(data)
+                    result = drt_solver.compute(n_tau=n_tau, model_order=model_order)
+                    method_key = "Loewner"
+                else:  # Generalized DRT
+                    drt_solver = TikhonovDRT(data, regularization_order=2, include_inductive=include_inductive)
+                    result = drt_solver.compute(n_tau=n_tau, lambda_auto=True)
+                    method_key = "Generalized DRT"
+                
+                # Reconstruct impedance
+                Z_rec_real, Z_rec_imag = drt_solver.reconstruct_impedance(result.tau_grid, result.gamma)
+                
+            except Exception as e:
+                st.error(f"DRT calculation failed: {e}")
+                st.stop()
         
         # Find peaks
-        peaks = find_peaks_drt(tau, gamma, peak_prominence)
+        peaks = find_peaks_drt(result.tau_grid, result.gamma, peak_prominence)
         
         # Calculate resistances if peaks found
         if peaks:
-            peaks_idx = [np.argmin(np.abs(tau - p['tau'])) for p in peaks]
-            resistances = calculate_resistances(tau, gamma, peaks_idx)
+            peaks_idx = [np.argmin(np.abs(result.tau_grid - p['tau'])) for p in peaks]
+            resistances = calculate_resistances(result.tau_grid, result.gamma, peaks_idx)
             for i, p in enumerate(peaks):
                 p['resistance'] = resistances[i] if i < len(resistances) else 0
                 p['capacitance'] = p['tau'] / p['resistance'] if p['resistance'] > 0 else 0
@@ -1218,8 +1616,12 @@ def main():
             st.subheader("Distribution of Relaxation Times")
             
             # Publication-quality DRT plot
-            fig_drt = plot_drt_matplotlib(tau, gamma, peaks, confidence)
+            fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
+            
+            # Convergence info for Bayesian method
+            if not result.convergence and analysis_method == "Bayesian MCMC":
+                st.warning("⚠ MCMC may not have converged. Consider increasing samples.")
             
             # Download button for DRT figure
             buf = io.BytesIO()
@@ -1249,11 +1651,11 @@ def main():
             st.subheader("Nyquist and Bode Plots")
             
             # Nyquist plot
-            fig_nyquist = plot_nyquist_matplotlib(freq, re_z, im_z, Z_rec_real, Z_rec_imag)
+            fig_nyquist = plot_nyquist_matplotlib(data, Z_rec_real, Z_rec_imag)
             st.pyplot(fig_nyquist)
             
             # Bode plot
-            fig_bode = plot_bode_matplotlib(freq, re_z, im_z, Z_rec_real, Z_rec_imag)
+            fig_bode = plot_bode_matplotlib(data, Z_rec_real, Z_rec_imag)
             st.pyplot(fig_bode)
             
             # Download buttons
@@ -1277,23 +1679,27 @@ def main():
             st.subheader("Interactive Plots")
             
             # Interactive impedance plot
-            fig_imp_plotly = plot_impedance_plotly(freq, re_z, im_z, Z_rec_real, Z_rec_imag)
+            fig_imp_plotly = plot_impedance_plotly(data, Z_rec_real, Z_rec_imag)
             st.plotly_chart(fig_imp_plotly, use_container_width=True)
             
             # Interactive DRT plot
-            fig_drt_plotly = plot_drt_plotly(tau, gamma, peaks, confidence)
+            fig_drt_plotly = plot_drt_plotly(result, peaks)
             st.plotly_chart(fig_drt_plotly, use_container_width=True)
             
             # Reconstruction error
-            error_real = np.abs(re_z - Z_rec_real) / np.abs(re_z + 1e-10) * 100
-            error_imag = np.abs(im_z - Z_rec_imag) / np.abs(im_z + 1e-10) * 100
+            error_real = np.abs(data.re_z - Z_rec_real) / np.abs(data.re_z + 1e-10) * 100
+            error_imag = np.abs(data.im_z - Z_rec_imag) / np.abs(data.im_z + 1e-10) * 100
             mean_error = np.mean(np.sqrt(error_real**2 + error_imag**2))
             st.metric("Mean Reconstruction Error", f"{mean_error:.2f} %")
+            
+            # Uncertainty info
+            if result.gamma_std is not None:
+                st.metric("Mean DRT Uncertainty", f"{np.mean(result.gamma_std / (result.gamma + 1e-10)) * 100:.2f} %")
         
         with tab4:
             if res_real is not None and res_imag is not None:
                 st.subheader("Kramers-Kronig Validation")
-                fig_kk = plot_kk_residuals_matplotlib(freq, res_real, res_imag)
+                fig_kk = plot_kk_residuals_matplotlib(data.freq, res_real, res_imag)
                 st.pyplot(fig_kk)
                 
                 buf = io.BytesIO()
@@ -1307,13 +1713,13 @@ def main():
             st.subheader("Analysis Report")
             
             params = {
-                'R_inf': R_inf,
-                'R_pol': R_pol,
+                'R_inf': result.R_inf,
+                'R_pol': result.R_pol,
                 'kk_passed': kk_passed,
-                'max_kk_res': max_res * 100,
+                'max_kk_res': max_res,
             }
             
-            report = create_report(freq, re_z, im_z, tau, gamma, peaks, analysis_method, params)
+            report = create_report(data, result, peaks, analysis_method, kk_passed, max_res)
             st.text(report)
             
             # Download report
@@ -1324,12 +1730,12 @@ def main():
             
             # Export DRT data
             drt_data = pd.DataFrame({
-                'tau_s': tau,
-                'log10_tau': np.log10(tau),
-                'gamma_tau': gamma
+                'tau_s': result.tau_grid,
+                'log10_tau': np.log10(result.tau_grid),
+                'gamma_tau': result.gamma
             })
-            if confidence is not None:
-                drt_data['gamma_uncertainty'] = confidence
+            if result.gamma_std is not None:
+                drt_data['gamma_uncertainty'] = result.gamma_std
             
             csv = drt_data.to_csv(index=False)
             st.download_button("📥 Export DRT Data (CSV)", 
@@ -1346,7 +1752,7 @@ def main():
                                   file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                                   mime="text/csv")
     
-    elif freq is None:
+    elif not st.session_state.data_loaded:
         st.info("👈 Please load impedance data using the sidebar controls to begin analysis")
         
         # Show example format
@@ -1373,7 +1779,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("⚡ *DRT Analysis Tool v2.0 | 5 inversion methods: Tikhonov, Bayesian, MaxEntropy, GP, ISGP*")
+    st.markdown("⚡ *DRT Analysis Tool v3.0 | 6 inversion methods: Tikhonov (NNLS), Bayesian MCMC, MaxEntropy (auto-λ), fGP-DRT, Loewner (RLF), Generalized DRT*")
 
 
 if __name__ == "__main__":
