@@ -2764,6 +2764,7 @@ def step1_data_loading():
                         if freq is not None:
                             st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
                             st.session_state.app_state.data_loaded = True
+                            st.session_state.selected_point_idx = 0  # Initialize selected point index
                             st.success(f"✅ Loaded {len(freq)} data points")
                             st.rerun()
                 except Exception as e:
@@ -2773,6 +2774,7 @@ def step1_data_loading():
             if freq is not None:
                 st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
                 st.session_state.app_state.data_loaded = True
+                st.session_state.selected_point_idx = 0  # Initialize selected point index
                 st.success(f"✅ Loaded {len(freq)} data points")
                 st.rerun()
     
@@ -2796,22 +2798,27 @@ def step1_data_loading():
         
         data = st.session_state.app_state.impedance_data
         
-        # Create a container for dynamic updates
-        plot_container = st.empty()
+        # Initialize session state for selected point if not exists
+        if 'selected_point_idx' not in st.session_state:
+            st.session_state.selected_point_idx = 0
         
-        col1, col2 = st.columns(2)
-        
-        # Point selection slider - this will trigger rerun and update the plot
+        # Point selection slider - placed OUTSIDE the plot container
+        # This prevents replotting when slider changes
         point_idx = st.slider(
             "Select point to remove (index)",
             min_value=0,
             max_value=data.n_points - 1,
-            value=min(0, data.n_points - 1),
+            value=min(st.session_state.selected_point_idx, data.n_points - 1),
             step=1,
-            key="point_selector"
+            key="point_selector_step1"
         )
         
-        # Update the plot dynamically based on slider value
+        # Update session state
+        st.session_state.selected_point_idx = point_idx
+        
+        # Create plots in a container - these will only update when rerun is triggered
+        plot_container = st.empty()
+        
         with plot_container:
             fig_nyquist = plot_nyquist_matplotlib(data, highlight_idx=point_idx)
             fig_bode = plot_bode_matplotlib(data, highlight_idx=point_idx)
@@ -2839,17 +2846,23 @@ def step1_data_loading():
             
             if st.button("📊 Apply Frequency Range", use_container_width=True):
                 data.apply_frequency_range(f_min, f_max)
+                st.session_state.selected_point_idx = 0  # Reset point index
                 st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
                 st.rerun()
         
         with col2:
             if st.button("🗑️ Remove Selected Point", use_container_width=True):
-                data.remove_point(point_idx)
-                st.success(f"Removed point {point_idx}")
-                st.rerun()
+                if point_idx < data.n_points:
+                    data.remove_point(point_idx)
+                    # Reset point index to 0 if we removed the last point
+                    if point_idx >= data.n_points - 1:
+                        st.session_state.selected_point_idx = max(0, data.n_points - 1)
+                    st.success(f"Removed point {point_idx}")
+                    st.rerun()
             
             if st.button("🔄 Reset Data", use_container_width=True):
                 data.reset()
+                st.session_state.selected_point_idx = 0
                 st.success("Data reset to original")
                 st.rerun()
         
