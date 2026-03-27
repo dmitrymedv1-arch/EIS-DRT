@@ -3451,12 +3451,12 @@ def step4_results():
             for peak, color in zip(deconv_result.peaks, colors):
                 # Восстанавливаем компоненту в оригинальном масштабе
                 # Используем оригинальную амплитуду peak.amplitude
-                y_component = GaussianModelDeconv.gaussian(
+                y_component = peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 
-                    peak.amplitude_norm,  # нормализованная амплитуда для расчета формы
+                    1.0,  # амплитуда = 1 для формы
                     peak.center_log, 
                     peak.sigma_log
-                ) * max(deconv_result.y_original)  # денормализуем с помощью max оригинальных данных
+                )
                 
                 # Заполняем под гауссианом
                 ax.fill_between(x_dense, 0, y_component, 
@@ -3469,7 +3469,7 @@ def step4_results():
         # Рисуем базовую линию если есть
         if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
             if deconv_result.baseline_method == 'constant':
-                y_baseline = np.full_like(x_dense, deconv_result.baseline_params[0] * max(deconv_result.y_original))
+                y_baseline = np.full_like(x_dense, deconv_result.baseline_params[0])
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
             elif deconv_result.baseline_method == 'linear':
                 y_baseline = (deconv_result.baseline_params[0] + 
@@ -3490,12 +3490,13 @@ def step4_results():
                 peak_params.extend([peak.amplitude_norm, peak.center_log, peak.sigma_log])
             
             if deconv_result.baseline_method != 'none' and deconv_result.baseline_params:
+                # Для общей суммы используем оригинальные значения
                 y_total = GaussianModelDeconv.multi_gaussian_with_baseline(
                     x_dense_log, n_peaks, peak_params, 
                     deconv_result.baseline_params, deconv_result.baseline_method
-                ) * max(deconv_result.y_original)
+                ) * max(deconv_result.y_original) / max([p.amplitude_norm for p in deconv_result.peaks])
             else:
-                y_total = GaussianModelDeconv.multi_gaussian(x_dense_log, *peak_params) * max(deconv_result.y_original)
+                y_total = GaussianModelDeconv.multi_gaussian(x_dense_log, *peak_params) * max(deconv_result.y_original) / max([p.amplitude_norm for p in deconv_result.peaks])
             
             ax.plot(x_dense, y_total, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
         
