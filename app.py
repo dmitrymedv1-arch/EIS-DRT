@@ -1843,6 +1843,28 @@ class GaussianDeconvolver:
         self.multi_gaussian = GaussianModel.multi_gaussian
         self.gaussian = GaussianModel.gaussian
     
+    def _get_n_baseline_params(self):
+        """Get number of baseline parameters"""
+        return {
+            'none': 0,
+            'constant': 1,
+            'linear': 2,
+            'quadratic': 3
+        }.get(self.baseline_method, 0)
+    
+    def _prepare_initial_params(self, peak_params, n_baseline):
+        """Prepare initial parameters with baseline if needed"""
+        params = list(peak_params)
+        if n_baseline > 0:
+            if self.baseline_method == 'constant':
+                baseline_init = [np.percentile(self.y_norm, 5)]
+            elif self.baseline_method == 'linear':
+                baseline_init = [np.percentile(self.y_norm, 5), 0]
+            else:  # quadratic
+                baseline_init = [np.percentile(self.y_norm, 5), 0, 0]
+            params.extend(baseline_init[:n_baseline])
+        return params
+    
     def auto_detect_peaks(self, sensitivity=0.03, min_distance=5):
         """Automatic peak detection using derivatives"""
         # Smoothing
@@ -2096,6 +2118,8 @@ class GaussianDeconvolver:
             _, _, initial_params, _ = self.auto_detect_peaks()
         
         if len(initial_params) == 0:
+            if progress_callback:
+                progress_callback(1.0, "No peaks detected!")
             return False
         
         n_peaks = len(initial_params) // 3
@@ -2143,6 +2167,9 @@ class GaussianDeconvolver:
             else:  # precise
                 xtol, ftol, gtol = 1e-8, 1e-8, 1e-8
                 maxfev = min(maxfev, 10000)
+            
+            if progress_callback:
+                progress_callback(0.5, "Running curve_fit...")
             
             # Perform fit
             popt, pcov = curve_fit(
@@ -2195,7 +2222,8 @@ class GaussianDeconvolver:
                     'fwhm': GaussianModel.calculate_fwhm(sigma),
                     'area': area,
                     'fraction': 0,
-                    'y_norm': component_y_norm
+                    'y_norm': component_y_norm,
+                    'source': 'auto'
                 })
             
             # Calculate fractions
@@ -2224,29 +2252,8 @@ class GaussianDeconvolver:
         except Exception as e:
             if progress_callback:
                 progress_callback(1.0, f"Fit failed: {e}")
+            print(f"Error in fit: {e}")  # For debugging
             return False
-    
-    def _get_n_baseline_params(self):
-        """Get number of baseline parameters"""
-        return {
-            'none': 0,
-            'constant': 1,
-            'linear': 2,
-            'quadratic': 3
-        }.get(self.baseline_method, 0)
-    
-    def _prepare_initial_params(self, peak_params, n_baseline):
-        """Prepare initial parameters with baseline if needed"""
-        params = list(peak_params)
-        if n_baseline > 0:
-            if self.baseline_method == 'constant':
-                baseline_init = [np.percentile(self.y_norm, 5)]
-            elif self.baseline_method == 'linear':
-                baseline_init = [np.percentile(self.y_norm, 5), 0]
-            else:  # quadratic
-                baseline_init = [np.percentile(self.y_norm, 5), 0, 0]
-            params.extend(baseline_init[:n_baseline])
-        return params
     
     def preview_fit(self, initial_params=None):
         """Preview fit without optimization (fast)"""
@@ -2385,7 +2392,6 @@ class GaussianDeconvolver:
             total_area=self.total_area,
             max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
         )
-
 
 # ============================================================================
 # Visualization Functions (from both codes)
