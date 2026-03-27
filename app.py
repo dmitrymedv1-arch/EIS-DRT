@@ -1057,8 +1057,8 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
         ax.plot(re_rec, im_rec, 's-', markersize=3, linewidth=1.0,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax.set_xlabel(r"$\mathrm{Re}(Z)$ / $\Omega$", fontweight='bold')
-    ax.set_ylabel(r"$-\mathrm{Im}(Z)$ / $\Omega$", fontweight='bold')
+    ax.set_xlabel(r"Re(Z) / $\Omega$", fontweight='bold')
+    ax.set_ylabel(r"-Im(Z) / $\Omega$", fontweight='bold')
     ax.set_title(title, fontweight='bold')
     ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--')
@@ -1085,7 +1085,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax1.loglog(data.freq, mag_rec, 's-', markersize=3, linewidth=1.0,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax1.set_ylabel("$|Z|$ / $\Omega$", fontweight='bold')
+    ax1.set_ylabel("|Z| / $\Omega$", fontweight='bold')
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3, linestyle='--')
     
@@ -1212,7 +1212,7 @@ def plot_kk_residuals_matplotlib(freq: np.ndarray, res_real: np.ndarray, res_ima
     
     ax1.semilogx(freq, res_real * 100, 'o-', markersize=4, linewidth=1.0, color='#1f77b4')
     ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax1.set_ylabel(r"$\Delta \mathrm{Re}(Z)$ / %", fontweight='bold')
+    ax1.set_ylabel(r"$\Delta$ Re(Z) / %", fontweight='bold')
     ax1.set_title("Kramers-Kronig Test - Real Part Residuals", fontweight='bold')
     ax1.grid(True, alpha=0.3, linestyle='--')
     ax1.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
@@ -1221,7 +1221,7 @@ def plot_kk_residuals_matplotlib(freq: np.ndarray, res_real: np.ndarray, res_ima
     
     ax2.semilogx(freq, res_imag * 100, 'o-', markersize=4, linewidth=1.0, color='#1f77b4')
     ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel(r"$\Delta \mathrm{Im}(Z)$ / %", fontweight='bold')
+    ax2.set_ylabel(r"$\Delta$ Im(Z) / %", fontweight='bold')
     ax2.set_title("Kramers-Kronig Test - Imaginary Part Residuals", fontweight='bold')
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
