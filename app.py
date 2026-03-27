@@ -3271,7 +3271,7 @@ def step3_gaussian_deconvolution():
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
             ax.set_ylabel('γ(τ) (norm.)', fontweight='bold')
             ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
-            ax.legend(['DRT Data', 'Detected Peaks'], loc='upper right')
+            ax.legend(['DRT Data', 'Detected Peaks'], loc='upper left')
             ax.grid(True, alpha=0.3, linestyle='--')
             
             st.pyplot(fig)
