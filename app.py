@@ -1129,7 +1129,7 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
         ax.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
                         result.gamma + 2*result.gamma_std,
                         alpha=0.3, color='gray', label='±2σ uncertainty')
-    ax.loglog(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
+    ax.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
     
     # Plot peaks
     if peaks and len(peaks) > 0:
