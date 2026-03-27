@@ -1,6 +1,6 @@
 """
 Electrochemical Impedance Spectroscopy (EIS) Analysis Tool
-Distribution of Relaxation Times (DRT) Analysis
+Distribution of Relaxation Times (DRT) Analysis with Gaussian Deconvolution
 
 Поддерживаемые методы:
 - Тихоновская регуляризация (Tikhonov) с NNLS
@@ -10,8 +10,13 @@ Distribution of Relaxation Times (DRT) Analysis
 - Loewner Framework (RLF) - data-driven метод
 - Generalized DRT для обработки индуктивных петель
 
+Дополнительно:
+- Gaussian Deconvolution of DRT Peaks
+- Multi-stage workflow with state preservation
+- Peak editing and area distribution analysis
+
 Author: DRT Analysis Tool
-Version: 3.0.0
+Version: 4.0.0
 """
 
 import streamlit as st
@@ -19,10 +24,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter, LogLocator, AutoMinorLocator
+from matplotlib.patches import Patch
 from scipy import optimize, linalg, interpolate, integrate
-from scipy.signal import savgol_filter, find_peaks
+from scipy.signal import savgol_filter, find_peaks, peak_widths
 from scipy.integrate import trapezoid
 from scipy.special import gamma as gamma_func
+from scipy.ndimage import gaussian_filter1d
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
@@ -30,9 +37,11 @@ import base64
 from datetime import datetime
 import warnings
 import logging
-from typing import Tuple, Optional, List, Dict, Any, Union
+from typing import Tuple, Optional, List, Dict, Any, Union, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+import re
+import time
 
 # PyMC for Bayesian MCMC
 try:
@@ -47,11 +56,197 @@ warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="EIS-DRT Analysis Tool v3.0",
+    page_title="EIS-DRT Analysis Tool v4.0",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+
+# ============================================================================
+# Modern Scientific Styling
+# ============================================================================
+
+def apply_modern_scientific_style():
+    """Apply modern scientific plotting style with enhanced aesthetics"""
+    plt.style.use('default')
+    plt.rcParams.update({
+        # Font settings
+        'font.size': 11,
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman', 'DejaVu Serif'],
+        
+        # Axes settings
+        'axes.labelsize': 12,
+        'axes.labelweight': 'bold',
+        'axes.titlesize': 13,
+        'axes.titleweight': 'bold',
+        'axes.facecolor': '#f8f9fa',
+        'axes.edgecolor': '#2c3e50',
+        'axes.linewidth': 1.2,
+        'axes.grid': True,
+        'axes.grid.alpha': 0.3,
+        'axes.grid.linestyle': '--',
+        
+        # Tick settings
+        'xtick.color': '#2c3e50',
+        'ytick.color': '#2c3e50',
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'xtick.direction': 'out',
+        'ytick.direction': 'out',
+        'xtick.major.size': 5,
+        'xtick.minor.size': 3,
+        'ytick.major.size': 5,
+        'ytick.minor.size': 3,
+        'xtick.major.width': 1,
+        'ytick.major.width': 1,
+        
+        # Legend settings
+        'legend.fontsize': 10,
+        'legend.frameon': True,
+        'legend.framealpha': 0.95,
+        'legend.edgecolor': '#2c3e50',
+        'legend.fancybox': True,
+        'legend.shadow': True,
+        
+        # Figure settings
+        'figure.dpi': 300,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+        'savefig.pad_inches': 0.05,
+        'figure.facecolor': 'white',
+        'figure.figsize': [10, 6],
+        
+        # Lines and markers
+        'lines.linewidth': 2,
+        'lines.markersize': 6,
+        'lines.markeredgewidth': 1,
+        'errorbar.capsize': 3,
+        
+        # Color cycles - modern scientific palette
+        'axes.prop_cycle': plt.cycler(color=['#1f77b4', '#ff7f0e', '#2ca02c', 
+                                              '#d62728', '#9467bd', '#8c564b', 
+                                              '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'])
+    })
+
+apply_modern_scientific_style()
+
+# Custom CSS for modern matte effects
+st.markdown("""
+<style>
+    /* Modern button styling with matte effect */
+    .stButton > button {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.5rem 1rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        background: linear-gradient(135deg, #5a67d8 0%, #6b46a0 100%);
+    }
+    .stButton > button:active {
+        transform: translateY(0px);
+    }
+    
+    /* Primary button special styling */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        background: linear-gradient(180deg, #f7fafc 0%, #edf2f7 100%);
+    }
+    
+    /* Metric cards */
+    .stMetric {
+        background: white;
+        border-radius: 12px;
+        padding: 1rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.07);
+        border: 1px solid #e2e8f0;
+    }
+    
+    /* Expander styling */
+    .streamlit-expanderHeader {
+        background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+        border-radius: 8px;
+        font-weight: 600;
+    }
+    
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
+        background-color: #f1f5f9;
+        border-radius: 8px;
+        padding: 4px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 6px;
+        padding: 8px 16px;
+        font-weight: 500;
+        transition: all 0.2s;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+    }
+    
+    /* Progress bar styling */
+    .stProgress > div > div {
+        background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+    }
+    
+    /* Info/Warning/Success boxes */
+    .stAlert {
+        border-radius: 10px;
+        border-left-width: 4px;
+    }
+    
+    /* Dataframe styling */
+    .dataframe {
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
+    
+    /* Slider styling */
+    .stSlider > div > div > div {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    
+    /* Navigation step indicators */
+    .step-indicator {
+        background: white;
+        border-radius: 12px;
+        padding: 12px;
+        margin-bottom: 16px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .step-completed {
+        color: #48bb78;
+        font-weight: bold;
+    }
+    .step-current {
+        color: #667eea;
+        font-weight: bold;
+        background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+        padding: 4px 8px;
+        border-radius: 6px;
+    }
+    .step-pending {
+        color: #a0aec0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -76,6 +271,7 @@ class DRTResult:
     
     def get_integral(self) -> float:
         return np.trapezoid(self.gamma, np.log(self.tau_grid))
+
 
 @dataclass
 class ImpedanceData:
@@ -146,57 +342,107 @@ class ImpedanceData:
 
 
 # ============================================================================
-# Scientific Plotting Style for Matplotlib
+# Data Classes for Gaussian Deconvolution Results
 # ============================================================================
 
-def apply_publication_style():
-    """Apply publication-quality plotting style for matplotlib figures"""
-    plt.style.use('default')
-    plt.rcParams.update({
-        'font.size': 10,
-        'font.family': 'serif',
-        'axes.labelsize': 11,
-        'axes.labelweight': 'bold',
-        'axes.titlesize': 12,
-        'axes.titleweight': 'bold',
-        'axes.facecolor': 'white',
-        'axes.edgecolor': 'black',
-        'axes.linewidth': 1.0,
-        'axes.grid': False,
-        'xtick.color': 'black',
-        'ytick.color': 'black',
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'xtick.direction': 'out',
-        'ytick.direction': 'out',
-        'xtick.major.size': 4,
-        'xtick.minor.size': 2,
-        'ytick.major.size': 4,
-        'ytick.minor.size': 2,
-        'xtick.major.width': 0.8,
-        'ytick.major.width': 0.8,
-        'legend.fontsize': 10,
-        'legend.frameon': True,
-        'legend.framealpha': 0.9,
-        'legend.edgecolor': 'black',
-        'legend.fancybox': False,
-        'figure.dpi': 600,
-        'savefig.dpi': 600,
-        'savefig.bbox': 'tight',
-        'savefig.pad_inches': 0.1,
-        'figure.facecolor': 'white',
-        'lines.linewidth': 1.5,
-        'lines.markersize': 6,
-        'errorbar.capsize': 3,
-        'text.usetex': False, 
-        'mathtext.default': 'regular', 
-    })
+@dataclass
+class GaussianPeak:
+    """Container for Gaussian peak parameters"""
+    id: int
+    center: float          # Center in linear space
+    center_log: float      # Center in log space
+    amplitude: float       # Amplitude in original scale
+    amplitude_norm: float  # Normalized amplitude
+    sigma_log: float       # Sigma in log space
+    fwhm: float           # Full width at half maximum
+    area: float           # Area under peak
+    fraction: float       # Fraction of total area
+    fraction_percent: float  # Percentage fraction
+    source: str = 'auto'  # Source: 'auto', 'manual', 'residuals'
+    y_norm: np.ndarray = None  # Normalized y values for plotting
 
-apply_publication_style()
+
+@dataclass
+class DeconvolutionResult:
+    """Container for Gaussian deconvolution results"""
+    peaks: List[GaussianPeak]
+    fit_y_norm: np.ndarray
+    x: np.ndarray
+    y_norm: np.ndarray
+    y_original: np.ndarray
+    x_linear: np.ndarray
+    use_log_x: bool
+    use_log_y: bool
+    quality_metrics: Dict[str, Any]
+    baseline_params: Optional[List[float]] = None
+    baseline_method: str = 'none'
+    total_area: float = 0.0
+    max_amplitude: float = 0.0
 
 
 # ============================================================================
-# Data Loading and Validation
+# Application State Management
+# ============================================================================
+
+@dataclass
+class AppState:
+    """Centralized state management for the entire application"""
+    # Current step
+    current_step: int = 1
+    
+    # Step 1: Data loading
+    impedance_data: Optional[ImpedanceData] = None
+    data_loaded: bool = False
+    
+    # Step 2: DRT calculation
+    drt_result: Optional[DRTResult] = None
+    drt_method: str = "Tikhonov Regularization (NNLS)"
+    drt_parameters: Dict[str, Any] = field(default_factory=dict)
+    drt_calculated: bool = False
+    
+    # Step 3: Gaussian deconvolution
+    deconv_result: Optional[DeconvolutionResult] = None
+    peak_info: Optional[List[Dict]] = None
+    initial_peak_params: Optional[List[float]] = None
+    manual_peaks: List[Dict] = field(default_factory=list)
+    residuals_peaks: List[Dict] = field(default_factory=list)
+    pending_remove: Optional[int] = None
+    pending_split: Optional[Tuple[int, float]] = None
+    manual_peak_position: Optional[float] = None
+    deconv_parameters: Dict[str, Any] = field(default_factory=dict)
+    deconv_calculated: bool = False
+    
+    # Step 4: Results
+    results_ready: bool = False
+    
+    # General settings
+    use_log_x: bool = True
+    use_log_y: bool = False
+    clip_negative: bool = True
+    show_warnings: bool = True
+    smoothing_level: str = 'none'
+    baseline_method: str = 'none'
+    fitting_method: str = 'trf'
+    fit_quality: str = 'balanced'
+    max_nfev: int = 5000
+    preview_mode: bool = False
+    
+    # Peak detection settings
+    sensitivity: float = 0.03
+    min_distance: int = 5
+    
+    # Temporary storage for preview
+    preview_fit: Optional[np.ndarray] = None
+    last_popt: Optional[np.ndarray] = None
+
+
+# Initialize session state
+if 'app_state' not in st.session_state:
+    st.session_state.app_state = AppState()
+
+
+# ============================================================================
+# Data Loading and Validation (from EIS code)
 # ============================================================================
 
 def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -216,7 +462,7 @@ def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Opt
 
 def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Create widget for manual data entry with single text area."""
-    st.subheader("Ручной ввод данных")
+    st.subheader("📝 Ручной ввод данных")
     st.markdown("Введите данные в формате: **частота Re(Z) -Im(Z)** (разделитель - пробел или табуляция)")
     
     example_data = """1000000	-71.55	-3745
@@ -239,7 +485,7 @@ def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Opt
         help="Формат: частота (Гц) Re(Z) (Ом) -Im(Z) (Ом). Разделитель - пробел или табуляция"
     )
     
-    if st.button("Загрузить данные", type="primary"):
+    if st.button("📥 Загрузить данные", type="primary", use_container_width=True):
         try:
             rows = []
             for line in data_input.strip().split('\n'):
@@ -263,7 +509,7 @@ def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Opt
                 im_z = rows[:, 2]
                 st.success(f"✅ Загружено {len(freq)} точек спектра")
                 
-                with st.expander("Просмотр загруженных данных"):
+                with st.expander("📊 Просмотр загруженных данных"):
                     preview_df = pd.DataFrame({
                         'Frequency (Hz)': freq,
                         'Re(Z) (Ω)': re_z,
@@ -297,7 +543,6 @@ def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: n
         interp_im = interp1d(omega, im_z, kind='cubic', fill_value='extrapolate')(interp_omega)
         
         # Calculate Hilbert transform of imaginary part to predict real part
-        # For a causal system, Re(Z) = H{Im(Z)} where H is Hilbert transform
         from scipy.signal import hilbert
         analytic = hilbert(interp_im)
         re_predicted = np.real(analytic)
@@ -308,7 +553,7 @@ def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: n
         # Calculate residuals
         residuals = (re_z - re_pred_original) / np.abs(re_z + 1e-10)
         max_residual = np.max(np.abs(residuals))
-        is_valid = max_residual < 0.05  # 5% threshold
+        is_valid = max_residual < 0.05
         
         return is_valid, max_residual, residuals, np.zeros_like(residuals)
     except Exception as e:
@@ -317,7 +562,7 @@ def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: n
 
 
 # ============================================================================
-# Base DRT Class with Generalized Support
+# Base DRT Class with Generalized Support (from EIS code)
 # ============================================================================
 
 class DRTCore:
@@ -338,7 +583,7 @@ class DRTCore:
         self.Z_real = self.Z_real[sort_idx]
         self.Z_imag = self.Z_imag[sort_idx]
         
-        # Determine if inductive behavior is present (positive imaginary part at high frequencies)
+        # Determine if inductive behavior is present
         high_freq_idx = np.where(self.frequencies > 0.1 * np.max(self.frequencies))[0]
         if len(high_freq_idx) > 0:
             self.has_inductive_loop = np.any(self.Z_imag[high_freq_idx] > 0)
@@ -349,7 +594,7 @@ class DRTCore:
         self.tau_min = 1.0 / (2 * np.pi * np.max(self.frequencies)) * 0.1
         self.tau_max = 1.0 / (2 * np.pi * np.min(self.frequencies)) * 10
         
-        # Estimate ohmic resistance (high frequency limit)
+        # Estimate ohmic resistance
         if len(high_freq_idx) > 3:
             self.R_inf = np.mean(self.Z_real[high_freq_idx[-5:]])
         else:
@@ -373,8 +618,6 @@ class DRTCore:
                 K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
                 
                 if include_rl:
-                    # For RL elements, the kernel is different
-                    # RL contribution: jωτ/(1+jωτ)
                     rl_denom = 1 + (omega[i] * tau_grid[j])**2
                     K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
                     K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
@@ -403,7 +646,7 @@ class DRTCore:
 
 
 # ============================================================================
-# Tikhonov Regularization with NNLS
+# Tikhonov Regularization with NNLS (from EIS code)
 # ============================================================================
 
 class TikhonovDRT(DRTCore):
@@ -436,7 +679,6 @@ class TikhonovDRT(DRTCore):
     def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
         from scipy.optimize import nnls
         x, resid = nnls(A, b)
-        # Проверка сходимости
         if resid > 1e-6 * np.linalg.norm(b):
             logging.warning(f"NNLS residual: {resid}")
         return x
@@ -453,7 +695,7 @@ class TikhonovDRT(DRTCore):
         
         L = self._build_regularization_matrix(n_tau, self.regularization_order)
         
-        lambda_opt = None  # Инициализируем переменную
+        lambda_opt = None
         
         if lambda_auto:
             if lambda_range is None:
@@ -468,7 +710,6 @@ class TikhonovDRT(DRTCore):
                     A = np.vstack([K, lam * L])
                     b = np.concatenate([Z_target, np.zeros(L.shape[0])])
                     
-                    # Use NNLS instead of lstsq
                     x = self._solve_nnls(A, b)
                     
                     residual = np.linalg.norm(K @ x - Z_target)
@@ -496,10 +737,6 @@ class TikhonovDRT(DRTCore):
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
-        # Normalize DRT
-        pass
-        
-        # Estimate uncertainty from curvature of solution
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         
         return DRTResult(
@@ -510,9 +747,9 @@ class TikhonovDRT(DRTCore):
             R_inf=self.R_inf,
             R_pol=self.R_pol,
             metadata={
-                'lambda': lambda_opt,  # Всегда сохраняем использованное значение λ
+                'lambda': lambda_opt,
                 'order': self.regularization_order,
-                'lambda_auto': lambda_auto  # Сохраняем флаг автоматического выбора
+                'lambda_auto': lambda_auto
             }
         )
     
@@ -525,7 +762,7 @@ class TikhonovDRT(DRTCore):
 
 
 # ============================================================================
-# Bayesian DRT with MCMC (PyMC)
+# Bayesian DRT with MCMC (from EIS code)
 # ============================================================================
 
 class BayesianDRT(DRTCore):
@@ -546,43 +783,31 @@ class BayesianDRT(DRTCore):
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
-        # Regularization matrix (second derivative)
         L = np.zeros((n_tau-2, n_tau))
         for i in range(n_tau-2):
             L[i, i] = 1
             L[i, i+1] = -2
             L[i, i+2] = 1
         
-        # Build PyMC model
         with pm.Model() as model:
-            # Prior for gamma (positive, smooth)
             gamma_raw = pm.HalfNormal('gamma_raw', sigma=1.0, shape=n_tau)
             
-            # Regularization prior (smoothness)
             smoothness = pm.HalfCauchy('smoothness', beta=0.1)
             reg_penalty = smoothness * pm.math.sum(pm.math.abs(L @ gamma_raw))
             
-            # Likelihood
             sigma = pm.HalfCauchy('sigma', beta=0.1)
             Z_pred = pm.math.dot(K, gamma_raw)
             likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
             
-            # Add regularization as potential
             pm.Potential('reg', -reg_penalty)
             
-            # Sample
             trace = pm.sample(draws=n_samples, tune=n_tune, chains=n_chains, 
                              return_inferencedata=True, progressbar=False)
         
-        # Extract posterior statistics
         gamma_samples = trace.posterior['gamma_raw'].values.reshape(-1, n_tau)
         gamma_mean = np.mean(gamma_samples, axis=0)
         gamma_std = np.std(gamma_samples, axis=0)
         
-        # Normalize
-        pass
-        
-        # Check convergence using R-hat
         r_hat = az.rhat(trace).to_array().values
         converged = np.all(r_hat < 1.05)
         
@@ -606,7 +831,7 @@ class BayesianDRT(DRTCore):
 
 
 # ============================================================================
-# Maximum Entropy DRT with Automatic Lambda Selection
+# Maximum Entropy DRT with Automatic Lambda Selection (from EIS code)
 # ============================================================================
 
 class MaxEntropyDRT(DRTCore):
@@ -655,7 +880,6 @@ class MaxEntropyDRT(DRTCore):
                 residuals.append(1e10)
                 solutions.append(np.zeros(n_tau))
         
-        # Find best lambda using L-curve
         if len(residuals) > 2:
             best_idx = self._l_curve_criterion(np.array(residuals), np.array(lambda_range))
         else:
@@ -689,10 +913,6 @@ class MaxEntropyDRT(DRTCore):
             gamma = result.x
             lambda_opt = lam
         
-        # Normalize
-        pass
-        
-        # Estimate uncertainty
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
         
         return DRTResult(
@@ -714,7 +934,7 @@ class MaxEntropyDRT(DRTCore):
 
 
 # ============================================================================
-# Finite Gaussian Process DRT (fGP-DRT)
+# Finite Gaussian Process DRT (fGP-DRT) (from EIS code)
 # ============================================================================
 
 class FiniteGaussianProcessDRT(DRTCore):
@@ -734,14 +954,12 @@ class FiniteGaussianProcessDRT(DRTCore):
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         log_tau_grid = np.log10(tau_grid)
         
-        # Create basis from RBF functions
         basis_centers = np.linspace(log_tau_grid[0], log_tau_grid[-1], n_components)
         length_scale = (log_tau_grid[-1] - log_tau_grid[0]) / n_components
         
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         K_full = np.vstack([K_real, K_imag])
         
-        # Build feature matrix
         Phi = np.zeros((self.N * 2, n_components))
         for i, center in enumerate(basis_centers):
             phi = np.exp(-0.5 * ((log_tau_grid - center) / length_scale)**2)
@@ -750,30 +968,21 @@ class FiniteGaussianProcessDRT(DRTCore):
         
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         
-        # Bayesian linear regression with non-negativity constraints
-        # Using truncated normal prior
-        from scipy.stats import truncnorm
-        
-        # Initialize with ridge regression
         lam = 1e-4
         A = Phi.T @ Phi + lam * np.eye(n_components)
         b = Phi.T @ Z_target
         weights_init = np.linalg.solve(A, b)
         weights_init = np.maximum(weights_init, 0)
         
-        # Sample posterior using MCMC with non-negativity constraints
         if PYMC_AVAILABLE:
             with pm.Model() as model:
-                # Prior for weights (truncated normal)
                 weights = pm.TruncatedNormal('weights', mu=weights_init, sigma=1.0, 
                                              lower=0, shape=n_components)
                 
-                # Likelihood
                 sigma = pm.HalfCauchy('sigma', beta=0.1)
                 Z_pred = pm.math.dot(Phi, weights)
                 likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
                 
-                # Sample
                 trace = pm.sample(draws=n_samples, tune=n_samples//2, 
                                  chains=2, progressbar=False)
                 
@@ -781,11 +990,9 @@ class FiniteGaussianProcessDRT(DRTCore):
                 weights_mean = np.mean(weights_samples, axis=0)
                 weights_std = np.std(weights_samples, axis=0)
         else:
-            # Fallback: use optimization with uncertainty estimation
             weights_mean = weights_init
             weights_std = np.ones_like(weights_init) * 0.1
         
-        # Reconstruct DRT
         gamma = np.zeros(n_tau)
         gamma_std = np.zeros(n_tau)
         for i, center in enumerate(basis_centers):
@@ -793,9 +1000,6 @@ class FiniteGaussianProcessDRT(DRTCore):
             phi = phi / np.sum(phi)
             gamma += weights_mean[i] * phi
             gamma_std += weights_std[i] * phi
-        
-        # Normalize
-        pass
         
         return DRTResult(
             tau_grid=tau_grid,
@@ -816,7 +1020,7 @@ class FiniteGaussianProcessDRT(DRTCore):
 
 
 # ============================================================================
-# Loewner Framework (RLF) - Data-Driven DRT
+# Loewner Framework (RLF) - Data-Driven DRT (from EIS code)
 # ============================================================================
 
 class LoewnerFrameworkDRT(DRTCore):
@@ -828,7 +1032,6 @@ class LoewnerFrameworkDRT(DRTCore):
     def _build_loewner_matrices(self, omega: np.ndarray, Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Build Loewner and shifted Loewner matrices"""
         n = len(omega)
-        # Split into left and right datasets
         n_left = n // 2
         n_right = n - n_left
         
@@ -837,7 +1040,6 @@ class LoewnerFrameworkDRT(DRTCore):
         left_Z = Z[:n_left]
         right_Z = Z[n_left:]
         
-        # Loewner matrix
         L = np.zeros((n_left, n_right), dtype=complex)
         Ls = np.zeros((n_left, n_right), dtype=complex)
         
@@ -856,11 +1058,9 @@ class LoewnerFrameworkDRT(DRTCore):
         if n < 3:
             return n // 2
         
-        # Find the knee point
         diffs = np.diff(singular_values)
         diffs2 = np.diff(diffs)
         
-        # Look for the largest change in curvature
         if len(diffs2) > 0:
             knee_idx = np.argmax(np.abs(diffs2)) + 1
             return min(knee_idx + 1, n)
@@ -873,68 +1073,50 @@ class LoewnerFrameworkDRT(DRTCore):
         omega = 2 * np.pi * self.frequencies
         Z = self.Z
         
-        # Build Loewner matrices
         L, Ls, left_Z, right_Z = self._build_loewner_matrices(omega, Z)
         
-        # Compute SVD for model order reduction
         U, S, Vh = np.linalg.svd(L, full_matrices=False)
         
-        # Determine optimal model order
         if model_order is None:
             model_order = self._scree_not_threshold(S)
         
         model_order = max(1, min(model_order, len(S) - 1))
         
-        # Truncate
         U_r = U[:, :model_order]
         S_r = np.diag(S[:model_order])
         V_r = Vh[:model_order, :]
         
-        # Compute reduced matrices
         E_r = -U_r.conj().T @ L @ V_r.conj().T
         A_r = -U_r.conj().T @ Ls @ V_r.conj().T
         B_r = U_r.conj().T @ left_Z
         C_r = right_Z @ V_r.conj().T
         
-        # Extract poles and residues
         try:
-            # Solve generalized eigenvalue problem
             eigvals, eigvecs = linalg.eig(A_r, E_r)
             
-            # Time constants
             tau_loewner = -1.0 / eigvals
-            # Keep only positive real time constants
             valid = (np.real(tau_loewner) > 0) & (np.imag(tau_loewner) < 1e-6)
             tau_loewner = np.real(tau_loewner[valid])
             
-            # Calculate residues (resistances)
             R_loewner = np.zeros(len(tau_loewner))
             for i in range(len(tau_loewner)):
-                # Simplified residue calculation
                 R_loewner[i] = np.abs(C_r @ eigvecs[:, i] * (eigvecs[:, i].conj().T @ B_r))
         except:
-            # Fallback: use regularized solution
             tau_loewner = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
             R_loewner = np.ones(n_tau) / n_tau
         
-        # Interpolate to uniform tau grid
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         gamma = np.zeros(n_tau)
         
-        # Sort and interpolate
         if len(tau_loewner) > 1:
             idx_sorted = np.argsort(tau_loewner)
             tau_sorted = tau_loewner[idx_sorted]
             R_sorted = R_loewner[idx_sorted]
             
-            # Interpolate
             interp_func = interpolate.interp1d(np.log10(tau_sorted), R_sorted, 
                                                kind='linear', fill_value=0, bounds_error=False)
             gamma = interp_func(np.log10(tau_grid))
             gamma = np.maximum(gamma, 0)
-        
-        # Normalize
-        pass
         
         return DRTResult(
             tau_grid=tau_grid,
@@ -955,7 +1137,7 @@ class LoewnerFrameworkDRT(DRTCore):
 
 
 # ============================================================================
-# Peak Detection and Analysis
+# Peak Detection and Analysis (from EIS code)
 # ============================================================================
 
 def find_peaks_drt(tau_grid: np.ndarray, gamma: np.ndarray, prominence: float = 0.05) -> List[Dict[str, Any]]:
@@ -1019,7 +1201,6 @@ def fit_gaussian_peaks(tau_grid: np.ndarray, gamma: np.ndarray, n_peaks: Optiona
             result += amp * np.exp(-((log_tau - center)**2) / (2 * sigma**2))
         return result
     
-    # Initial parameters
     initial_params = []
     peaks = find_peaks_drt(tau_grid, gamma)
     for i, peak in enumerate(peaks[:n_peaks]):
@@ -1044,7 +1225,848 @@ def fit_gaussian_peaks(tau_grid: np.ndarray, gamma: np.ndarray, n_peaks: Optiona
 
 
 # ============================================================================
-# Visualization Functions (Matplotlib - Publication Quality)
+# Gaussian Model for Deconvolution (from second code)
+# ============================================================================
+
+class GaussianModelDeconv:
+    """Model for sum of Gaussians with baseline correction"""
+    
+    @staticmethod
+    def gaussian(x, amp, cen, sigma):
+        """Gaussian function with safe sigma"""
+        return amp * np.exp(-(x - cen)**2 / (2 * max(sigma, np.finfo(float).eps)**2))
+    
+    @staticmethod
+    def multi_gaussian(x, *params):
+        """Sum of multiple Gaussians"""
+        n = len(params) // 3
+        y = np.zeros_like(x, dtype=float)
+        for i in range(n):
+            amp = params[3*i]
+            cen = params[3*i + 1]
+            sigma = abs(params[3*i + 2])
+            y += GaussianModelDeconv.gaussian(x, amp, cen, sigma)
+        return y
+    
+    @staticmethod
+    def multi_gaussian_with_baseline(x, n_peaks, peak_params, baseline_params, baseline_method):
+        """Sum of Gaussians with baseline correction"""
+        y_peaks = np.zeros_like(x, dtype=float)
+        for i in range(n_peaks):
+            amp = peak_params[3*i]
+            cen = peak_params[3*i + 1]
+            sigma = abs(peak_params[3*i + 2])
+            y_peaks += GaussianModelDeconv.gaussian(x, amp, cen, sigma)
+        
+        if baseline_method == "constant" and len(baseline_params) >= 1:
+            y_baseline = baseline_params[0]
+        elif baseline_method == "linear" and len(baseline_params) >= 2:
+            y_baseline = baseline_params[0] + baseline_params[1] * x
+        elif baseline_method == "quadratic" and len(baseline_params) >= 3:
+            y_baseline = baseline_params[0] + baseline_params[1] * x + baseline_params[2] * x**2
+        else:
+            y_baseline = 0
+        
+        return y_peaks + y_baseline
+    
+    @staticmethod
+    def calculate_area(amp, sigma):
+        """Area under Gaussian"""
+        return amp * sigma * np.sqrt(2 * np.pi)
+    
+    @staticmethod
+    def calculate_fwhm(sigma):
+        """Full width at half maximum"""
+        return 2 * np.sqrt(2 * np.log(2)) * sigma
+
+
+# ============================================================================
+# Fit Quality Analyzer (from second code)
+# ============================================================================
+
+class FitQualityAnalyzer:
+    """Fit quality analysis"""
+    
+    @staticmethod
+    def calculate_metrics(y_true, y_pred, n_params):
+        """Calculate quality metrics"""
+        residuals = y_true - y_pred
+        n = len(y_true)
+        
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((y_true - np.mean(y_true))**2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        
+        rss = ss_res
+        aic = n * np.log(rss/n) + 2 * n_params if rss > 0 else -np.inf
+        bic = n * np.log(rss/n) + n_params * np.log(n) if rss > 0 else -np.inf
+        
+        chi_squared = rss / (n - n_params) if n > n_params else np.inf
+        max_error = np.max(np.abs(residuals))
+        rmse = np.sqrt(np.mean(residuals**2))
+        
+        return {
+            'R²': r_squared,
+            'AIC': aic,
+            'BIC': bic,
+            'χ²': chi_squared,
+            'Max Error': max_error,
+            'RMSE': rmse,
+            'Residuals': residuals
+        }
+
+
+# ============================================================================
+# Gaussian Fitter (from second code)
+# ============================================================================
+
+class GaussianFitter:
+    """Handles Gaussian fitting with multiple optimization methods and baseline"""
+    
+    def __init__(self, method='trf', max_nfev=5000, baseline_method='none', 
+                 fit_quality='balanced', last_popt=None):
+        self.method = method
+        self.max_nfev = max_nfev
+        self.baseline_method = baseline_method
+        self.fit_quality = fit_quality
+        self.last_popt = last_popt
+        self.convergence_history = []
+        self.fit_progress = 0
+        
+        if fit_quality == 'fast':
+            self.xtol = 1e-3
+            self.ftol = 1e-3
+            self.gtol = 1e-3
+        elif fit_quality == 'balanced':
+            self.xtol = 1e-5
+            self.ftol = 1e-5
+            self.gtol = 1e-5
+        else:
+            self.xtol = 1e-8
+            self.ftol = 1e-8
+            self.gtol = 1e-8
+    
+    def get_n_baseline_params(self):
+        """Get number of baseline parameters"""
+        return {
+            'none': 0,
+            'constant': 1,
+            'linear': 2,
+            'quadratic': 3
+        }.get(self.baseline_method, 0)
+    
+    def fit(self, x, y_norm, initial_peak_params, y_max, 
+            progress_callback=None, fixed_params=None):
+        """Perform fitting with progress tracking"""
+        n_peaks = len(initial_peak_params) // 3
+        n_baseline = self.get_n_baseline_params()
+        
+        if self.last_popt is not None:
+            expected_len = n_peaks * 3 + n_baseline
+            if len(self.last_popt) == expected_len:
+                initial_params = self.last_popt.copy()
+                if progress_callback:
+                    progress_callback(0.1, "Using cached parameters...")
+            else:
+                initial_params = np.array(initial_peak_params)
+                if n_baseline > 0:
+                    if self.baseline_method == 'constant':
+                        baseline_init = [np.percentile(y_norm, 5)]
+                    elif self.baseline_method == 'linear':
+                        baseline_init = [np.percentile(y_norm, 5), 0]
+                    else:
+                        baseline_init = [np.percentile(y_norm, 5), 0, 0]
+                    initial_params = np.concatenate([initial_params, baseline_init])
+        else:
+            initial_params = np.array(initial_peak_params)
+            if n_baseline > 0:
+                if self.baseline_method == 'constant':
+                    baseline_init = [np.percentile(y_norm, 5)]
+                elif self.baseline_method == 'linear':
+                    baseline_init = [np.percentile(y_norm, 5), 0]
+                else:
+                    baseline_init = [np.percentile(y_norm, 5), 0, 0]
+                initial_params = np.concatenate([initial_params, baseline_init])
+        
+        if len(initial_params) == 0:
+            return False, None, None, None
+        
+        lower_bounds, upper_bounds = self._create_bounds(x, y_norm, n_peaks, n_baseline)
+        
+        for i in range(len(initial_params)):
+            initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
+        
+        try:
+            if progress_callback:
+                progress_callback(0.3, "Initializing fit...")
+            
+            def model_func(x, *params):
+                return GaussianModelDeconv.multi_gaussian_with_baseline_flat(
+                    x, *params, n_peaks=n_peaks, baseline_method=self.baseline_method
+                )
+            
+            popt, pcov = curve_fit(
+                model_func,
+                x,
+                y_norm,
+                p0=initial_params,
+                bounds=(lower_bounds, upper_bounds),
+                method=self.method,
+                maxfev=self.max_nfev,
+                xtol=self.xtol,
+                ftol=self.ftol,
+                gtol=self.gtol
+            )
+            
+            if progress_callback:
+                progress_callback(0.8, "Calculating components...")
+            
+            fit_y_norm = model_func(x, *popt)
+            
+            peak_params = popt[:n_peaks*3]
+            baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
+            
+            components = []
+            for i in range(n_peaks):
+                amp_norm = peak_params[3*i]
+                cen = peak_params[3*i + 1]
+                sigma = abs(peak_params[3*i + 2])
+                
+                amp = amp_norm * y_max
+                area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * y_max
+                
+                component_y_norm = GaussianModelDeconv.gaussian(x, amp_norm, cen, sigma)
+                
+                cen_linear = 10**cen if np.any(x < 0) else cen
+                
+                components.append({
+                    'id': i + 1,
+                    'amp_norm': amp_norm,
+                    'amp': amp,
+                    'cen_log': cen,
+                    'cen_linear': cen_linear,
+                    'sigma_log': sigma,
+                    'fwhm': GaussianModelDeconv.calculate_fwhm(sigma),
+                    'area': area,
+                    'fraction': 0,
+                    'y_norm': component_y_norm,
+                    'source': 'auto'
+                })
+            
+            total_area = sum([c['area'] for c in components])
+            for c in components:
+                c['fraction'] = c['area'] / total_area if total_area > 0 else 0
+                c['fraction_percent'] = c['fraction'] * 100
+            
+            if progress_callback:
+                progress_callback(1.0, "Fit complete!")
+            
+            return True, popt, components, baseline_params
+            
+        except Exception as e:
+            if progress_callback:
+                progress_callback(1.0, f"Fit failed: {e}")
+            return False, None, None, None
+    
+    def _create_bounds(self, x, y_norm, n_peaks, n_baseline):
+        """Create bounds for fitting"""
+        lower_bounds = []
+        upper_bounds = []
+        x_range = np.max(x) - np.min(x)
+        
+        for i in range(n_peaks):
+            lower_bounds.extend([0, np.min(x), x_range * 0.001])
+            upper_bounds.extend([2 * np.max(y_norm), np.max(x), x_range * 0.5])
+        
+        if n_baseline >= 1:
+            lower_bounds.append(-np.max(y_norm))
+            upper_bounds.append(np.max(y_norm))
+        if n_baseline >= 2:
+            lower_bounds.append(-x_range)
+            upper_bounds.append(x_range)
+        if n_baseline >= 3:
+            lower_bounds.append(-x_range**2)
+            upper_bounds.append(x_range**2)
+        
+        return lower_bounds, upper_bounds
+    
+    def preview_fit(self, x, peak_params, y_max, baseline_params=None):
+        """Preview fit without optimization (fast)"""
+        n_peaks = len(peak_params) // 3
+        n_baseline = self.get_n_baseline_params()
+        
+        if baseline_params is None and n_baseline > 0:
+            if self.baseline_method == 'constant':
+                baseline_params = [0]
+            elif self.baseline_method == 'linear':
+                baseline_params = [0, 0]
+            else:
+                baseline_params = [0, 0, 0]
+        
+        fit_y_norm = GaussianModelDeconv.multi_gaussian_with_baseline(
+            x, n_peaks, peak_params, baseline_params or [], self.baseline_method
+        )
+        
+        return fit_y_norm
+
+
+# Add flat version for curve_fit compatibility
+def multi_gaussian_with_baseline_flat(x, *params, n_peaks, baseline_method):
+    """Flat version for curve_fit"""
+    if baseline_method == "none":
+        return GaussianModelDeconv.multi_gaussian(x, *params)
+    
+    n_baseline_params = {
+        'none': 0,
+        'constant': 1,
+        'linear': 2,
+        'quadratic': 3
+    }.get(baseline_method, 0)
+    
+    peak_params = params[:n_peaks*3]
+    baseline_params = params[n_peaks*3:] if n_baseline_params > 0 else []
+    
+    return GaussianModelDeconv.multi_gaussian_with_baseline(
+        x, n_peaks, peak_params, baseline_params, baseline_method
+    )
+
+GaussianModelDeconv.multi_gaussian_with_baseline_flat = multi_gaussian_with_baseline_flat
+
+
+# ============================================================================
+# Derivative Analyzer (from second code)
+# ============================================================================
+
+class DerivativeAnalyzer:
+    """Analysis of first and second derivatives for peak detection"""
+    
+    @staticmethod
+    def calculate_derivatives(x, y, window_length=11, polyorder=3):
+        """Calculate smoothed derivatives with fallback for small datasets"""
+        if len(x) < window_length:
+            window_length = len(x) if len(x) % 2 == 1 else len(x) - 1
+        
+        if window_length < polyorder + 2:
+            dy = np.gradient(y, x)
+            d2y = np.gradient(dy, x)
+            return dy, d2y, y
+        
+        try:
+            y_smooth = savgol_filter(y, window_length, polyorder)
+            dy = savgol_filter(y, window_length, polyorder, deriv=1, delta=np.mean(np.diff(x)))
+            d2y = savgol_filter(y, window_length, polyorder, deriv=2, delta=np.mean(np.diff(x)))
+        except Exception as e:
+            warnings.warn(f"Savitzky-Golay failed, using simple gradient: {e}")
+            y_smooth = y
+            dy = np.gradient(y, x)
+            d2y = np.gradient(dy, x)
+        
+        return dy, d2y, y_smooth
+    
+    @staticmethod
+    def find_peaks_by_derivatives(x, y, dy, d2y, threshold=0.01):
+        """Find peaks by zero crossing of first derivative and negative second derivative"""
+        peaks = []
+        for i in range(1, len(x) - 1):
+            if (dy[i-1] > 0 and dy[i] <= 0) or (dy[i-1] >= 0 and dy[i] < 0):
+                if d2y[i] < 0:
+                    if y[i] > threshold * np.max(y):
+                        peaks.append(i)
+        return peaks
+
+
+# ============================================================================
+# Data Preprocessor (from second code)
+# ============================================================================
+
+class DataPreprocessor:
+    """Handles data preprocessing including clipping and log transformations"""
+    
+    def __init__(self, clip_negative=True, show_warnings=True):
+        self.clip_negative = clip_negative
+        self.show_warnings = show_warnings
+        self.clipped_points = 0
+        self.small_values_warning = False
+    
+    def smooth_data(self, x, y, method='savgol', level='none', x_log=False):
+        """Smooth data with various methods and levels"""
+        if level == 'none' or len(y) < 5:
+            return y
+        
+        n_points = len(y)
+        if level == 'light':
+            window = min(5, n_points - 1 if n_points % 2 == 0 else n_points)
+        elif level == 'medium':
+            window = min(11, n_points - 1 if n_points % 2 == 0 else n_points)
+        elif level == 'strong':
+            window = min(21, n_points - 1 if n_points % 2 == 0 else n_points)
+        elif level == 'adaptive':
+            noise_estimate = np.std(np.diff(y)) / np.mean(np.abs(y)) if np.mean(np.abs(y)) > 0 else 1
+            if noise_estimate > 0.5:
+                window = min(21, n_points - 1 if n_points % 2 == 0 else n_points)
+            elif noise_estimate > 0.2:
+                window = min(11, n_points - 1 if n_points % 2 == 0 else n_points)
+            else:
+                window = min(5, n_points - 1 if n_points % 2 == 0 else n_points)
+        else:
+            return y
+        
+        if window % 2 == 0:
+            window += 1
+        
+        try:
+            if method == 'savgol':
+                polyorder = min(3, window - 1)
+                return savgol_filter(y, window, polyorder)
+            elif method == 'gaussian':
+                sigma = window / 5
+                return gaussian_filter1d(y, sigma)
+        except Exception as e:
+            if self.show_warnings:
+                warnings.warn(f"Smoothing failed: {e}")
+            return y
+
+
+# ============================================================================
+# Gaussian Deconvolver (from second code)
+# ============================================================================
+
+class GaussianDeconvolver:
+    """Main class for spectral deconvolution with baseline correction"""
+    
+    def __init__(self, x_linear, y_original, use_log_x=True, use_log_y=False,
+                 clip_negative=True, show_warnings=True, baseline_method='none',
+                 smoothing_level='none'):
+        self.x_original = np.array(x_linear).copy()
+        self.y_original_raw = np.array(y_original).copy()
+        
+        self.x_linear = np.array(x_linear)
+        self.y_original = np.array(y_original)
+        self.use_log_x = use_log_x
+        self.use_log_y = use_log_y
+        self.baseline_method = baseline_method
+        self.smoothing_level = smoothing_level
+        
+        sort_idx = np.argsort(self.x_linear)
+        self.x_linear = self.x_linear[sort_idx]
+        self.y_original = self.y_original[sort_idx]
+        
+        self.x_sorted = self.x_linear.copy()
+        self.y_sorted = self.y_original.copy()
+        
+        self.preprocessor = DataPreprocessor(clip_negative, show_warnings)
+        
+        self.x = np.log10(self.x_linear) if use_log_x else self.x_linear
+        self.y = self.y_original.copy()
+        
+        self.y_max = np.percentile(self.y_original, 95) if np.any(self.y_original > 0) else 1.0
+        
+        if self.y_max > 0:
+            self.y_norm = self.y / self.y_max
+        else:
+            self.y_norm = self.y
+        
+        self.components = []
+        self.fit_y_norm = None
+        self.popt = None
+        self.baseline_params = None
+        self.quality_metrics = {}
+        self.convergence_history = []
+        self.total_area = 0
+        self.fitter = None
+    
+    def auto_detect_peaks(self, sensitivity=0.03, min_distance=5):
+        """Automatic peak detection using derivatives"""
+        window_length = min(11, len(self.y_norm) // 5 * 2 + 1)
+        if window_length % 2 == 0:
+            window_length += 1
+        
+        if window_length >= 5:
+            y_smooth = savgol_filter(self.y_norm, window_length, 3)
+        else:
+            y_smooth = self.y_norm
+        
+        dy, d2y, y_smooth = DerivativeAnalyzer.calculate_derivatives(self.x, y_smooth)
+        
+        height_threshold = sensitivity * np.max(y_smooth)
+        peaks1, _ = find_peaks(y_smooth, height=height_threshold, distance=min_distance)
+        peaks2 = DerivativeAnalyzer.find_peaks_by_derivatives(self.x, y_smooth, dy, d2y, sensitivity)
+        
+        all_peaks = sorted(set(np.concatenate([peaks1, peaks2])))
+        
+        filtered_peaks = []
+        for peak in all_peaks:
+            if not filtered_peaks or abs(self.x[peak] - self.x[filtered_peaks[-1]]) > min_distance * np.mean(np.diff(self.x)):
+                filtered_peaks.append(peak)
+        
+        peak_info = []
+        initial_params = []
+        
+        for peak_idx in filtered_peaks:
+            cen = self.x[peak_idx]
+            amp = y_smooth[peak_idx]
+            
+            sigma = self._estimate_sigma_from_peak(self.x, y_smooth, peak_idx)
+            sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / max(len(filtered_peaks), 1))
+            
+            if self.use_log_x:
+                x_linear = 10**self.x[peak_idx]
+            else:
+                x_linear = self.x[peak_idx]
+            
+            idx = np.argmin(np.abs(self.x_sorted - x_linear))
+            y_original_value = self.y_sorted[idx]
+            
+            peak_info.append({
+                'index': peak_idx,
+                'x': self.x[peak_idx],
+                'x_linear': x_linear,
+                'y': self.y[peak_idx],
+                'y_original': y_original_value,
+                'amp_est': amp,
+                'cen_est': cen,
+                'sigma_est': sigma,
+                'dy': dy[peak_idx],
+                'd2y': d2y[peak_idx],
+                'source': 'auto'
+            })
+            
+            initial_params.extend([amp, cen, sigma])
+        
+        return filtered_peaks, peak_info, initial_params, (dy, d2y, y_smooth)
+    
+    def _estimate_sigma_from_peak(self, x, y, peak_idx):
+        """Estimate sigma with fallback methods"""
+        try:
+            widths, width_heights, left_ips, right_ips = peak_widths(
+                y, [peak_idx], rel_height=0.5
+            )
+            fwhm = widths[0] * np.mean(np.diff(x))
+            sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
+            return sigma
+        except Exception as e:
+            left_min = peak_idx
+            right_min = peak_idx
+            
+            for i in range(peak_idx - 1, 0, -1):
+                if y[i] < y[i-1] and y[i] < y[i+1]:
+                    left_min = i
+                    break
+            
+            for i in range(peak_idx + 1, len(y) - 1):
+                if y[i] < y[i-1] and y[i] < y[i+1]:
+                    right_min = i
+                    break
+            
+            width = (right_min - left_min) * np.mean(np.diff(x))
+            sigma = width / 3.0
+            return max(sigma, 0.01 * (np.max(x) - np.min(x)) / 10)
+    
+    def add_manual_peak(self, x_position_linear, amplitude=None, sigma_est=None):
+        """Add a peak manually at specified linear X position"""
+        if self.use_log_x:
+            x_position = np.log10(x_position_linear)
+        else:
+            x_position = x_position_linear
+        
+        idx = np.argmin(np.abs(self.x_sorted - x_position_linear))
+        
+        if amplitude is None:
+            if self.use_log_x:
+                log_idx = np.argmin(np.abs(self.x - x_position))
+                amplitude = self.y_norm[log_idx] if log_idx < len(self.y_norm) else 0.1
+            else:
+                amplitude = self.y_norm[idx] if idx < len(self.y_norm) else 0.1
+        
+        if sigma_est is None:
+            if self.use_log_x:
+                x_search = self.x
+                y_search = self.y_norm
+            else:
+                x_search = self.x_linear
+                y_search = self.y_original / self.y_max
+            
+            left_idx = idx
+            right_idx = idx
+            for i in range(idx - 1, 0, -1):
+                if i < len(y_search) - 1 and y_search[i] < y_search[i-1] and y_search[i] < y_search[i+1]:
+                    left_idx = i
+                    break
+            for i in range(idx + 1, len(y_search) - 1):
+                if y_search[i] < y_search[i-1] and y_search[i] < y_search[i+1]:
+                    right_idx = i
+                    break
+            
+            width = (x_search[right_idx] - x_search[left_idx]) if right_idx > left_idx else 0.1
+            sigma_est = max(width / 3.0, 0.01 * (np.max(x_search) - np.min(x_search)) / 20)
+        
+        peak_info_entry = {
+            'index': idx,
+            'x': x_position,
+            'x_linear': x_position_linear,
+            'y': amplitude,
+            'y_original': self.y_sorted[idx],
+            'amp_est': amplitude,
+            'cen_est': x_position,
+            'sigma_est': sigma_est,
+            'dy': 0,
+            'd2y': 0,
+            'source': 'manual'
+        }
+        
+        return peak_info_entry, [amplitude, x_position, sigma_est]
+    
+    def find_missing_peaks_by_residuals(self, peak_info, sensitivity=0.02, min_distance=5):
+        """Find missing peaks by analyzing residuals after initial fit"""
+        if not peak_info:
+            return [], []
+        
+        n_peaks = len(peak_info)
+        if n_peaks == 0:
+            return [], []
+        
+        peak_params = []
+        for info in peak_info:
+            peak_params.extend([info['amp_est'], info['cen_est'], info['sigma_est']])
+        
+        y_initial_fit = GaussianModelDeconv.multi_gaussian(self.x, *peak_params)
+        
+        residuals = self.y_norm - y_initial_fit
+        
+        height_threshold = sensitivity * np.max(np.abs(residuals))
+        
+        window_length = min(11, len(residuals) // 5 * 2 + 1)
+        if window_length % 2 == 0:
+            window_length += 1
+        
+        if window_length >= 5:
+            residuals_smooth = savgol_filter(residuals, window_length, 3)
+        else:
+            residuals_smooth = residuals
+        
+        positive_peaks, _ = find_peaks(residuals_smooth, height=height_threshold, distance=min_distance)
+        negative_peaks, _ = find_peaks(-residuals_smooth, height=height_threshold, distance=min_distance)
+        
+        all_candidate_indices = sorted(set(positive_peaks) | set(negative_peaks))
+        
+        missing_peaks = []
+        missing_params = []
+        
+        for idx in all_candidate_indices:
+            too_close = False
+            for info in peak_info:
+                if abs(self.x[idx] - info['cen_est']) < min_distance * np.mean(np.diff(self.x)):
+                    too_close = True
+                    break
+            
+            if too_close:
+                continue
+            
+            cen = self.x[idx]
+            amp = abs(residuals_smooth[idx])
+            sigma = self._estimate_sigma_from_peak(self.x, residuals_smooth, idx)
+            sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / 20)
+            
+            if self.use_log_x:
+                x_linear = 10**cen
+            else:
+                x_linear = cen
+            
+            orig_idx = np.argmin(np.abs(self.x_sorted - x_linear))
+            y_original_value = self.y_sorted[orig_idx]
+            
+            missing_peaks.append({
+                'index': idx,
+                'x': cen,
+                'x_linear': x_linear,
+                'y': amp,
+                'y_original': y_original_value,
+                'amp_est': amp,
+                'cen_est': cen,
+                'sigma_est': sigma,
+                'dy': 0,
+                'd2y': 0,
+                'source': 'residuals'
+            })
+            
+            missing_params.extend([amp, cen, sigma])
+        
+        return missing_peaks, missing_params
+    
+    def fit(self, initial_params=None, method='trf', maxfev=5000, 
+            fit_quality='balanced', last_popt=None, progress_callback=None):
+        """Perform fitting with selected method and baseline"""
+        if initial_params is None:
+            _, _, initial_params, _ = self.auto_detect_peaks()
+        
+        if len(initial_params) == 0:
+            return False
+        
+        self.fitter = GaussianFitter(
+            method=method, 
+            max_nfev=maxfev,
+            baseline_method=self.baseline_method,
+            fit_quality=fit_quality,
+            last_popt=last_popt
+        )
+        
+        success, popt, components, baseline_params = self.fitter.fit(
+            self.x, self.y_norm, initial_params, self.y_max,
+            progress_callback=progress_callback
+        )
+        
+        if success:
+            self.popt = popt
+            self.components = components
+            self.baseline_params = baseline_params
+            
+            n_peaks = len(components)
+            peak_params = []
+            for c in components:
+                peak_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
+            
+            self.fit_y_norm = GaussianModelDeconv.multi_gaussian_with_baseline(
+                self.x, n_peaks, peak_params, baseline_params or [], self.baseline_method
+            )
+            
+            self.total_area = sum([c['area'] for c in self.components])
+            
+            self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
+                self.y_norm, self.fit_y_norm, len(popt)
+            )
+            
+            return True
+        
+        return False
+    
+    def preview_fit(self, initial_params=None):
+        """Preview fit without optimization (fast)"""
+        if initial_params is None:
+            _, _, initial_params, _ = self.auto_detect_peaks()
+        
+        if len(initial_params) == 0:
+            return None
+        
+        fitter = GaussianFitter(baseline_method=self.baseline_method)
+        
+        n_baseline = fitter.get_n_baseline_params()
+        baseline_params = [0] * n_baseline if n_baseline > 0 else None
+        
+        fit_y_norm = fitter.preview_fit(
+            self.x, initial_params, self.y_max, baseline_params
+        )
+        
+        return fit_y_norm
+    
+    def remove_peak(self, peak_id):
+        """Remove a peak (does NOT perform fit, just marks for removal)"""
+        if peak_id > len(self.components):
+            return False
+        
+        st.session_state.app_state.pending_remove = peak_id
+        return True
+    
+    def split_peak(self, peak_id, split_position):
+        """Split a peak into two (does NOT perform fit, just marks for splitting)"""
+        if peak_id > len(self.components):
+            return False
+        
+        st.session_state.app_state.pending_split = (peak_id, split_position)
+        return True
+    
+    def apply_pending_operations(self, fit_quality='balanced', progress_callback=None):
+        """Apply all pending operations and perform fit"""
+        if self.components:
+            current_params = []
+            for c in self.components:
+                current_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
+        else:
+            return False
+        
+        if st.session_state.app_state.pending_remove is not None:
+            remove_id = st.session_state.app_state.pending_remove
+            new_params = []
+            for i, c in enumerate(self.components):
+                if i != remove_id - 1:
+                    new_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
+            current_params = new_params
+            st.session_state.app_state.pending_remove = None
+        
+        if st.session_state.app_state.pending_split is not None:
+            peak_id, split_position = st.session_state.app_state.pending_split
+            peak = self.components[peak_id - 1]
+            
+            new_params = []
+            for i, c in enumerate(self.components):
+                if i == peak_id - 1:
+                    amp1 = c['amp_norm'] * 0.6
+                    amp2 = c['amp_norm'] * 0.4
+                    
+                    cen1 = split_position - c['sigma_log'] * 0.3
+                    cen2 = split_position + c['sigma_log'] * 0.3
+                    
+                    cen1 = np.clip(cen1, np.min(self.x), np.max(self.x))
+                    cen2 = np.clip(cen2, np.min(self.x), np.max(self.x))
+                    
+                    sigma1 = c['sigma_log'] * 0.7
+                    sigma2 = c['sigma_log'] * 0.7
+                    
+                    new_params.extend([amp1, cen1, sigma1])
+                    new_params.extend([amp2, cen2, sigma2])
+                else:
+                    new_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
+            
+            current_params = new_params
+            st.session_state.app_state.pending_split = None
+        
+        return self.fit(
+            initial_params=current_params,
+            method=st.session_state.app_state.fitting_method,
+            maxfev=st.session_state.app_state.max_nfev,
+            fit_quality=fit_quality,
+            last_popt=st.session_state.app_state.last_popt,
+            progress_callback=progress_callback
+        )
+    
+    def create_deconvolution_result(self) -> DeconvolutionResult:
+        """Create result container from current components"""
+        peaks = []
+        for c in self.components:
+            peak = GaussianPeak(
+                id=c['id'],
+                center=c['cen_linear'],
+                center_log=c['cen_log'],
+                amplitude=c['amp'],
+                amplitude_norm=c['amp_norm'],
+                sigma_log=c['sigma_log'],
+                fwhm=c['fwhm'],
+                area=c['area'],
+                fraction=c['fraction'],
+                fraction_percent=c['fraction_percent'],
+                source=c.get('source', 'auto'),
+                y_norm=c['y_norm']
+            )
+            peaks.append(peak)
+        
+        return DeconvolutionResult(
+            peaks=peaks,
+            fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
+            x=self.x,
+            y_norm=self.y_norm,
+            y_original=self.y_original,
+            x_linear=self.x_linear,
+            use_log_x=self.use_log_x,
+            use_log_y=self.use_log_y,
+            quality_metrics=self.quality_metrics,
+            baseline_params=self.baseline_params,
+            baseline_method=self.baseline_method,
+            total_area=self.total_area,
+            max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
+        )
+
+
+# ============================================================================
+# Visualization Functions (from both codes)
 # ============================================================================
 
 def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
@@ -1065,25 +2087,24 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
         ax.plot(re_rec, im_rec, 's-', markersize=3, linewidth=1.0,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')  # Убрал LaTeX
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')  # Убрал LaTeX
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
     ax.set_title(title, fontweight='bold')
     ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--')
     
-    # Equal aspect ratio
     x_range = ax.get_xlim()
     y_range = ax.get_ylim()
     ax.set_aspect('equal', adjustable='box')
     
     return fig
 
+
 def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
                          im_rec: Optional[np.ndarray] = None) -> plt.Figure:
     """Create publication-quality Bode plot"""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 7))
     
-    # Magnitude plot
     mag = data.Z_mod
     ax1.loglog(data.freq, mag, 'o-', markersize=4, linewidth=1.5, 
                label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
@@ -1092,11 +2113,10 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax1.loglog(data.freq, mag_rec, 's-', markersize=3, linewidth=1.0,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax1.set_ylabel("|Z| / Ohm", fontweight='bold')  # Убрал LaTeX
+    ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3, linestyle='--')
     
-    # Phase plot
     phase = data.phase
     ax2.semilogx(data.freq, phase, 'o-', markersize=4, linewidth=1.5,
                  label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.5)
@@ -1105,7 +2125,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax2.semilogx(data.freq, phase_rec, 's-', markersize=3, linewidth=1.0,
                      label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel("Phase / deg", fontweight='bold')  # Убрал символ градуса
+    ax2.set_ylabel("Phase / deg", fontweight='bold')
     ax2.legend(loc='best')
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
@@ -1115,29 +2135,23 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     
     return fig
 
+
 def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None,
                        title: str = "Distribution of Relaxation Times") -> plt.Figure:
     """Create publication-quality DRT plot with both tau and frequency axes"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
-    # ========================================================================
-    # Left plot: γ(τ) vs τ (log scale)
-    # ========================================================================
-    
-    # Plot DRT with uncertainty if available
     if result.gamma_std is not None:
         ax1.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
                         result.gamma + 2*result.gamma_std,
                         alpha=0.3, color='gray', label='±2σ uncertainty')
     ax1.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
     
-    # Plot peaks on left plot
     if peaks and len(peaks) > 0:
         peak_tau = [p['tau'] for p in peaks]
         peak_drt = [p['amplitude'] for p in peaks]
         ax1.plot(peak_tau, peak_drt, 'rv', markersize=8, label='Detected peaks')
         
-        # Add peak labels for left plot
         for i, (t, d) in enumerate(zip(peak_tau, peak_drt)):
             freq = 1/(2*np.pi*t)
             ax1.annotate(f'τ={t:.2e}s\nf={freq:.2e}Hz',
@@ -1151,19 +2165,11 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     ax1.legend(loc='best', frameon=True)
     ax1.grid(True, alpha=0.3, linestyle='--', which='both')
     
-    # ========================================================================
-    # Right plot: γ(τ) vs Frequency (Hz) - high to low frequency
-    # ========================================================================
-    
-    # Convert tau to frequency: f = 1/(2πτ)
     frequencies = 1 / (2 * np.pi * result.tau_grid)
-    
-    # Sort frequencies in descending order (high to low)
-    sort_idx = np.argsort(frequencies)[::-1]  # Descending order
+    sort_idx = np.argsort(frequencies)[::-1]
     freqs_sorted = frequencies[sort_idx]
     gamma_sorted = result.gamma[sort_idx]
     
-    # Plot DRT vs frequency
     if result.gamma_std is not None:
         gamma_std_sorted = result.gamma_std[sort_idx]
         ax2.fill_between(freqs_sorted, gamma_sorted - 2*gamma_std_sorted, 
@@ -1171,17 +2177,14 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
                         alpha=0.3, color='gray', label='±2σ uncertainty')
     ax2.semilogx(freqs_sorted, gamma_sorted, '-', linewidth=2, color='#2ca02c', label='DRT')
     
-    # Plot peaks on frequency plot
     if peaks and len(peaks) > 0:
         peak_freqs = [p['frequency'] for p in peaks]
         peak_amplitudes = [p['amplitude'] for p in peaks]
-        # Sort peaks by frequency (descending)
         peak_pairs = sorted(zip(peak_freqs, peak_amplitudes), key=lambda x: x[0], reverse=True)
         peak_freqs_sorted, peak_amplitudes_sorted = zip(*peak_pairs) if peak_pairs else ([], [])
         
         ax2.plot(peak_freqs_sorted, peak_amplitudes_sorted, 'rv', markersize=8, label='Detected peaks')
         
-        # Add peak labels for right plot
         for i, (f, d) in enumerate(zip(peak_freqs_sorted, peak_amplitudes_sorted)):
             tau_val = 1/(2*np.pi*f)
             ax2.annotate(f'f={f:.2e}Hz\nτ={tau_val:.2e}s',
@@ -1194,255 +2197,158 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     ax2.set_title(r"$\gamma(\tau)$ vs Frequency (High → Low)", fontweight='bold')
     ax2.legend(loc='best', frameon=True)
     ax2.grid(True, alpha=0.3, linestyle='--', which='both')
-    
-    # Ensure x-axis is log scale and shows from high to low
     ax2.set_xscale('log')
-    # Invert x-axis to show high frequency on left, low on right
     ax2.invert_xaxis()
-    
-    # Set x-axis limits to match data range
     ax2.set_xlim(freqs_sorted[0], freqs_sorted[-1])
-    
-    # Add minor ticks for better readability
     ax2.xaxis.set_minor_locator(AutoMinorLocator())
     
-    # Main title
     fig.suptitle(title, fontweight='bold', fontsize=14)
     plt.tight_layout()
     
     return fig
 
 
-def plot_kk_residuals_matplotlib(freq: np.ndarray, res_real: np.ndarray, res_imag: np.ndarray) -> plt.Figure:
-    """Create publication-quality KK residuals plot"""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5))
+def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_components: bool = True,
+                              show_baseline: bool = True, title: str = "Gaussian Deconvolution Result",
+                              preview_mode: bool = False, preview_fit: Optional[np.ndarray] = None) -> plt.Figure:
+    """Plot deconvolution result with components and baseline"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
-    ax1.semilogx(freq, res_real * 100, 'o-', markersize=4, linewidth=1.0, color='#1f77b4')
-    ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax1.set_ylabel(r"$\Delta$ Re(Z) / %", fontweight='bold')
-    ax1.set_title("Kramers-Kronig Test - Real Part Residuals", fontweight='bold')
+    # Left plot: Main deconvolution
+    if deconv_result.use_log_x:
+        ax1.set_xscale('log')
+    
+    ax1.scatter(deconv_result.x_linear, deconv_result.y_original, 
+                s=15, alpha=0.5, color='black', label='Data', zorder=1)
+    
+    x_dense = np.linspace(np.min(deconv_result.x_linear), np.max(deconv_result.x_linear), 2000)
+    if deconv_result.use_log_x:
+        x_dense_log = np.log10(x_dense)
+    else:
+        x_dense_log = x_dense
+    
+    if show_components and deconv_result.peaks:
+        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        for peak, color in zip(deconv_result.peaks, colors):
+            y_component = GaussianModelDeconv.gaussian(x_dense_log, peak.amplitude_norm, 
+                                                       peak.center_log, peak.sigma_log) * deconv_result.y_original.max()
+            ax1.fill_between(x_dense, 0, y_component, color=color, alpha=0.3, linewidth=0)
+            ax1.plot(x_dense, y_component, '-', color=color, linewidth=2,
+                    label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
+    
+    if show_baseline and deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+        if deconv_result.baseline_method == 'constant':
+            y_baseline = deconv_result.baseline_params[0] * deconv_result.y_original.max()
+            ax1.axhline(y=y_baseline, color='gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+        elif deconv_result.baseline_method == 'linear':
+            y_baseline = (deconv_result.baseline_params[0] + 
+                         deconv_result.baseline_params[1] * x_dense_log) * deconv_result.y_original.max()
+            ax1.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+        elif deconv_result.baseline_method == 'quadratic':
+            y_baseline = (deconv_result.baseline_params[0] + 
+                         deconv_result.baseline_params[1] * x_dense_log +
+                         deconv_result.baseline_params[2] * x_dense_log**2) * deconv_result.y_original.max()
+            ax1.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+    
+    if preview_mode and preview_fit is not None:
+        y_total = preview_fit * deconv_result.y_original.max()
+        ax1.plot(x_dense, y_total, 'b--', linewidth=2, label='Preview (no fit)', zorder=3, alpha=0.7)
+    elif deconv_result.fit_y_norm is not None:
+        n_peaks = len(deconv_result.peaks)
+        peak_params = []
+        for peak in deconv_result.peaks:
+            peak_params.extend([peak.amplitude_norm, peak.center_log, peak.sigma_log])
+        
+        y_total = GaussianModelDeconv.multi_gaussian_with_baseline(
+            x_dense_log, n_peaks, peak_params, 
+            deconv_result.baseline_params or [], deconv_result.baseline_method
+        ) * deconv_result.y_original.max()
+        
+        ax1.plot(x_dense, y_total, 'r--', linewidth=2, label='Total Fit', zorder=3)
+    
+    ax1.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold')
+    ax1.set_ylabel('Intensity', fontweight='bold')
+    ax1.set_title(title, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=9, frameon=True, edgecolor='black')
     ax1.grid(True, alpha=0.3, linestyle='--')
-    ax1.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
-    ax1.axhline(y=2, color='r', linestyle='--', linewidth=0.5, alpha=0.5)
-    ax1.axhline(y=-2, color='r', linestyle='--', linewidth=0.5, alpha=0.5)
     
-    ax2.semilogx(freq, res_imag * 100, 'o-', markersize=4, linewidth=1.0, color='#1f77b4')
-    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel(r"$\Delta$ Im(Z) / %", fontweight='bold')
-    ax2.set_title("Kramers-Kronig Test - Imaginary Part Residuals", fontweight='bold')
-    ax2.grid(True, alpha=0.3, linestyle='--')
-    ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
-    ax2.axhline(y=2, color='r', linestyle='--', linewidth=0.5, alpha=0.5)
-    ax2.axhline(y=-2, color='r', linestyle='--', linewidth=0.5, alpha=0.5)
+    # Right plot: Area distribution
+    if deconv_result.peaks:
+        peaks_ids = [f'Peak {p.id}' for p in deconv_result.peaks]
+        fractions = [p.fraction_percent for p in deconv_result.peaks]
+        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        
+        bars = ax2.bar(peaks_ids, fractions, color=colors, edgecolor='black', alpha=0.7)
+        ax2.set_xlabel('Peak', fontweight='bold')
+        ax2.set_ylabel('Fraction (%)', fontweight='bold')
+        ax2.set_title('Peak Area Distribution', fontweight='bold')
+        ax2.set_ylim(0, max(fractions) * 1.2 if fractions else 100)
+        ax2.grid(True, alpha=0.3, axis='y')
+        
+        for bar, frac in zip(bars, fractions):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{frac:.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        ax2.tick_params(axis='x', rotation=45)
+    
+    # Add quality metrics text
+    if deconv_result.quality_metrics and not preview_mode:
+        metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
+        metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
+        ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes,
+                fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
     
     plt.tight_layout()
-    
     return fig
 
 
-# ============================================================================
-# Plotly Interactive Visualization
-# ============================================================================
-
-def plot_impedance_plotly(data: ImpedanceData, re_rec: Optional[np.ndarray] = None,
-                         im_rec: Optional[np.ndarray] = None) -> go.Figure:
-    """Create interactive impedance plots with Plotly"""
-    fig = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=('Nyquist Plot', 'Bode Plot - Magnitude'),
-        specs=[[{'type': 'scatter'}, {'type': 'scatter'}]]
-    )
+def plot_deconvolution_components_comparison(deconv_result: DeconvolutionResult) -> plt.Figure:
+    """Plot normalized components comparison"""
+    fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Nyquist plot
-    fig.add_trace(
-        go.Scatter(x=data.re_z, y=-data.im_z, mode='markers',
-                   name='Experimental', marker=dict(size=6, color='blue')),
-        row=1, col=1
-    )
+    if deconv_result.use_log_x:
+        ax.set_xscale('log')
     
-    if re_rec is not None and im_rec is not None:
-        fig.add_trace(
-            go.Scatter(x=re_rec, y=-im_rec, mode='lines',
-                       name='Reconstructed', line=dict(color='red', width=2)),
-            row=1, col=1
-        )
-    
-    fig.update_xaxes(title_text="Z' (Ω)", row=1, col=1)
-    fig.update_yaxes(title_text="-Z'' (Ω)", row=1, col=1)
-    
-    # Bode plot - Magnitude
-    Z_mod_exp = data.Z_mod
-    fig.add_trace(
-        go.Scatter(x=data.freq, y=Z_mod_exp, mode='markers',
-                   name='Experimental', marker=dict(size=6, color='blue')),
-        row=1, col=2
-    )
-    
-    if re_rec is not None and im_rec is not None:
-        Z_mod_rec = np.sqrt(re_rec**2 + im_rec**2)
-        fig.add_trace(
-            go.Scatter(x=data.freq, y=Z_mod_rec, mode='lines',
-                       name='Reconstructed', line=dict(color='red', width=2)),
-            row=1, col=2
-        )
-    
-    fig.update_xaxes(title_text="Frequency (Hz)", type="log", row=1, col=2)
-    fig.update_yaxes(title_text="|Z| (Ω)", type="log", row=1, col=2)
-    
-    fig.update_layout(height=500, showlegend=True)
-    
-    return fig
-
-
-def plot_drt_plotly(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None) -> go.Figure:
-    """Create interactive DRT plot with Plotly"""
-    fig = go.Figure()
-    
-    # Main DRT curve
-    fig.add_trace(go.Scatter(
-        x=result.tau_grid, y=result.gamma,
-        mode='lines',
-        name='DRT',
-        line=dict(color='blue', width=2)
-    ))
-    
-    # Confidence interval
-    if result.gamma_std is not None:
-        fig.add_trace(go.Scatter(
-            x=np.concatenate([result.tau_grid, result.tau_grid[::-1]]),
-            y=np.concatenate([result.gamma + 2*result.gamma_std, 
-                             (result.gamma - 2*result.gamma_std)[::-1]]),
-            fill='toself',
-            fillcolor='rgba(0,100,200,0.2)',
-            line=dict(color='rgba(255,255,255,0)'),
-            name='95% Confidence Interval'
-        ))
-    
-    # Detected peaks
-    if peaks:
-        peak_tau = [p['tau'] for p in peaks]
-        peak_gamma = [p['amplitude'] for p in peaks]
-        fig.add_trace(go.Scatter(
-            x=peak_tau, y=peak_gamma,
-            mode='markers',
-            marker=dict(size=10, color='red', symbol='x'),
-            name='Detected Peaks'
-        ))
-        
-        # Add annotations
-        for peak in peaks:
-            fig.add_annotation(
-                x=peak['tau'], y=peak['amplitude'],
-                text=f"τ = {peak['tau']:.2e} s<br>f = {peak['frequency']:.2f} Hz",
-                showarrow=True,
-                arrowhead=2,
-                ax=20, ay=-20
-            )
-    
-    fig.update_xaxes(title_text="τ (s)", type="log")
-    fig.update_yaxes(title_text="γ(τ) (Ω)")
-    fig.update_layout(height=500, title="Distribution of Relaxation Times (DRT)")
-    
-    return fig
-
-
-# ============================================================================
-# Report Generation
-# ============================================================================
-
-def create_report(data: ImpedanceData, result: DRTResult, peaks_data: List[Dict[str, Any]],
-                 method_name: str, kk_passed: bool, max_kk_res: float) -> str:
-    """Generate analysis report"""
-    report = f"""
-    ============================================================
-    EIS-DRT Analysis Report
-    ============================================================
-    Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    
-    Analysis Method: {method_name}
-    
-    Data Information:
-    - Original points: {len(data.original_freq)}
-    - Analyzed points: {data.n_points}
-    - Removed points: {len(data.removed_indices)}
-    - Frequency range: {data.freq.min():.2e} - {data.freq.max():.2e} Hz
-    - Ohmic resistance (R∞): {result.R_inf:.4f} Ω
-    - Polarization resistance (Rpol): {result.R_pol:.4f} Ω
-    
-    DRT Parameters:
-    - Time constant range: {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
-    - Total integral: {result.get_integral():.4f} Ω
-    """
-    
-    # Add regularization info if available
-    if 'lambda' in result.metadata:
-        lambda_val = result.metadata['lambda']
-        lambda_auto = result.metadata.get('lambda_auto', False)
-        if lambda_auto:
-            report += f"    - Regularization parameter λ: {lambda_val:.3e} (automatically selected via L-curve)\n"
-        else:
-            report += f"    - Regularization parameter λ: {lambda_val:.3e} (manually specified)\n"
-    
-    if 'order' in result.metadata:
-        report += f"    - Regularization order: {result.metadata['order']}\n"
-    
-    report += f"""
-    Detected Processes:
-    """
-    
-    if peaks_data and len(peaks_data) > 0:
-        for i, peak in enumerate(peaks_data):
-            report += f"""
-    Process {i+1}:
-        - Relaxation time τ: {peak['tau']:.2e} s
-        - Frequency f: {peak['frequency']:.2e} Hz
-        - Amplitude: {peak['amplitude']:.4f} Ω
-    """
+    x_dense = np.linspace(np.min(deconv_result.x_linear), np.max(deconv_result.x_linear), 2000)
+    if deconv_result.use_log_x:
+        x_dense_log = np.log10(x_dense)
     else:
-        report += "    No peaks detected\n"
+        x_dense_log = x_dense
     
-    report += f"""
-    Quality Metrics:
-    - KK test passed: {kk_passed}
-    - Max KK residual: {max_kk_res*100:.3f}%
-    
-    ============================================================
-    """
-    
-    return report
-
-
-# ============================================================================
-# Main Application
-# ============================================================================
-
-def initialize_session_state():
-    """Initialize session state variables"""
-    if 'data' not in st.session_state:
-        st.session_state.data = None
-    if 'data_loaded' not in st.session_state:
-        st.session_state.data_loaded = False
-    if 'preview_plots' not in st.session_state:
-        st.session_state.preview_plots = False
-    if 'selected_point' not in st.session_state:
-        st.session_state.selected_point = None
-
-
-def main():
-    initialize_session_state()
-    
-    st.title("⚡ Electrochemical Impedance Spectroscopy Analysis")
-    st.markdown("### Distribution of Relaxation Times (DRT) Analysis Tool v3.0")
-    st.markdown("Поддерживаются 6 методов инверсии: Tikhonov (NNLS), Bayesian MCMC, Maximum Entropy (auto-λ), "
-                "fGP-DRT, Loewner Framework (RLF), Generalized DRT (с индуктивностями)")
-    st.markdown("---")
-    
-    # Sidebar for input controls
-    with st.sidebar:
-        st.header("📁 Data Input")
+    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    for peak, color in zip(deconv_result.peaks, colors):
+        y_component = GaussianModelDeconv.gaussian(x_dense_log, peak.amplitude_norm, 
+                                                   peak.center_log, peak.sigma_log)
+        y_component_norm = y_component / max(peak.amplitude_norm, 1e-10)
         
-        # Data input method selection
-        input_method = st.radio("Select input method:", ["Upload File", "Manual Entry"])
+        ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
+               label=f'Peak {peak.id} (center: {peak.center:.3e})')
+        ax.axvline(x=peak.center, color=color, linestyle=':', alpha=0.5, linewidth=1)
+    
+    ax.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold')
+    ax.set_ylabel('Normalized Intensity', fontweight='bold')
+    ax.set_title('Normalized Components Comparison', fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9, frameon=True, edgecolor='black')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    return fig
+
+
+# ============================================================================
+# Step 1: Data Loading and Preprocessing
+# ============================================================================
+
+def step1_data_loading():
+    """Step 1: Load and preprocess impedance data"""
+    st.header("📁 Step 1: Data Loading and Preprocessing")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        input_method = st.radio("Select input method:", ["Upload File", "Manual Entry"], horizontal=True)
         
         freq = None
         re_z = None
@@ -1458,560 +2364,924 @@ def main():
                     col_re = st.selectbox("Re(Z) column", df.columns)
                     col_im = st.selectbox("-Im(Z) column", df.columns)
                     
-                    if st.button("Load Data", key="load_file_btn"):
+                    if st.button("📥 Load Data", type="primary", use_container_width=True):
                         freq, re_z, im_z = load_data(uploaded_file, col_freq, col_re, col_im)
                         if freq is not None:
-                            st.session_state.data = ImpedanceData(freq, re_z, im_z)
-                            st.session_state.data_loaded = True
-                            st.session_state.preview_plots = True
-                            st.success(f"Loaded {len(freq)} data points")
+                            st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
+                            st.session_state.app_state.data_loaded = True
+                            st.success(f"✅ Loaded {len(freq)} data points")
                             st.rerun()
-                        else:
-                            st.error("Error loading data")
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
-        
-        else:  # Manual entry
+        else:
             freq, re_z, im_z = manual_data_entry()
             if freq is not None:
-                st.session_state.data = ImpedanceData(freq, re_z, im_z)
-                st.session_state.data_loaded = True
-                st.session_state.preview_plots = True
+                st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
+                st.session_state.app_state.data_loaded = True
+                st.success(f"✅ Loaded {len(freq)} data points")
                 st.rerun()
-        
-        # Data preprocessing controls
-        if st.session_state.data_loaded and st.session_state.data is not None:
-            st.header("✂️ Data Preprocessing")
-            
-            # Frequency range selection
-            f_min, f_max = st.slider(
-                "Frequency range (Hz)",
-                min_value=float(st.session_state.data.original_freq.min()),
-                max_value=float(st.session_state.data.original_freq.max()),
-                value=(float(st.session_state.data.original_freq.min()),
-                       float(st.session_state.data.original_freq.max())),
-                format="%.2e"
-            )
-            
-            # Point removal
-            point_idx = st.slider(
-                "Select point to remove (index)",
-                min_value=0,
-                max_value=st.session_state.data.n_points - 1,
-                value=0,
-                step=1
-            )
-            st.session_state.selected_point = point_idx
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Remove Selected Point", key="remove_point_btn"):
-                    st.session_state.data.remove_point(point_idx)
-                    st.success(f"Removed point {point_idx}")
-                    st.rerun()
-            with col2:
-                if st.button("Reset Data", key="reset_data_btn"):
-                    st.session_state.data.reset()
-                    st.success("Data reset to original")
-                    st.rerun()
-            
-            # Apply frequency range button
-            if st.button("Apply Frequency Range", key="apply_range_btn"):
-                st.session_state.data.apply_frequency_range(f_min, f_max)
-                st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
-                st.rerun()
-            
-            st.info(f"Current points: {st.session_state.data.n_points} / {len(st.session_state.data.original_freq)}")
-        
-        # Analysis parameters
-        if st.session_state.data_loaded and st.session_state.data is not None:
-            st.header("⚙️ Analysis Parameters")
-            
-            # Method selection
-            analysis_method = st.selectbox("DRT Calculation Method",
-                                          ["Tikhonov Regularization (NNLS)",
-                                           "Bayesian MCMC",
-                                           "Maximum Entropy (auto-λ)",
-                                           "Finite Gaussian Process (fGP-DRT)",
-                                           "Loewner Framework (RLF)",
-                                           "Generalized DRT (with inductive loops)"])
-            
-            n_tau = st.slider("Number of time points", 50, 300, 150)
-            
-            # Inductive loop handling
-            include_inductive = False
-            if analysis_method == "Generalized DRT (with inductive loops)":
-                include_inductive = st.checkbox("Include inductive loops", value=True)
-            
-            # Method-specific parameters
-            if analysis_method == "Tikhonov Regularization (NNLS)":
-                reg_order = st.selectbox("Regularization order", [0, 1, 2], index=2)
-                lambda_auto = st.checkbox("Automatic λ selection", value=True)
-                if not lambda_auto:
-                    lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
-                else:
-                    lambda_value = None
-            elif analysis_method == "Bayesian MCMC":
-                if not PYMC_AVAILABLE:
-                    st.warning("PyMC not installed. Bayesian MCMC will use fallback method.")
-                n_samples = st.slider("MCMC samples", 500, 5000, 2000)
-                n_tune = st.slider("Tuning samples", 500, 2000, 1000)
-            elif analysis_method == "Maximum Entropy (auto-λ)":
-                entropy_lambda_auto = st.checkbox("Auto-select λ", value=True)
-                if not entropy_lambda_auto:
-                    entropy_lambda = st.number_input("Entropy λ", value=0.1, format="%.2f")
-                else:
-                    entropy_lambda = None
-            elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
-                n_components = st.slider("GP components", 10, 50, 30)
-            elif analysis_method == "Loewner Framework (RLF)":
-                model_order = st.number_input("Model order (0=auto)", min_value=0, max_value=100, value=0)
-                if model_order == 0:
-                    model_order = None
-            
-            # Peak detection parameters
-            st.header("🔍 Peak Detection")
-            peak_prominence = st.slider("Peak prominence (%)", 1, 20, 5) / 100
-            
-            # Run analysis button
-            analyze_button = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
     
-    # Main content area - Preview plots
-    if st.session_state.data_loaded and st.session_state.data is not None and st.session_state.preview_plots:
-        st.markdown("---")
-        st.header("📊 Data Preview")
+    with col2:
+        st.subheader("📊 Data Format")
+        st.info("""
+        **Expected format:**
+        - Frequency (Hz)
+        - Re(Z) (Ω)
+        - -Im(Z) (Ω)
         
-        # Display preview plots
+        **Supported separators:**
+        - Space
+        - Comma
+        - Tab
+        """)
+    
+    if st.session_state.app_state.data_loaded and st.session_state.app_state.impedance_data:
+        st.markdown("---")
+        st.subheader("📈 Data Preview")
+        
+        data = st.session_state.app_state.impedance_data
+        
         col1, col2 = st.columns(2)
         
         with col1:
-            fig_nyquist = plot_nyquist_matplotlib(st.session_state.data, 
-                                                  highlight_idx=st.session_state.selected_point)
+            fig_nyquist = plot_nyquist_matplotlib(data)
             st.pyplot(fig_nyquist)
-            st.caption("Nyquist Plot - Red circle shows selected point")
+            plt.close()
         
         with col2:
-            fig_bode = plot_bode_matplotlib(st.session_state.data)
+            fig_bode = plot_bode_matplotlib(data)
             st.pyplot(fig_bode)
-            st.caption("Bode Plot")
+            plt.close()
         
-        # Data statistics
-        with st.expander("Data Statistics"):
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Points", st.session_state.data.n_points)
-            with col2:
-                st.metric("f_min", f"{st.session_state.data.freq.min():.2e} Hz")
-            with col3:
-                st.metric("f_max", f"{st.session_state.data.freq.max():.2e} Hz")
-            with col4:
-                st.metric("R_inf (est)", f"{st.session_state.data.re_z[-1]:.4f} Ω")
-    
-    # Main content area - Analysis results
-    if st.session_state.data_loaded and st.session_state.data is not None and 'analyze_button' in locals() and analyze_button:
         st.markdown("---")
-        st.header("📊 Analysis Results")
+        st.subheader("✂️ Data Preprocessing")
         
-        data = st.session_state.data
+        col1, col2 = st.columns(2)
         
-        # Perform KK test
-        with st.spinner("Performing Kramers-Kronig validation..."):
-            kk_passed, max_res, res_real, res_imag = kramers_kronig_hilbert_transform(
-                data.freq, data.re_z, data.im_z
+        with col1:
+            f_min, f_max = st.slider(
+                "Frequency range (Hz)",
+                min_value=float(data.original_freq.min()),
+                max_value=float(data.original_freq.max()),
+                value=(float(data.original_freq.min()), float(data.original_freq.max())),
+                format="%.2e"
             )
             
-            if kk_passed:
-                st.success(f"✓ KK test passed (max residual: {max_res*100:.2f}%)")
-            else:
-                st.warning(f"⚠ KK test failed (max residual: {max_res*100:.2f}%)")
+            if st.button("📊 Apply Frequency Range", use_container_width=True):
+                data.apply_frequency_range(f_min, f_max)
+                st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
+                st.rerun()
         
-        # Calculate DRT based on selected method
-        with st.spinner(f"Calculating DRT using {analysis_method}..."):
-            try:
-                if analysis_method == "Tikhonov Regularization (NNLS)":
-                    drt_solver = TikhonovDRT(data, regularization_order=reg_order, 
-                                             include_inductive=include_inductive)
-                    result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_value, 
-                                                lambda_auto=lambda_auto)
-                    method_key = "Tikhonov"
-                elif analysis_method == "Bayesian MCMC":
-                    drt_solver = BayesianDRT(data, include_inductive=include_inductive)
-                    if PYMC_AVAILABLE:
-                        result = drt_solver.compute(n_tau=n_tau, n_samples=n_samples, n_tune=n_tune)
-                    else:
-                        # Fallback to simpler Bayesian method
-                        result = drt_solver.compute(n_tau=n_tau, n_samples=500)
-                    method_key = "Bayesian"
-                elif analysis_method == "Maximum Entropy (auto-λ)":
-                    drt_solver = MaxEntropyDRT(data, include_inductive=include_inductive)
-                    lambda_auto_val = entropy_lambda_auto if 'entropy_lambda_auto' in locals() else True
-                    lambda_val = entropy_lambda if not lambda_auto_val and 'entropy_lambda' in locals() else None
-                    result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_val, 
-                                                lambda_auto=lambda_auto_val)
-                    method_key = "MaxEntropy"
-                elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
-                    drt_solver = FiniteGaussianProcessDRT(data, include_inductive=include_inductive)
-                    result = drt_solver.compute(n_tau=n_tau, n_components=n_components)
-                    method_key = "fGP-DRT"
-                elif analysis_method == "Loewner Framework (RLF)":
-                    drt_solver = LoewnerFrameworkDRT(data)
-                    result = drt_solver.compute(n_tau=n_tau, model_order=model_order)
-                    method_key = "Loewner"
-                else:  # Generalized DRT
-                    drt_solver = TikhonovDRT(data, regularization_order=2, include_inductive=include_inductive)
-                    result = drt_solver.compute(n_tau=n_tau, lambda_auto=True)
-                    method_key = "Generalized DRT"
-                
-                # Reconstruct impedance
-                Z_rec_real, Z_rec_imag = drt_solver.reconstruct_impedance(result.tau_grid, result.gamma)
-                
-            except Exception as e:
-                st.error(f"DRT calculation failed: {e}")
-                st.stop()
-        
-        # Find peaks
-        peaks = find_peaks_drt(result.tau_grid, result.gamma, peak_prominence)
-        
-        # Calculate resistances if peaks found
-        if peaks:
-            peaks_idx = [np.argmin(np.abs(result.tau_grid - p['tau'])) for p in peaks]
-            resistances = calculate_resistances(result.tau_grid, result.gamma, peaks_idx)
-            for i, p in enumerate(peaks):
-                p['resistance'] = resistances[i] if i < len(resistances) else 0
-                p['capacitance'] = p['tau'] / p['resistance'] if p['resistance'] > 0 else 0
-        
-        # Create tabs for results
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 DRT Spectrum", "🔄 Nyquist & Bode", 
-                                                 "📊 Interactive Plots", "🔍 KK Test", "📋 Report"])
-        
-        with tab1:
-            st.subheader("Distribution of Relaxation Times")
+        with col2:
+            point_idx = st.slider(
+                "Select point to remove (index)",
+                min_value=0,
+                max_value=data.n_points - 1,
+                value=0,
+                step=1
+            )
             
-            # Display regularization parameter if available
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("🗑️ Remove Point", use_container_width=True):
+                    data.remove_point(point_idx)
+                    st.success(f"Removed point {point_idx}")
+                    st.rerun()
+            with col_b:
+                if st.button("🔄 Reset Data", use_container_width=True):
+                    data.reset()
+                    st.success("Data reset to original")
+                    st.rerun()
+        
+        st.info(f"Current points: {data.n_points} / {len(data.original_freq)}")
+        
+        # Navigation buttons
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            if st.button("⬅️ Back", use_container_width=True):
+                st.session_state.app_state.current_step = 1
+                st.rerun()
+        with col_next:
+            if st.button("Next: DRT Analysis ➡️", type="primary", use_container_width=True):
+                st.session_state.app_state.current_step = 2
+                st.rerun()
+
+
+# ============================================================================
+# Step 2: DRT Analysis
+# ============================================================================
+
+def step2_drt_analysis():
+    """Step 2: Select DRT method and perform analysis"""
+    st.header("⚡ Step 2: DRT Analysis")
+    
+    data = st.session_state.app_state.impedance_data
+    
+    if data is None:
+        st.error("No data loaded. Please go back to Step 1.")
+        if st.button("⬅️ Back to Step 1"):
+            st.session_state.app_state.current_step = 1
+            st.rerun()
+        return
+    
+    col1, col2 = st.columns([1, 1.5])
+    
+    with col1:
+        st.subheader("⚙️ Analysis Parameters")
+        
+        analysis_method = st.selectbox(
+            "DRT Calculation Method",
+            ["Tikhonov Regularization (NNLS)",
+             "Bayesian MCMC",
+             "Maximum Entropy (auto-λ)",
+             "Finite Gaussian Process (fGP-DRT)",
+             "Loewner Framework (RLF)",
+             "Generalized DRT (with inductive loops)"]
+        )
+        
+        n_tau = st.slider("Number of time points", 50, 300, 150)
+        
+        include_inductive = False
+        if analysis_method == "Generalized DRT (with inductive loops)":
+            include_inductive = st.checkbox("Include inductive loops", value=True)
+        
+        # Method-specific parameters
+        lambda_auto = True
+        lambda_value = None
+        reg_order = 2
+        
+        if analysis_method == "Tikhonov Regularization (NNLS)":
+            reg_order = st.selectbox("Regularization order", [0, 1, 2], index=2)
+            lambda_auto = st.checkbox("Automatic λ selection", value=True)
+            if not lambda_auto:
+                lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
+        
+        elif analysis_method == "Bayesian MCMC":
+            if not PYMC_AVAILABLE:
+                st.warning("⚠️ PyMC not installed. Bayesian MCMC may not work.")
+            n_samples = st.slider("MCMC samples", 500, 5000, 2000)
+            n_tune = st.slider("Tuning samples", 500, 2000, 1000)
+            st.session_state.app_state.drt_parameters['n_samples'] = n_samples
+            st.session_state.app_state.drt_parameters['n_tune'] = n_tune
+        
+        elif analysis_method == "Maximum Entropy (auto-λ)":
+            entropy_lambda_auto = st.checkbox("Auto-select λ", value=True)
+            if not entropy_lambda_auto:
+                st.session_state.app_state.drt_parameters['entropy_lambda'] = st.number_input("Entropy λ", value=0.1, format="%.2f")
+            st.session_state.app_state.drt_parameters['lambda_auto'] = entropy_lambda_auto
+        
+        elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
+            n_components = st.slider("GP components", 10, 50, 30)
+            st.session_state.app_state.drt_parameters['n_components'] = n_components
+        
+        elif analysis_method == "Loewner Framework (RLF)":
+            model_order = st.number_input("Model order (0=auto)", min_value=0, max_value=100, value=0)
+            st.session_state.app_state.drt_parameters['model_order'] = model_order if model_order > 0 else None
+        
+        # Store parameters
+        st.session_state.app_state.drt_method = analysis_method
+        st.session_state.app_state.drt_parameters.update({
+            'n_tau': n_tau,
+            'include_inductive': include_inductive,
+            'reg_order': reg_order,
+            'lambda_auto': lambda_auto,
+            'lambda_value': lambda_value
+        })
+        
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            if st.button("⬅️ Back to Data", use_container_width=True):
+                st.session_state.app_state.current_step = 1
+                st.rerun()
+        with col_next:
+            if st.button("🚀 Run DRT Analysis", type="primary", use_container_width=True):
+                with st.spinner("Calculating DRT..."):
+                    try:
+                        if analysis_method == "Tikhonov Regularization (NNLS)":
+                            drt_solver = TikhonovDRT(data, regularization_order=reg_order, 
+                                                     include_inductive=include_inductive)
+                            result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_value, 
+                                                        lambda_auto=lambda_auto)
+                        
+                        elif analysis_method == "Bayesian MCMC":
+                            drt_solver = BayesianDRT(data, include_inductive=include_inductive)
+                            if PYMC_AVAILABLE:
+                                result = drt_solver.compute(n_tau=n_tau, 
+                                                           n_samples=st.session_state.app_state.drt_parameters.get('n_samples', 2000),
+                                                           n_tune=st.session_state.app_state.drt_parameters.get('n_tune', 1000))
+                            else:
+                                result = drt_solver.compute(n_tau=n_tau, n_samples=500)
+                        
+                        elif analysis_method == "Maximum Entropy (auto-λ)":
+                            drt_solver = MaxEntropyDRT(data, include_inductive=include_inductive)
+                            lambda_auto_val = st.session_state.app_state.drt_parameters.get('lambda_auto', True)
+                            lambda_val = st.session_state.app_state.drt_parameters.get('entropy_lambda', None)
+                            result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_val, 
+                                                        lambda_auto=lambda_auto_val)
+                        
+                        elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
+                            drt_solver = FiniteGaussianProcessDRT(data, include_inductive=include_inductive)
+                            n_comp = st.session_state.app_state.drt_parameters.get('n_components', 30)
+                            result = drt_solver.compute(n_tau=n_tau, n_components=n_comp)
+                        
+                        elif analysis_method == "Loewner Framework (RLF)":
+                            drt_solver = LoewnerFrameworkDRT(data)
+                            model_order_val = st.session_state.app_state.drt_parameters.get('model_order', None)
+                            result = drt_solver.compute(n_tau=n_tau, model_order=model_order_val)
+                        
+                        else:  # Generalized DRT
+                            drt_solver = TikhonovDRT(data, regularization_order=2, include_inductive=include_inductive)
+                            result = drt_solver.compute(n_tau=n_tau, lambda_auto=True)
+                        
+                        # Store results
+                        st.session_state.app_state.drt_result = result
+                        st.session_state.app_state.drt_calculated = True
+                        
+                        # Also store for reconstruction
+                        st.session_state.app_state.drt_solver = drt_solver
+                        
+                        st.success("✅ DRT calculation complete!")
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"DRT calculation failed: {e}")
+    
+    with col2:
+        if st.session_state.app_state.drt_calculated and st.session_state.app_state.drt_result:
+            st.subheader("📊 DRT Results")
+            
+            result = st.session_state.app_state.drt_result
+            
+            st.info(f"""
+            **Method:** {result.method}
+            **R∞:** {result.R_inf:.4f} Ω
+            **Rpol:** {result.R_pol:.4f} Ω
+            **τ range:** {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
+            """)
+            
             if 'lambda' in result.metadata:
-                lambda_val = result.metadata['lambda']
-                lambda_auto = result.metadata.get('lambda_auto', False)
-                
-                if lambda_auto:
-                    st.info(f"📊 **Automatic λ selection**: Optimal regularization parameter λ = **{lambda_val:.3e}** selected via L-curve criterion")
-                else:
-                    st.info(f"⚙️ **Manual λ selection**: Regularization parameter λ = **{lambda_val:.3e}**")
+                st.info(f"**λ:** {result.metadata['lambda']:.3e}")
             
-            # Display regularization order if available
-            if 'order' in result.metadata:
-                st.info(f"🔧 **Regularization order**: {result.metadata['order']}")
+            peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
             
-            # Publication-quality DRT plot
             fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
+            plt.close()
             
-            # Convergence info for Bayesian method
-            if not result.convergence and analysis_method == "Bayesian MCMC":
-                st.warning("⚠ MCMC may not have converged. Consider increasing samples.")
-            
-            # Download button for DRT figure
-            buf = io.BytesIO()
-            fig_drt.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-            st.download_button("📥 Download DRT Plot (PNG, 600 dpi)", 
-                              data=buf.getvalue(),
-                              file_name=f"drt_spectrum_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                              mime="image/png",
-                              key="download_drt_plot")
-            
-            # Display peak information
-            if peaks:
-                st.subheader("Detected Processes")
-                for i, peak in enumerate(peaks):
-                    with st.expander(f"Process {i+1} (τ = {peak['tau']:.2e} s)"):
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Relaxation Time τ", f"{peak['tau']:.2e} s")
-                            st.metric("Frequency f", f"{peak['frequency']:.2e} Hz")
-                        with col2:
-                            st.metric("Resistance R", f"{peak.get('resistance', 0):.4f} Ω")
-                        with col3:
-                            st.metric("Capacitance C", f"{peak.get('capacitance', 0):.2e} F")
-            else:
-                st.info("No peaks detected. Try adjusting the peak prominence parameter.")
-        
-        with tab2:
-            st.subheader("Nyquist and Bode Plots")
-            
-            # Nyquist plot
-            fig_nyquist = plot_nyquist_matplotlib(data, Z_rec_real, Z_rec_imag)
-            st.pyplot(fig_nyquist)
-            
-            # Bode plot
-            fig_bode = plot_bode_matplotlib(data, Z_rec_real, Z_rec_imag)
-            st.pyplot(fig_bode)
-            
-            # Download buttons
-            col1, col2 = st.columns(2)
-            with col1:
-                buf = io.BytesIO()
-                fig_nyquist.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-                st.download_button("📥 Download Nyquist Plot (PNG)", 
-                                  data=buf.getvalue(),
-                                  file_name=f"nyquist_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                                  mime="image/png")
-            with col2:
-                buf = io.BytesIO()
-                fig_bode.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-                st.download_button("📥 Download Bode Plot (PNG)", 
-                                  data=buf.getvalue(),
-                                  file_name=f"bode_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                                  mime="image/png")
-        
-        with tab3:
-            st.subheader("Interactive Plots")
-            
-            # Interactive impedance plot
-            fig_imp_plotly = plot_impedance_plotly(data, Z_rec_real, Z_rec_imag)
-            st.plotly_chart(fig_imp_plotly, use_container_width=True)
-            
-            # Interactive DRT plot
-            fig_drt_plotly = plot_drt_plotly(result, peaks)
-            st.plotly_chart(fig_drt_plotly, use_container_width=True)
-            
-            # Reconstruction error
-            error_real = np.abs(data.re_z - Z_rec_real) / np.abs(data.re_z + 1e-10) * 100
-            error_imag = np.abs(data.im_z - Z_rec_imag) / np.abs(data.im_z + 1e-10) * 100
-            mean_error = np.mean(np.sqrt(error_real**2 + error_imag**2))
-            st.metric("Mean Reconstruction Error", f"{mean_error:.2f} %")
-            
-            # Uncertainty info
-            if result.gamma_std is not None:
-                st.metric("Mean DRT Uncertainty", f"{np.mean(result.gamma_std / (result.gamma + 1e-10)) * 100:.2f} %")
-        
-        with tab4:
-            if res_real is not None and res_imag is not None:
-                st.subheader("Kramers-Kronig Validation")
-                fig_kk = plot_kk_residuals_matplotlib(data.freq, res_real, res_imag)
-                st.pyplot(fig_kk)
-                
-                buf = io.BytesIO()
-                fig_kk.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-                st.download_button("📥 Download KK Residuals Plot (PNG)", 
-                                  data=buf.getvalue(),
-                                  file_name=f"kk_residuals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                                  mime="image/png")
-        
-        with tab5:
-            st.subheader("Analysis Report")
-            
-            params = {
-                'R_inf': result.R_inf,
-                'R_pol': result.R_pol,
-                'kk_passed': kk_passed,
-                'max_kk_res': max_res,
-            }
-            
-            report = create_report(data, result, peaks, analysis_method, kk_passed, max_res)
-            st.text(report)
-            
-            # Download report with key parameter to prevent rerun
-            st.download_button("📥 Download Full Report (TXT)", 
-                              data=report,
-                              file_name=f"eis_drt_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                              mime="text/plain",
-                              key="download_report")
-            
-            st.markdown("---")
-            st.subheader("📁 Export DRT Data")
-            
-            # Create two different export formats
-            # Format 1: γ(τ) vs τ (relaxation time in seconds)
-            drt_data_tau = pd.DataFrame({
-                'tau_s': result.tau_grid,
-                'gamma_tau_ohm': result.gamma
-            })
-            if result.gamma_std is not None:
-                drt_data_tau['gamma_uncertainty_ohm'] = result.gamma_std
-            
-            # Format 2: γ(τ) vs Frequency (Hz)
-            frequencies = 1 / (2 * np.pi * result.tau_grid)
-            # Sort by frequency (high to low for better readability)
-            sort_idx = np.argsort(frequencies)[::-1]
-            freqs_sorted = frequencies[sort_idx]
-            gamma_sorted = result.gamma[sort_idx]
-            
-            drt_data_freq = pd.DataFrame({
-                'frequency_hz': freqs_sorted,
-                'gamma_tau_ohm': gamma_sorted
-            })
-            if result.gamma_std is not None:
-                gamma_std_sorted = result.gamma_std[sort_idx]
-                drt_data_freq['gamma_uncertainty_ohm'] = gamma_std_sorted
-            
-            # Export options with unique keys
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Export as γ(τ) vs τ**")
-                st.markdown("Data format: relaxation time (s) vs DRT amplitude (Ω)")
-                
-                # Create CSV for tau format
-                csv_tau = drt_data_tau.to_csv(index=False)
-                st.download_button(
-                    "📥 Export DRT Data (τ format) - CSV", 
-                    data=csv_tau,
-                    file_name=f"drt_data_tau_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_tau_csv"
-                )
-                
-                # Create TXT for tau format (tab-separated)
-                txt_tau = drt_data_tau.to_csv(sep='\t', index=False)
-                st.download_button(
-                    "📥 Export DRT Data (τ format) - TXT", 
-                    data=txt_tau,
-                    file_name=f"drt_data_tau_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    key="download_tau_txt"
-                )
-                
-                # Show preview
-                with st.expander("Preview - γ(τ) vs τ data"):
-                    st.dataframe(drt_data_tau.head(10))
-            
-            with col2:
-                st.markdown("**Export as γ(τ) vs Frequency**")
-                st.markdown("Data format: frequency (Hz) vs DRT amplitude (Ω)")
-                
-                # Create CSV for frequency format
-                csv_freq = drt_data_freq.to_csv(index=False)
-                st.download_button(
-                    "📥 Export DRT Data (Frequency format) - CSV", 
-                    data=csv_freq,
-                    file_name=f"drt_data_frequency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_freq_csv"
-                )
-                
-                # Create TXT for frequency format (tab-separated)
-                txt_freq = drt_data_freq.to_csv(sep='\t', index=False)
-                st.download_button(
-                    "📥 Export DRT Data (Frequency format) - TXT", 
-                    data=txt_freq,
-                    file_name=f"drt_data_frequency_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    key="download_freq_txt"
-                )
-                
-                # Show preview
-                with st.expander("Preview - γ(τ) vs Frequency data"):
-                    st.dataframe(drt_data_freq.head(10))
-            
-            st.markdown("---")
-            st.subheader("📊 Export Peak Analysis")
-            
-            # Export peaks data
-            if peaks:
-                peaks_df = pd.DataFrame(peaks)
-                
-                # Add additional calculated columns if available
-                if 'resistance' in peaks_df.columns:
-                    peaks_df['capacitance_F'] = peaks_df['tau'] / peaks_df['resistance']
-                
-                # Reorder columns for better readability
-                column_order = ['tau', 'frequency', 'amplitude', 'resistance', 'capacitance_F', 'log_tau', 'width']
-                available_cols = [col for col in column_order if col in peaks_df.columns]
-                peaks_df = peaks_df[available_cols]
-                
-                # CSV export
-                peaks_csv = peaks_df.to_csv(index=False)
-                st.download_button(
-                    "📥 Export Peaks Data - CSV", 
-                    data=peaks_csv,
-                    file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_peaks_csv"
-                )
-                
-                # TXT export (tab-separated)
-                peaks_txt = peaks_df.to_csv(sep='\t', index=False)
-                st.download_button(
-                    "📥 Export Peaks Data - TXT", 
-                    data=peaks_txt,
-                    file_name=f"peaks_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    key="download_peaks_txt"
-                )
-                
-                # Show peaks preview
-                with st.expander("Preview - Detected Peaks"):
-                    st.dataframe(peaks_df)
-            else:
-                st.info("No peaks detected to export")
-            
-            st.markdown("---")
-            st.subheader("📈 Export Full Dataset")
-            
-            # Export complete dataset with all information
-            complete_data = pd.DataFrame({
-                'tau_s': result.tau_grid,
-                'log10_tau': np.log10(result.tau_grid),
-                'frequency_hz': 1 / (2 * np.pi * result.tau_grid),
-                'gamma_tau_ohm': result.gamma
-            })
-            
-            if result.gamma_std is not None:
-                complete_data['gamma_uncertainty_ohm'] = result.gamma_std
-            
-            # Sort by frequency for better readability
-            complete_data = complete_data.sort_values('frequency_hz', ascending=False).reset_index(drop=True)
-            
-            # CSV export
-            complete_csv = complete_data.to_csv(index=False)
-            st.download_button(
-                "📥 Export Complete Dataset - CSV", 
-                data=complete_csv,
-                file_name=f"drt_complete_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="download_complete_csv"
-            )
-            
-            # TXT export (tab-separated)
-            complete_txt = complete_data.to_csv(sep='\t', index=False)
-            st.download_button(
-                "📥 Export Complete Dataset - TXT", 
-                data=complete_txt,
-                file_name=f"drt_complete_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain",
-                key="download_complete_txt"
-            )
-            
-            with st.expander("Preview - Complete Dataset"):
-                st.dataframe(complete_data.head(10))
+            col_prev, col_next = st.columns(2)
+            with col_prev:
+                if st.button("⬅️ Back to Parameters", use_container_width=True):
+                    pass
+            with col_next:
+                if st.button("Next: Peak Deconvolution ➡️", type="primary", use_container_width=True):
+                    st.session_state.app_state.current_step = 3
+                    st.rerun()
+        else:
+            st.info("👈 Configure parameters and click 'Run DRT Analysis' to begin")
+
+
+# ============================================================================
+# Step 3: Gaussian Deconvolution of DRT Peaks
+# ============================================================================
+
+def step3_gaussian_deconvolution():
+    """Step 3: Perform Gaussian deconvolution on DRT peaks"""
+    st.header("📈 Step 3: Gaussian Deconvolution of DRT Peaks")
     
-    elif not st.session_state.data_loaded:
-        st.info("👈 Please load impedance data using the sidebar controls to begin analysis")
+    if st.session_state.app_state.drt_result is None:
+        st.error("No DRT results found. Please complete Step 2 first.")
+        if st.button("⬅️ Back to DRT Analysis"):
+            st.session_state.app_state.current_step = 2
+            st.rerun()
+        return
+    
+    drt_result = st.session_state.app_state.drt_result
+    
+    # Prepare data for deconvolution
+    # Convert DRT (γ vs τ) to format suitable for Gaussian deconvolution
+    log_tau = np.log10(drt_result.tau_grid)
+    gamma_norm = drt_result.gamma / np.max(drt_result.gamma) if np.max(drt_result.gamma) > 0 else drt_result.gamma
+    
+    # Create deconvolver if not exists or if parameters changed
+    if st.session_state.app_state.deconv_result is None:
+        # Use log_tau as x and gamma_norm as y for deconvolution
+        deconvolver = GaussianDeconvolver(
+            x_linear=drt_result.tau_grid,
+            y_original=gamma_norm,
+            use_log_x=True,
+            use_log_y=False,
+            clip_negative=st.session_state.app_state.clip_negative,
+            show_warnings=st.session_state.app_state.show_warnings,
+            baseline_method=st.session_state.app_state.baseline_method,
+            smoothing_level=st.session_state.app_state.smoothing_level
+        )
+        st.session_state.app_state.deconvolver = deconvolver
+    
+    deconvolver = st.session_state.app_state.deconvolver
+    
+    col1, col2 = st.columns([1, 1.5])
+    
+    with col1:
+        st.subheader("🔍 Peak Detection Parameters")
         
-        # Show example format
-        with st.expander("📖 Data Format Example"):
-            st.markdown("""
-            ### Expected Data Format
-            Your file should contain at least three columns:
+        sensitivity = st.slider("Sensitivity", 0.001, 0.1, 
+                               value=st.session_state.app_state.sensitivity,
+                               step=0.001, format="%.3f")
+        min_distance = st.slider("Minimum distance between peaks", 1, 20,
+                                value=st.session_state.app_state.min_distance, step=1)
+        
+        st.session_state.app_state.sensitivity = sensitivity
+        st.session_state.app_state.min_distance = min_distance
+        
+        st.markdown("---")
+        st.subheader("Manual Peak Addition")
+        
+        if deconvolver.use_log_x:
+            x_min_display = np.min(deconvolver.x_linear)
+            x_max_display = np.max(deconvolver.x_linear)
+            manual_position = st.slider("Select peak position (τ, s):",
+                                       min_value=float(x_min_display),
+                                       max_value=float(x_max_display),
+                                       value=float((x_min_display + x_max_display) / 2),
+                                       format="%.3e")
+        else:
+            x_min_display = np.min(deconvolver.x_linear)
+            x_max_display = np.max(deconvolver.x_linear)
+            manual_position = st.slider("Select peak position:",
+                                       min_value=float(x_min_display),
+                                       max_value=float(x_max_display),
+                                       value=float((x_min_display + x_max_display) / 2),
+                                       format="%.3e")
+        
+        st.session_state.app_state.manual_peak_position = manual_position
+        
+        col_add1, col_add2 = st.columns(2)
+        with col_add1:
+            if st.button("➕ Add Manual Peak", use_container_width=True):
+                new_peak, new_params = deconvolver.add_manual_peak(manual_position)
+                if st.session_state.app_state.peak_info is None:
+                    st.session_state.app_state.peak_info = []
+                st.session_state.app_state.peak_info.append(new_peak)
+                if st.session_state.app_state.initial_peak_params is None:
+                    st.session_state.app_state.initial_peak_params = []
+                st.session_state.app_state.initial_peak_params.extend(new_params)
+                st.session_state.app_state.manual_peaks.append(new_peak)
+                st.success(f"Manual peak added at τ = {manual_position:.3e} s")
+                st.rerun()
+        
+        with col_add2:
+            if st.button("🔍 Find Missing Peaks", use_container_width=True):
+                with st.spinner("Analyzing residuals..."):
+                    if st.session_state.app_state.peak_info is None:
+                        _, st.session_state.app_state.peak_info, st.session_state.app_state.initial_peak_params, _ = deconvolver.auto_detect_peaks(
+                            sensitivity=sensitivity, min_distance=min_distance
+                        )
+                    
+                    missing_peaks, missing_params = deconvolver.find_missing_peaks_by_residuals(
+                        st.session_state.app_state.peak_info,
+                        sensitivity=sensitivity * 0.5,
+                        min_distance=min_distance
+                    )
+                    
+                    if missing_peaks:
+                        for p in missing_peaks:
+                            st.session_state.app_state.peak_info.append(p)
+                            st.session_state.app_state.initial_peak_params.extend([p['amp_est'], p['cen_est'], p['sigma_est']])
+                            st.session_state.app_state.residuals_peaks.append(p)
+                        st.success(f"Added {len(missing_peaks)} peaks from residuals")
+                        st.rerun()
+                    else:
+                        st.info("No additional peaks found in residuals")
+        
+        st.markdown("---")
+        
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            if st.button("⬅️ Back to DRT", use_container_width=True):
+                st.session_state.app_state.current_step = 2
+                st.rerun()
+        with col_next:
+            if st.button("🎯 Perform Deconvolution", type="primary", use_container_width=True):
+                with st.spinner("Performing Gaussian deconvolution..."):
+                    if st.session_state.app_state.peak_info is None:
+                        _, st.session_state.app_state.peak_info, st.session_state.app_state.initial_peak_params, _ = deconvolver.auto_detect_peaks(
+                            sensitivity=sensitivity, min_distance=min_distance
+                        )
+                    
+                    if st.session_state.app_state.preview_mode:
+                        preview_fit = deconvolver.preview_fit(st.session_state.app_state.initial_peak_params)
+                        if preview_fit is not None:
+                            st.session_state.app_state.preview_fit = preview_fit
+                            st.success("Preview generated")
+                    else:
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        def update_progress(progress, message):
+                            progress_bar.progress(progress)
+                            status_text.text(message)
+                        
+                        success = deconvolver.fit(
+                            initial_params=st.session_state.app_state.initial_peak_params,
+                            method=st.session_state.app_state.fitting_method,
+                            maxfev=st.session_state.app_state.max_nfev,
+                            fit_quality=st.session_state.app_state.fit_quality,
+                            progress_callback=update_progress
+                        )
+                        
+                        progress_bar.empty()
+                        status_text.empty()
+                        
+                        if success:
+                            st.session_state.app_state.last_popt = deconvolver.popt
+                            st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
+                            st.session_state.app_state.deconv_calculated = True
+                            st.success("✅ Deconvolution complete!")
+                            st.rerun()
+                        else:
+                            st.error("Deconvolution failed. Try adjusting parameters.")
+    
+    with col2:
+        st.subheader("📊 Peak Detection Preview")
+        
+        if st.session_state.app_state.peak_info is not None:
+            fig, ax = plt.subplots(figsize=(10, 6))
             
-            | Frequency (Hz) | Re(Z) (Ω) | -Im(Z) (Ω) |
-            |----------------|-----------|------------|
-            | 0.1            | 10.0      | 0.5        |
-            | 1.0            | 8.5       | 1.2        |
-            | 10.0           | 6.2       | 2.8        |
-            | 100.0          | 4.1       | 3.5        |
-            | 1000.0         | 2.5       | 2.9        |
-            | 10000.0        | 1.2       | 1.8        |
+            if deconvolver.use_log_x:
+                ax.set_xscale('log')
             
-            **Notes:**
-            - Frequency must be in Hz
-            - Re(Z) should be positive
-            - -Im(Z) should be positive (capacitive behavior)
-            - Data can be in any order (will be sorted by frequency)
-            """)
+            ax.plot(deconvolver.x_linear, deconvolver.y_original, 
+                   'o-', markersize=3, linewidth=1, alpha=0.7, 
+                   label='DRT Data', color='black', zorder=1)
+            
+            source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
+            for info in st.session_state.app_state.peak_info:
+                source = info.get('source', 'auto')
+                color = source_colors.get(source, '#2ca02c')
+                ax.plot(info['x_linear'], info['y_original'], 'o', 
+                       markersize=8, markeredgecolor='darkred', 
+                       markerfacecolor=color, zorder=3)
+                ax.text(info['x_linear'], info['y_original'] * 1.05, 
+                       f'τ={info["x_linear"]:.2e}s', ha='center', 
+                       fontsize=8, rotation=45)
+            
+            if st.session_state.app_state.manual_peak_position is not None:
+                idx = np.argmin(np.abs(deconvolver.x_linear - st.session_state.app_state.manual_peak_position))
+                y_at_position = deconvolver.y_original[idx]
+                ax.axvline(x=st.session_state.app_state.manual_peak_position, 
+                          color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax.plot(st.session_state.app_state.manual_peak_position, y_at_position, 
+                       'ro', markersize=10)
+            
+            ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
+            ax.set_ylabel('γ(τ) (norm.)', fontweight='bold')
+            ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
+            ax.legend(['DRT Data', 'Detected Peaks'], loc='upper right')
+            ax.grid(True, alpha=0.3, linestyle='--')
+            
+            st.pyplot(fig)
+            plt.close()
+            
+            # Peak info table
+            if st.session_state.app_state.peak_info:
+                peak_data = []
+                for i, info in enumerate(st.session_state.app_state.peak_info):
+                    source = info.get('source', 'auto')
+                    source_icon = "🟢" if source == 'auto' else "🟠" if source == 'manual' else "🔵"
+                    peak_data.append({
+                        'Peak': i + 1,
+                        'Source': f"{source_icon} {source}",
+                        'τ (s)': f"{info['x_linear']:.4e}",
+                        'γ(τ)': f"{info['y_original']:.4e}",
+                        'σ (log)': f"{info.get('sigma_est', 0):.4f}"
+                    })
+                
+                df_peaks = pd.DataFrame(peak_data)
+                st.dataframe(df_peaks, use_container_width=True)
+        
+        elif st.session_state.app_state.deconv_calculated and st.session_state.app_state.deconv_result:
+            st.success("✅ Deconvolution completed!")
+            result = st.session_state.app_state.deconv_result
+            st.metric("R²", f"{result.quality_metrics.get('R²', 0):.4f}")
+            st.metric("Number of Peaks", len(result.peaks))
+            st.metric("Total Area", f"{result.total_area:.4e}")
+
+
+# ============================================================================
+# Step 4: Results and Export
+# ============================================================================
+
+def step4_results():
+    """Step 4: Display results, tables, and export options"""
+    st.header("📊 Step 4: Results and Export")
+    
+    if st.session_state.app_state.deconv_result is None:
+        st.error("No deconvolution results found. Please complete Step 3 first.")
+        if st.button("⬅️ Back to Deconvolution"):
+            st.session_state.app_state.current_step = 3
+            st.rerun()
+        return
+    
+    deconv_result = st.session_state.app_state.deconv_result
+    
+    # Navigation buttons
+    col_prev, col_next = st.columns([1, 5])
+    with col_prev:
+        if st.button("⬅️ Back to Deconvolution", use_container_width=True):
+            st.session_state.app_state.current_step = 3
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Tabs for different views
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Deconvolution Plot", "📊 Area Distribution", "📋 Complete Dataset", 
+                                             "📈 Normalized View", "📥 Export"])
+    
+    with tab1:
+        st.subheader("Gaussian Deconvolution Result")
+        
+        fig = plot_deconvolution_result(deconv_result, show_components=True, show_baseline=True)
+        st.pyplot(fig)
+        plt.close()
+        
+        # Download plot button
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+        buf.seek(0)
+        st.download_button("📥 Download Deconvolution Plot (PNG)", 
+                          data=buf,
+                          file_name=f"deconvolution_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                          mime="image/png")
+    
+    with tab2:
+        st.subheader("Area Distribution Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Bar chart of fractions
+            fig, ax = plt.subplots(figsize=(8, 6))
+            peaks_ids = [f'Peak {p.id}' for p in deconv_result.peaks]
+            fractions = [p.fraction_percent for p in deconv_result.peaks]
+            colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+            
+            bars = ax.bar(peaks_ids, fractions, color=colors, edgecolor='black', alpha=0.7)
+            ax.set_xlabel('Peak', fontweight='bold')
+            ax.set_ylabel('Fraction (%)', fontweight='bold')
+            ax.set_title('Peak Area Distribution', fontweight='bold')
+            ax.set_ylim(0, max(fractions) * 1.2 if fractions else 100)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            for bar, frac in zip(bars, fractions):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{frac:.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
+            
+            ax.tick_params(axis='x', rotation=45)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+        
+        with col2:
+            # Pie chart
+            fig, ax = plt.subplots(figsize=(8, 6))
+            wedges, texts, autotexts = ax.pie(fractions, labels=peaks_ids, autopct='%1.1f%%',
+                                               colors=colors, startangle=90,
+                                               textprops={'fontweight': 'bold'})
+            ax.set_title('Area Distribution - Pie Chart', fontweight='bold')
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+        
+        # Summary statistics
+        st.markdown("---")
+        st.subheader("Summary Statistics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Area", f"{deconv_result.total_area:.4e}")
+        with col2:
+            st.metric("Number of Peaks", len(deconv_result.peaks))
+        with col3:
+            max_peak = max(deconv_result.peaks, key=lambda p: p.fraction)
+            st.metric("Dominant Peak", f"Peak {max_peak.id} ({max_peak.fraction_percent:.1f}%)")
+        with col4:
+            avg_area = deconv_result.total_area / len(deconv_result.peaks) if deconv_result.peaks else 0
+            st.metric("Average Area", f"{avg_area:.4e}")
+    
+    with tab3:
+        st.subheader("Complete Dataset - Peak Parameters")
+        
+        # Create detailed table
+        data = []
+        for peak in deconv_result.peaks:
+            data.append({
+                'Peak ID': peak.id,
+                'Center (τ, s)': f"{peak.center:.4e}",
+                'Center (log τ)': f"{peak.center_log:.4f}",
+                'Amplitude': f"{peak.amplitude:.4e}",
+                'Amplitude (norm)': f"{peak.amplitude_norm:.4f}",
+                'Sigma (log)': f"{peak.sigma_log:.4f}",
+                'FWHM': f"{peak.fwhm:.4f}",
+                'Area': f"{peak.area:.4e}",
+                'Fraction (%)': f"{peak.fraction_percent:.2f}"
+            })
+        
+        df = pd.DataFrame(data)
+        st.dataframe(df, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("Quality Metrics")
+        
+        metrics = deconv_result.quality_metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("R²", f"{metrics.get('R²', 0):.6f}")
+        with col2:
+            st.metric("RMSE", f"{metrics.get('RMSE', 0):.2e}")
+        with col3:
+            st.metric("AIC", f"{metrics.get('AIC', 0):.2f}")
+        with col4:
+            st.metric("BIC", f"{metrics.get('BIC', 0):.2f}")
+        
+        if deconv_result.baseline_method != 'none' and deconv_result.baseline_params:
+            st.markdown("---")
+            st.subheader("Baseline Parameters")
+            baseline_df = pd.DataFrame([{
+                'Method': deconv_result.baseline_method,
+                'Parameters': ', '.join([f"{p:.4e}" for p in deconv_result.baseline_params])
+            }])
+            st.dataframe(baseline_df, use_container_width=True)
+    
+    with tab4:
+        st.subheader("Normalized View (Max Peak = 1)")
+        
+        fig = plot_deconvolution_components_comparison(deconv_result)
+        st.pyplot(fig)
+        plt.close()
+        
+        # Normalized parameters table
+        st.markdown("---")
+        st.subheader("Normalized Parameters")
+        
+        norm_data = []
+        max_amp = deconv_result.max_amplitude
+        for peak in deconv_result.peaks:
+            norm_data.append({
+                'Peak': peak.id,
+                'Center (τ, s)': f"{peak.center:.4e}",
+                'Normalized Amplitude': f"{peak.amplitude / max_amp:.4f}",
+                'Original Amplitude': f"{peak.amplitude:.4e}",
+                'Fraction (%)': f"{peak.fraction_percent:.2f}"
+            })
+        
+        df_norm = pd.DataFrame(norm_data)
+        st.dataframe(df_norm, use_container_width=True)
+    
+    with tab5:
+        st.subheader("Export Results")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Export Peak Data**")
+            
+            # Create peaks DataFrame
+            peaks_df = pd.DataFrame([{
+                'Peak_ID': p.id,
+                'Center_tau_s': p.center,
+                'Center_log_tau': p.center_log,
+                'Amplitude': p.amplitude,
+                'Amplitude_Normalized': p.amplitude_norm,
+                'Sigma_log': p.sigma_log,
+                'FWHM': p.fwhm,
+                'Area': p.area,
+                'Fraction': p.fraction,
+                'Fraction_Percent': p.fraction_percent,
+                'Source': getattr(p, 'source', 'auto')
+            } for p in deconv_result.peaks])
+            
+            csv_peaks = peaks_df.to_csv(index=False)
+            st.download_button(
+                "📥 Export Peaks as CSV",
+                data=csv_peaks,
+                file_name=f"deconvolution_peaks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+            
+            st.markdown("**Export Fitting Data**")
+            
+            # Create fitting data DataFrame
+            fit_data = pd.DataFrame({
+                'tau_s': deconv_result.x_linear,
+                'gamma_tau': deconv_result.y_original,
+                'gamma_fit': deconv_result.fit_y_norm * deconv_result.y_original.max(),
+                'Residuals': deconv_result.quality_metrics.get('Residuals', np.zeros_like(deconv_result.x_linear)) * deconv_result.y_original.max()
+            })
+            
+            csv_fit = fit_data.to_csv(index=False)
+            st.download_button(
+                "📥 Export Fitting Data as CSV",
+                data=csv_fit,
+                file_name=f"deconvolution_fit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
+        with col2:
+            st.markdown("**Generate Report**")
+            
+            if st.button("📄 Generate Detailed Report", use_container_width=True):
+                report = f"""GAUSSIAN DECONVOLUTION REPORT
+{"="*80}
+
+Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+QUALITY METRICS:
+{"-"*40}
+R²: {deconv_result.quality_metrics.get('R²', 0):.6f}
+AIC: {deconv_result.quality_metrics.get('AIC', 0):.2f}
+BIC: {deconv_result.quality_metrics.get('BIC', 0):.2f}
+χ²: {deconv_result.quality_metrics.get('χ²', 0):.2e}
+RMSE: {deconv_result.quality_metrics.get('RMSE', 0):.2e}
+Max Error: {deconv_result.quality_metrics.get('Max Error', 0):.2e}
+
+"""
+                if deconv_result.baseline_method != 'none':
+                    report += f"""BASELINE PARAMETERS:
+{"-"*40}
+Method: {deconv_result.baseline_method}
+Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
+
+"""
+                
+                report += f"""PEAK PARAMETERS:
+{"-"*80}
+ID    Center (s)      Amplitude       Area           Fraction(%)
+{"-"*80}"""
+                
+                for p in deconv_result.peaks:
+                    report += f"\n{p.id:<4} {p.center:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
+                
+                report += f"""
+{"="*80}
+Total Area: {deconv_result.total_area:.6e}
+Number of Peaks: {len(deconv_result.peaks)}
+{"="*80}"""
+                
+                st.download_button(
+                    "📥 Download Report",
+                    data=report,
+                    file_name=f"deconvolution_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+            
+            st.markdown("---")
+            st.markdown("**Start New Analysis**")
+            
+            if st.button("🔄 New Analysis", use_container_width=True):
+                st.session_state.app_state = AppState()
+                st.rerun()
+    
+    # Additional: Compare with original DRT
+    if st.session_state.app_state.drt_result:
+        st.markdown("---")
+        st.subheader("Comparison with Original DRT")
+        
+        drt_result = st.session_state.app_state.drt_result
+        peaks_drt = find_peaks_drt(drt_result.tau_grid, drt_result.gamma)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.semilogx(drt_result.tau_grid, drt_result.gamma, 'b-', linewidth=2, label='Original DRT')
+            
+            for peak in deconv_result.peaks:
+                ax.axvline(x=peak.center, color='red', linestyle='--', alpha=0.5)
+                ax.text(peak.center, np.max(drt_result.gamma) * 0.9, 
+                       f'Peak {peak.id}', ha='center', fontsize=9)
+            
+            ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
+            ax.set_ylabel('γ(τ)', fontweight='bold')
+            ax.set_title('DRT with Deconvolved Peak Positions', fontweight='bold')
+            ax.legend()
+            ax.grid(True, alpha=0.3, linestyle='--')
+            st.pyplot(fig)
+            plt.close()
+        
+        with col2:
+            # Comparison table
+            comparison_data = []
+            for i, peak in enumerate(deconv_result.peaks):
+                matching_drt = None
+                for p in peaks_drt:
+                    if abs(np.log10(p['tau']) - peak.center_log) < 0.3:
+                        matching_drt = p
+                        break
+                
+                comparison_data.append({
+                    'Deconvolved Peak': i + 1,
+                    'τ (s)': f"{peak.center:.4e}",
+                    'DRT τ (s)': f"{matching_drt['tau']:.4e}" if matching_drt else "N/A",
+                    'Match': "✓" if matching_drt else "✗"
+                })
+            
+            df_comp = pd.DataFrame(comparison_data)
+            st.dataframe(df_comp, use_container_width=True)
+
+
+# ============================================================================
+# Navigation and Main Application
+# ============================================================================
+
+def show_step_indicator():
+    """Display step indicator in sidebar"""
+    st.sidebar.markdown("### 📍 Analysis Steps")
+    
+    steps = {
+        1: "1. Data Loading",
+        2: "2. DRT Analysis",
+        3: "3. Peak Deconvolution",
+        4: "4. Results & Export"
+    }
+    
+    current = st.session_state.app_state.current_step
+    
+    for step_num, step_name in steps.items():
+        if step_num < current:
+            st.sidebar.markdown(f"✅ **{step_name}**")
+        elif step_num == current:
+            st.sidebar.markdown(f"🔵 **{step_name}**")
+        else:
+            st.sidebar.markdown(f"⏳ {step_name}")
+    
+    st.sidebar.markdown("---")
+    
+    # Settings expander
+    with st.sidebar.expander("⚙️ Global Settings", expanded=False):
+        st.session_state.app_state.clip_negative = st.checkbox(
+            "Clip negative values", 
+            value=st.session_state.app_state.clip_negative
+        )
+        st.session_state.app_state.show_warnings = st.checkbox(
+            "Show warnings", 
+            value=st.session_state.app_state.show_warnings
+        )
+        st.session_state.app_state.smoothing_level = st.selectbox(
+            "Smoothing",
+            options=['none', 'light', 'medium', 'strong', 'adaptive'],
+            index=0
+        )
+        st.session_state.app_state.baseline_method = st.selectbox(
+            "Baseline correction",
+            options=['none', 'constant', 'linear', 'quadratic'],
+            index=0
+        )
+        st.session_state.app_state.fitting_method = st.selectbox(
+            "Fitting method",
+            options=['trf', 'dogbox', 'lm'],
+            index=0
+        )
+        st.session_state.app_state.fit_quality = st.selectbox(
+            "Fit quality",
+            options=['fast', 'balanced', 'precise'],
+            index=1
+        )
+        st.session_state.app_state.preview_mode = st.checkbox(
+            "Preview mode (no fitting)",
+            value=st.session_state.app_state.preview_mode
+        )
+    
+    # Reset button
+    if st.sidebar.button("🔄 Reset All", use_container_width=True):
+        st.session_state.app_state = AppState()
+        st.rerun()
+
+
+def main():
+    """Main application entry point"""
+    show_step_indicator()
+    
+    # Route to appropriate step
+    current_step = st.session_state.app_state.current_step
+    
+    if current_step == 1:
+        step1_data_loading()
+    elif current_step == 2:
+        step2_drt_analysis()
+    elif current_step == 3:
+        step3_gaussian_deconvolution()
+    elif current_step == 4:
+        step4_results()
+    else:
+        step1_data_loading()
     
     # Footer
     st.markdown("---")
-    st.markdown("⚡ *DRT Analysis Tool v3.0 | 6 inversion methods: Tikhonov (NNLS), Bayesian MCMC, MaxEntropy (auto-λ), fGP-DRT, Loewner (RLF), Generalized DRT*")
+    st.markdown("⚡ **EIS-DRT Analysis Tool v4.0** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis")
 
 
 if __name__ == "__main__":
