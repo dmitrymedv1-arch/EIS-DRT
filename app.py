@@ -2684,8 +2684,8 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
     
     # Scientific formatting
     ax.ticklabel_format(style='scientific', scilimits=(-2, 2))
-    ax.xaxis.set_major_formatter(ScalarFormatter(useMathText=True))
-    ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    ax.xaxis.set_major_formatter(ScalarFormatter(useMathText=False))
+    ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=False))
     
     x_range = ax.get_xlim()
     y_range = ax.get_ylim()
@@ -2719,8 +2719,8 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     ax1.grid(True, alpha=0.3, linestyle='--')
     
     # Scientific formatting for log axes
-    ax1.xaxis.set_major_formatter(ScalarFormatter(useMathText=True))
-    ax1.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    ax1.xaxis.set_major_formatter(ScalarFormatter(useMathText=False))
+    ax1.yaxis.set_major_formatter(ScalarFormatter(useMathText=False))
     
     phase = data.phase
     ax2.semilogx(data.freq, phase, 'o-', markersize=5, linewidth=1.8,
@@ -2741,8 +2741,9 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
     
-    # Scientific formatting
-    ax2.xaxis.set_major_formatter(ScalarFormatter(useMathText=True))
+    # Scientific formatting - отключаем LaTeX
+    ax2.xaxis.set_major_formatter(ScalarFormatter(useMathText=False))
+    ax2.yaxis.set_major_formatter(ScalarFormatter(useMathText=False))
     
     fig.suptitle("Bode Plot", fontweight='bold', fontsize=16)
     plt.tight_layout()
@@ -2779,9 +2780,9 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
     # Используем обычный текст без LaTeX
-    ax1.set_xlabel("Relaxation Time tau (s)", fontweight='bold')
-    ax1.set_ylabel("gamma(tau) (Ohm)", fontweight='bold')
-    ax1.set_title("gamma(tau) vs tau", fontweight='bold')
+    ax1.set_xlabel("Relaxation Time (s)", fontweight='bold')
+    ax1.set_ylabel("gamma (Ohm)", fontweight='bold')
+    ax1.set_title("gamma vs tau", fontweight='bold')
     ax1.legend(loc='best', frameon=True)
     ax1.grid(True, alpha=0.3, linestyle='--', which='both')
     
