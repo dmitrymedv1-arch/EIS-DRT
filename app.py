@@ -867,10 +867,12 @@ class TikhonovDRT(DRTCore):
         Reconstruct impedance from DRT.
         
         Z_reconstructed = R∞ + K_real @ gamma
+        Note: gamma already includes ln(10) factor, but kernel also includes dln_tau,
+        so we need to divide by ln(10) to avoid double multiplication.
         """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
+        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10)
         return Z_rec_real, Z_rec_imag
 
 
@@ -988,8 +990,8 @@ class MaxEntropyDRT(DRTCore):
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
+        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10)
         return Z_rec_real, Z_rec_imag
 
 
