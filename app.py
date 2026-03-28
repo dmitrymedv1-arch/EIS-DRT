@@ -265,43 +265,35 @@ class DRTResult:
     R_pol: float = 0.0
     convergence: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
-    _gamma_scaled: Optional[np.ndarray] = None  # Cached scaled version
     
     @property
     def log_tau(self) -> np.ndarray:
         return np.log10(self.tau_grid)
     
     def get_integral_ln(self) -> float:
-        """Calculate ∫ γ(τ) d(ln τ). This should equal R_pol for correctly scaled DRT."""
+        """
+        Calculate ∫ γ(τ) d(ln τ).
+        This should equal R_pol for correctly scaled DRT.
+        """
         return np.trapezoid(self.gamma, np.log(self.tau_grid))
     
     def get_integral_log10(self) -> float:
-        """Calculate ∫ γ(τ) d(log₁₀ τ). This equals R_pol / ln(10) ≈ R_pol / 2.3026."""
+        """
+        Calculate ∫ γ(τ) d(log₁₀ τ).
+        This equals R_pol / ln(10) ≈ R_pol / 2.3026.
+        """
         return np.trapezoid(self.gamma, np.log10(self.tau_grid))
     
     def get_scaled_gamma_for_deconvolution(self) -> np.ndarray:
         """
-        Return gamma scaled so that ∫ γ d(ln τ) = R_pol.
-        This is the correct physical scaling for DRT.
+        Return gamma scaled for deconvolution.
+        The scaling ensures that area under peaks sums to R_pol.
         """
-        if self._gamma_scaled is not None:
-            return self._gamma_scaled
-        
         current_integral = self.get_integral_ln()
         if current_integral > 0 and self.R_pol > 0:
             scaling_factor = self.R_pol / current_integral
-            self._gamma_scaled = self.gamma * scaling_factor
-        else:
-            self._gamma_scaled = self.gamma.copy()
-        
-        return self._gamma_scaled
-    
-    def get_gamma_for_plotting(self) -> np.ndarray:
-        """
-        Return gamma in the correct physical scale (∫γ d(ln τ) = R_pol).
-        This should be used for all plotting.
-        """
-        return self.get_scaled_gamma_for_deconvolution()
+            return self.gamma * scaling_factor
+        return self.gamma.copy()
     
     def get_validation_report(self) -> str:
         """Generate validation report"""
@@ -1952,30 +1944,29 @@ class GaussianDeconvolver:
                  clip_negative=True, show_warnings=True, baseline_method='none',
                  smoothing_level='none', target_total_area=None):
         """
-        Initialize deconvolver with correctly scaled DRT data.
+        Initialize deconvolver.
         
         Parameters:
         -----------
         x_linear : array
             X values (τ in seconds)
         y_original : array
-            Y values (γ(τ) in Ω) - should already be correctly scaled
-            where ∫γ d(ln τ) = R_pol
+            Y values (γ(τ) in Ω)
         use_log_x : bool
             Whether to use log scale for X
         use_log_y : bool
             Whether to use log scale for Y
         target_total_area : float, optional
-            Expected total area (R_pol) for verification
+            Expected total area (R_pol) for scaling verification
         """
-        # Store original data - already correctly scaled
+        # Store original data
         self.x_original = np.array(x_linear).copy()
         self.y_original_raw = np.array(y_original).copy()
         self.target_total_area = target_total_area
         
         # Working arrays
         self.x_linear = np.array(x_linear)
-        self.y_original = np.array(y_original)  # Already in correct physical scale
+        self.y_original = np.array(y_original)
         self.use_log_x = use_log_x
         self.use_log_y = use_log_y
         self.baseline_method = baseline_method
@@ -1990,7 +1981,7 @@ class GaussianDeconvolver:
         self.x_sorted = self.x_linear.copy()
         self.y_sorted = self.y_original.copy()
         
-        # Preprocess data (clipping, smoothing) but NO normalization
+        # Preprocess data
         self.preprocessor = DataPreprocessor(clip_negative, show_warnings)
         preprocessed = self.preprocessor.preprocess_for_fitting(
             self.x_linear, self.y_original, use_log_x, use_log_y, smoothing_level
@@ -2001,16 +1992,20 @@ class GaussianDeconvolver:
         self.y_sorted = preprocessed['y_sorted']
         self.x = preprocessed['x']
         self.y = preprocessed['y']
-        self.y_for_fitting = preprocessed['y_for_fitting']  # This is the physical γ(τ) in Ω
+        self.y_for_fitting = preprocessed['y_for_fitting']
         self.x_label = preprocessed['x_label']
         self.y_label = preprocessed['y_label']
         self.clipped_points = preprocessed['clipped_points']
         self.small_values_warning = preprocessed['small_values_warning']
         
-        # IMPORTANT: NO NORMALIZATION - y_for_fitting is already in correct physical scale
-        # We work directly with physical units (Ω)
-        self.y_norm = self.y_for_fitting.copy()  # Actually not normalized, just for compatibility
-        self.y_max = 1.0  # No normalization scaling
+        # Normalization - use 95th percentile
+        self.y_max = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
+        
+        # For fitting, normalize
+        if self.y_max > 0:
+            self.y_norm = self.y / self.y_max
+        else:
+            self.y_norm = self.y
         
         # Results containers
         self.components = []
@@ -2042,33 +2037,30 @@ class GaussianDeconvolver:
         params = list(peak_params)
         if n_baseline > 0:
             if self.baseline_method == 'constant':
-                baseline_init = [np.percentile(self.y_for_fitting, 5)]
+                baseline_init = [np.percentile(self.y_norm, 5)]
             elif self.baseline_method == 'linear':
-                baseline_init = [np.percentile(self.y_for_fitting, 5), 0]
+                baseline_init = [np.percentile(self.y_norm, 5), 0]
             else:
-                baseline_init = [np.percentile(self.y_for_fitting, 5), 0, 0]
+                baseline_init = [np.percentile(self.y_norm, 5), 0, 0]
             params.extend(baseline_init[:n_baseline])
         return params
     
     def auto_detect_peaks(self, sensitivity=0.03, min_distance=5):
-        """Automatic peak detection on correctly scaled DRT data"""
-        # Work directly with y_for_fitting (physical scale)
-        y_work = self.y_for_fitting.copy()
-        
+        """Automatic peak detection using derivatives"""
         # Smoothing
-        window_length = min(11, len(y_work) // 5 * 2 + 1)
+        window_length = min(11, len(self.y_norm) // 5 * 2 + 1)
         if window_length % 2 == 0:
             window_length += 1
         
         if window_length >= 5:
-            y_smooth = savgol_filter(y_work, window_length, 3)
+            y_smooth = savgol_filter(self.y_norm, window_length, 3)
         else:
-            y_smooth = y_work
+            y_smooth = self.y_norm
         
         # Calculate derivatives
         dy, d2y, y_smooth = DerivativeAnalyzer.calculate_derivatives(self.x, y_smooth)
         
-        # Peak search using physical amplitudes
+        # Peak search
         height_threshold = sensitivity * np.max(y_smooth)
         peaks1, _ = find_peaks(y_smooth, height=height_threshold, distance=min_distance)
         peaks2 = DerivativeAnalyzer.find_peaks_by_derivatives(self.x, y_smooth, dy, d2y, sensitivity)
@@ -2088,7 +2080,7 @@ class GaussianDeconvolver:
         
         for peak_idx in filtered_peaks:
             cen = self.x[peak_idx]
-            amp = y_smooth[peak_idx]  # Physical amplitude in Ω
+            amp = y_smooth[peak_idx]
             
             # Estimate sigma
             sigma = GaussianModel.estimate_sigma_from_peak(self.x, y_smooth, peak_idx)
@@ -2122,7 +2114,7 @@ class GaussianDeconvolver:
         return filtered_peaks, peak_info, initial_params, (dy, d2y, y_smooth)
     
     def add_manual_peak(self, x_position_linear, amplitude=None, sigma_est=None):
-        """Add a peak manually at specified linear X position using physical scale"""
+        """Add a peak manually at specified linear X position"""
         if self.use_log_x:
             x_position = np.log10(x_position_linear)
         else:
@@ -2133,17 +2125,17 @@ class GaussianDeconvolver:
         if amplitude is None:
             if self.use_log_x:
                 log_idx = np.argmin(np.abs(self.x - x_position))
-                amplitude = self.y_for_fitting[log_idx] if log_idx < len(self.y_for_fitting) else 0.1
+                amplitude = self.y_norm[log_idx] if log_idx < len(self.y_norm) else 0.1
             else:
-                amplitude = self.y_for_fitting[idx] if idx < len(self.y_for_fitting) else 0.1
+                amplitude = self.y_norm[idx] if idx < len(self.y_norm) else 0.1
         
         if sigma_est is None:
             if self.use_log_x:
                 x_search = self.x
-                y_search = self.y_for_fitting
+                y_search = self.y_norm
             else:
                 x_search = self.x_linear
-                y_search = self.y_for_fitting
+                y_search = self.y_original / self.y_max
             
             left_idx = idx
             right_idx = idx
@@ -2189,7 +2181,7 @@ class GaussianDeconvolver:
             peak_params.extend([info['amp_est'], info['cen_est'], info['sigma_est']])
         
         y_initial_fit = GaussianModel.multi_gaussian(self.x, *peak_params)
-        residuals = self.y_for_fitting - y_initial_fit  # Physical residuals in Ω
+        residuals = self.y_norm - y_initial_fit
         
         height_threshold = sensitivity * np.max(np.abs(residuals))
         
@@ -2221,7 +2213,7 @@ class GaussianDeconvolver:
                 continue
             
             cen = self.x[idx]
-            amp = abs(residuals_smooth[idx])  # Physical amplitude in Ω
+            amp = abs(residuals_smooth[idx])
             sigma = GaussianModel.estimate_sigma_from_peak(self.x, residuals_smooth, idx)
             sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / 20)
             
@@ -2251,20 +2243,19 @@ class GaussianDeconvolver:
         
         return missing_peaks, missing_params
     
-    def _create_bounds(self, x, y, n_peaks, n_baseline):
-        """Create bounds for fitting in physical units"""
+    def _create_bounds(self, x, y_norm, n_peaks, n_baseline):
+        """Create bounds for fitting"""
         lower_bounds = []
         upper_bounds = []
         x_range = np.max(x) - np.min(x)
-        y_max = np.max(y) if len(y) > 0 else 1.0
         
         for i in range(n_peaks):
             lower_bounds.extend([0, np.min(x), x_range * 0.001])
-            upper_bounds.extend([2 * y_max, np.max(x), x_range * 0.5])
+            upper_bounds.extend([2 * np.max(y_norm), np.max(x), x_range * 0.5])
         
         if n_baseline >= 1:
-            lower_bounds.append(-y_max)
-            upper_bounds.append(y_max)
+            lower_bounds.append(-np.max(y_norm))
+            upper_bounds.append(np.max(y_norm))
         if n_baseline >= 2:
             lower_bounds.append(-x_range)
             upper_bounds.append(x_range)
@@ -2276,7 +2267,7 @@ class GaussianDeconvolver:
     
     def fit(self, initial_params=None, method='trf', maxfev=5000, 
             fit_quality='balanced', last_popt=None, progress_callback=None):
-        """Perform fitting with selected method and baseline in physical units"""
+        """Perform fitting with selected method and baseline"""
         if initial_params is None:
             _, _, initial_params, _ = self.auto_detect_peaks()
         
@@ -2297,10 +2288,7 @@ class GaussianDeconvolver:
         else:
             initial_params = self._prepare_initial_params(initial_params, n_baseline)
         
-        # Use y_for_fitting directly (physical units)
-        y_fit = self.y_for_fitting
-        
-        lower_bounds, upper_bounds = self._create_bounds(self.x, y_fit, n_peaks, n_baseline)
+        lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
         
         for i in range(len(initial_params)):
             initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
@@ -2335,7 +2323,7 @@ class GaussianDeconvolver:
             popt, pcov = curve_fit(
                 model_func,
                 self.x,
-                y_fit,
+                self.y_norm,
                 p0=initial_params,
                 bounds=(lower_bounds, upper_bounds),
                 method=method,
@@ -2348,20 +2336,21 @@ class GaussianDeconvolver:
             if progress_callback:
                 progress_callback(0.8, "Calculating components...")
             
-            fit_y = model_func(self.x, *popt)
+            fit_y_norm = model_func(self.x, *popt)
             
             components = []
             peak_params = popt[:n_peaks*3]
             baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
             
             for i in range(n_peaks):
-                amp = peak_params[3*i]  # Physical amplitude in Ω
+                amp_norm = peak_params[3*i]
                 cen = peak_params[3*i + 1]
                 sigma = abs(peak_params[3*i + 2])
                 
-                area = GaussianModelDeconv.calculate_area(amp, sigma)
+                amp = amp_norm * self.y_max
+                area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
                 
-                component_y = GaussianModelDeconv.gaussian(self.x, amp, cen, sigma)
+                component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
                 
                 if self.use_log_x:
                     cen_linear = 10**cen
@@ -2370,6 +2359,7 @@ class GaussianDeconvolver:
                 
                 components.append({
                     'id': i + 1,
+                    'amp_norm': amp_norm,
                     'amp': amp,
                     'cen_log': cen,
                     'cen_linear': cen_linear,
@@ -2377,18 +2367,24 @@ class GaussianDeconvolver:
                     'fwhm': GaussianModel.calculate_fwhm(sigma),
                     'area': area,
                     'fraction': 0,
-                    'y': component_y,
+                    'y_norm': component_y_norm,
                     'source': 'auto'
                 })
             
             total_area = sum([c['area'] for c in components])
             
-            # Verify against target total area
+            # Check if scaling is needed based on target total area
             if self.target_total_area is not None and total_area > 0:
                 area_ratio = self.target_total_area / total_area
-                if abs(area_ratio - 1.0) > 0.05:
+                if abs(area_ratio - 1.0) > 0.1:
+                    # Scale all components to match target
+                    for c in components:
+                        c['amp'] = c['amp'] * area_ratio
+                        c['area'] = c['area'] * area_ratio
+                    total_area = self.target_total_area
+                    
                     if progress_callback:
-                        progress_callback(0.9, f"Area ratio {area_ratio:.3f} - may need scaling")
+                        progress_callback(0.9, f"Applied scaling factor {area_ratio:.3f} to match R_pol={self.target_total_area:.3f}Ω")
             
             for c in components:
                 c['fraction'] = c['area'] / total_area if total_area > 0 else 0
@@ -2397,11 +2393,11 @@ class GaussianDeconvolver:
             self.popt = popt
             self.components = components
             self.baseline_params = baseline_params
-            self.fit_y = fit_y  # Store fit in physical units
+            self.fit_y_norm = fit_y_norm
             self.total_area = total_area
             
             self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
-                y_fit, fit_y, len(popt)
+                self.y_norm, self.fit_y_norm, len(popt)
             )
             
             if progress_callback:
@@ -2416,7 +2412,7 @@ class GaussianDeconvolver:
             return False
     
     def preview_fit(self, initial_params=None):
-        """Preview fit without optimization (fast) in physical units"""
+        """Preview fit without optimization (fast)"""
         if initial_params is None:
             _, _, initial_params, _ = self.auto_detect_peaks()
         
@@ -2429,15 +2425,15 @@ class GaussianDeconvolver:
         full_params = self._prepare_initial_params(initial_params, n_baseline)
         
         if n_baseline == 0:
-            fit_y = GaussianModel.multi_gaussian(self.x, *full_params)
+            fit_y_norm = GaussianModel.multi_gaussian(self.x, *full_params)
         else:
             peak_params = full_params[:n_peaks*3]
             baseline_params = full_params[n_peaks*3:]
-            fit_y = GaussianModel.multi_gaussian_with_baseline(
+            fit_y_norm = GaussianModel.multi_gaussian_with_baseline(
                 self.x, n_peaks, peak_params, baseline_params, self.baseline_method
             )
         
-        return fit_y
+        return fit_y_norm
     
     def remove_peak(self, peak_id):
         """Remove a peak"""
@@ -2458,7 +2454,7 @@ class GaussianDeconvolver:
         if self.components:
             current_params = []
             for c in self.components:
-                current_params.extend([c['amp'], c['cen_log'], c['sigma_log']])
+                current_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
         else:
             return False
         
@@ -2467,7 +2463,7 @@ class GaussianDeconvolver:
             new_params = []
             for i, c in enumerate(self.components):
                 if i != remove_id - 1:
-                    new_params.extend([c['amp'], c['cen_log'], c['sigma_log']])
+                    new_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
             current_params = new_params
             st.session_state.app_state.pending_remove = None
         
@@ -2478,8 +2474,8 @@ class GaussianDeconvolver:
             new_params = []
             for i, c in enumerate(self.components):
                 if i == peak_id - 1:
-                    amp1 = c['amp'] * 0.6
-                    amp2 = c['amp'] * 0.4
+                    amp1 = c['amp_norm'] * 0.6
+                    amp2 = c['amp_norm'] * 0.4
                     
                     cen1 = split_position - c['sigma_log'] * 0.3
                     cen2 = split_position + c['sigma_log'] * 0.3
@@ -2493,7 +2489,7 @@ class GaussianDeconvolver:
                     new_params.extend([amp1, cen1, sigma1])
                     new_params.extend([amp2, cen2, sigma2])
                 else:
-                    new_params.extend([c['amp'], c['cen_log'], c['sigma_log']])
+                    new_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
             
             current_params = new_params
             st.session_state.app_state.pending_split = None
@@ -2507,6 +2503,35 @@ class GaussianDeconvolver:
             progress_callback=progress_callback
         )
     
+    def remove_peak_by_id(self, peak_id):
+        """Remove a peak by its ID"""
+        if st.session_state.app_state.peak_info is None:
+            return False
+        
+        peak_to_remove = None
+        for i, info in enumerate(st.session_state.app_state.peak_info):
+            if info.get('id', i+1) == peak_id or i+1 == peak_id:
+                peak_to_remove = i
+                break
+        
+        if peak_to_remove is None:
+            return False
+        
+        removed_peak = st.session_state.app_state.peak_info.pop(peak_to_remove)
+        
+        if st.session_state.app_state.initial_peak_params is not None:
+            start_idx = peak_to_remove * 3
+            del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
+        
+        if removed_peak.get('source') == 'manual':
+            st.session_state.app_state.manual_peaks = [p for p in st.session_state.app_state.manual_peaks 
+                                                        if p.get('x_linear') != removed_peak.get('x_linear')]
+        elif removed_peak.get('source') == 'residuals':
+            st.session_state.app_state.residuals_peaks = [p for p in st.session_state.app_state.residuals_peaks 
+                                                           if p.get('x_linear') != removed_peak.get('x_linear')]
+        
+        return True
+    
     def create_deconvolution_result(self) -> DeconvolutionResult:
         """Create result container from current components"""
         peaks = []
@@ -2516,22 +2541,22 @@ class GaussianDeconvolver:
                 center=c['cen_linear'],
                 center_log=c['cen_log'],
                 amplitude=c['amp'],
-                amplitude_norm=c['amp'] / (self.total_area if self.total_area > 0 else 1.0),
+                amplitude_norm=c['amp_norm'],
                 sigma_log=c['sigma_log'],
                 fwhm=c['fwhm'],
                 area=c['area'],
                 fraction=c['fraction'],
                 fraction_percent=c['fraction_percent'],
                 source=c.get('source', 'auto'),
-                y_norm=c['y'] / (np.max(c['y']) if np.max(c['y']) > 0 else 1.0)
+                y_norm=c['y_norm']
             )
             peaks.append(peak)
         
         return DeconvolutionResult(
             peaks=peaks,
-            fit_y_norm=self.fit_y if self.fit_y is not None else np.zeros_like(self.x),
+            fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
-            y_norm=self.y_for_fitting,
+            y_norm=self.y_norm,
             y_original=self.y_original,
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
@@ -2642,41 +2667,26 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
 
 def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None,
                        title: str = "Distribution of Relaxation Times") -> plt.Figure:
-    """Create publication-quality DRT plot with correct physical scaling"""
+    """Create publication-quality DRT plot with both tau and frequency axes"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
-    # Use correctly scaled gamma for plotting
-    gamma_plot = result.get_gamma_for_plotting()
-    
     if result.gamma_std is not None:
-        # Scale uncertainty as well
-        scaling_factor = result.R_pol / result.get_integral_ln() if result.get_integral_ln() > 0 else 1.0
-        gamma_std_plot = result.gamma_std * scaling_factor if result.gamma_std is not None else None
-        
-        if gamma_std_plot is not None:
-            ax1.fill_between(result.tau_grid, gamma_plot - 2*gamma_std_plot, 
-                            gamma_plot + 2*gamma_std_plot,
-                            alpha=0.3, color='gray', label='±2σ uncertainty')
-    
-    ax1.semilogx(result.tau_grid, gamma_plot, '-', linewidth=2, color='#2ca02c', label='DRT')
+        ax1.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
+                        result.gamma + 2*result.gamma_std,
+                        alpha=0.3, color='gray', label='±2σ uncertainty')
+    ax1.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
     
     if peaks and len(peaks) > 0:
-        # Get peaks in the correct scale
         peak_tau = [p['tau'] for p in peaks]
-        # For peak detection, we need to find peaks in the scaled gamma
-        # Re-detect peaks on scaled gamma for accurate amplitude
-        peaks_scaled = find_peaks_drt(result.tau_grid, gamma_plot, prominence=0.05)
-        peak_drt = [p['amplitude'] for p in peaks_scaled] if peaks_scaled else []
+        peak_drt = [p['amplitude'] for p in peaks]
+        ax1.plot(peak_tau, peak_drt, 'rv', markersize=8, label='Detected peaks')
         
-        if peaks_scaled:
-            ax1.plot(peak_tau, peak_drt, 'rv', markersize=8, label='Detected peaks')
-            
-            for i, (t, d) in enumerate(zip(peak_tau, peak_drt)):
-                freq = 1/(2*np.pi*t)
-                ax1.annotate(f'τ={t:.2e}s\nf={freq:.2e}Hz',
-                           xy=(t, d), xytext=(t*1.5, d*1.2),
-                           fontsize=8, ha='center',
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
+        for i, (t, d) in enumerate(zip(peak_tau, peak_drt)):
+            freq = 1/(2*np.pi*t)
+            ax1.annotate(f'τ={t:.2e}s\nf={freq:.2e}Hz',
+                       xy=(t, d), xytext=(t*1.5, d*1.2),
+                       fontsize=8, ha='center',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
     ax1.set_xlabel(r"Relaxation Time $\tau$ / s", fontweight='bold')
     ax1.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
@@ -2684,37 +2694,32 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     ax1.legend(loc='best', frameon=True)
     ax1.grid(True, alpha=0.3, linestyle='--', which='both')
     
-    # Second plot with frequency axis
     frequencies = 1 / (2 * np.pi * result.tau_grid)
     sort_idx = np.argsort(frequencies)[::-1]
     freqs_sorted = frequencies[sort_idx]
-    gamma_sorted = gamma_plot[sort_idx]
+    gamma_sorted = result.gamma[sort_idx]
     
-    if result.gamma_std is not None and gamma_std_plot is not None:
-        gamma_std_sorted = gamma_std_plot[sort_idx]
+    if result.gamma_std is not None:
+        gamma_std_sorted = result.gamma_std[sort_idx]
         ax2.fill_between(freqs_sorted, gamma_sorted - 2*gamma_std_sorted, 
                         gamma_sorted + 2*gamma_std_sorted,
                         alpha=0.3, color='gray', label='±2σ uncertainty')
-    
     ax2.semilogx(freqs_sorted, gamma_sorted, '-', linewidth=2, color='#2ca02c', label='DRT')
     
     if peaks and len(peaks) > 0:
-        # Use scaled peaks for frequency plot
-        peaks_scaled = find_peaks_drt(result.tau_grid, gamma_plot, prominence=0.05)
-        if peaks_scaled:
-            peak_freqs = [1/(2*np.pi*p['tau']) for p in peaks_scaled]
-            peak_amplitudes = [p['amplitude'] for p in peaks_scaled]
-            peak_pairs = sorted(zip(peak_freqs, peak_amplitudes), key=lambda x: x[0], reverse=True)
-            peak_freqs_sorted, peak_amplitudes_sorted = zip(*peak_pairs) if peak_pairs else ([], [])
-            
-            ax2.plot(peak_freqs_sorted, peak_amplitudes_sorted, 'rv', markersize=8, label='Detected peaks')
-            
-            for i, (f, d) in enumerate(zip(peak_freqs_sorted, peak_amplitudes_sorted)):
-                tau_val = 1/(2*np.pi*f)
-                ax2.annotate(f'f={f:.2e}Hz\nτ={tau_val:.2e}s',
-                           xy=(f, d), xytext=(f*1.5, d*1.2),
-                           fontsize=8, ha='center',
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
+        peak_freqs = [p['frequency'] for p in peaks]
+        peak_amplitudes = [p['amplitude'] for p in peaks]
+        peak_pairs = sorted(zip(peak_freqs, peak_amplitudes), key=lambda x: x[0], reverse=True)
+        peak_freqs_sorted, peak_amplitudes_sorted = zip(*peak_pairs) if peak_pairs else ([], [])
+        
+        ax2.plot(peak_freqs_sorted, peak_amplitudes_sorted, 'rv', markersize=8, label='Detected peaks')
+        
+        for i, (f, d) in enumerate(zip(peak_freqs_sorted, peak_amplitudes_sorted)):
+            tau_val = 1/(2*np.pi*f)
+            ax2.annotate(f'f={f:.2e}Hz\nτ={tau_val:.2e}s',
+                       xy=(f, d), xytext=(f*1.5, d*1.2),
+                       fontsize=8, ha='center',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
     ax2.set_xlabel("Frequency / Hz", fontweight='bold')
     ax2.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
@@ -2726,8 +2731,7 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     ax2.set_xlim(freqs_sorted[0], freqs_sorted[-1])
     ax2.xaxis.set_minor_locator(AutoMinorLocator())
     
-    # Add note about correct scaling
-    fig.suptitle(title + f"\n∫γ d(ln τ) = {result.R_pol:.4f} Ω", fontweight='bold', fontsize=12)
+    fig.suptitle(title, fontweight='bold', fontsize=14)
     plt.tight_layout()
     
     return fig
@@ -3202,9 +3206,6 @@ def step2_drt_analysis():
             
             result = st.session_state.app_state.drt_result
             
-            # Use correctly scaled gamma for display
-            gamma_plot = result.get_gamma_for_plotting()
-            
             # Display basic info
             col_a, col_b, col_c = st.columns(3)
             with col_a:
@@ -3216,7 +3217,8 @@ def step2_drt_analysis():
             
             # Display integral information
             integral_ln = result.get_integral_ln()
-            scaled_integral = np.trapezoid(gamma_plot, np.log(result.tau_grid))
+            integral_log10 = result.get_integral_log10()
+            expected_ln = result.R_pol
             
             st.markdown("---")
             st.subheader("📐 Integral Validation")
@@ -3224,10 +3226,10 @@ def step2_drt_analysis():
             col_d, col_e, col_f = st.columns(3)
             with col_d:
                 st.metric("∫ γ d(ln τ)", f"{integral_ln:.4f} Ω")
-                st.caption(f"Expected: {result.R_pol:.4f} Ω")
+                st.caption(f"Expected: {expected_ln:.4f} Ω")
             with col_e:
-                ratio = integral_ln / result.R_pol if result.R_pol > 0 else 0
-                st.metric("Raw Ratio", f"{ratio:.4f}")
+                ratio = integral_ln / expected_ln if expected_ln > 0 else 0
+                st.metric("Ratio", f"{ratio:.4f}")
                 if abs(ratio - 1.0) < 0.05:
                     st.success("✓ Correctly scaled")
                 elif abs(ratio - 1.0) < 0.1:
@@ -3235,9 +3237,8 @@ def step2_drt_analysis():
                 else:
                     st.error("✗ Scaling issue detected")
             with col_f:
-                st.metric("After Scaling", f"{scaled_integral:.4f} Ω")
-                if abs(scaled_integral - result.R_pol) < 1e-6:
-                    st.success("✓ Scale corrected")
+                st.metric("∫ γ d(log₁₀τ)", f"{integral_log10:.4f} Ω")
+                st.caption(f"= R_pol/ln(10) = {expected_ln/2.3026:.4f} Ω")
             
             # Display validation if available
             if 'validation' in result.metadata:
@@ -3272,15 +3273,15 @@ def step2_drt_analysis():
                 with st.expander("📋 Detailed Validation Report"):
                     st.code(result.get_validation_report(), language='text')
             
-            # Display peaks detected on correctly scaled DRT
-            peaks = find_peaks_drt(result.tau_grid, gamma_plot, prominence=0.05)
+            # Display peaks
+            peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
             
-            # Plot DRT with correct physical scale
+            # Plot DRT with correct scaling note
             fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
             plt.close()
             
-            st.caption(f"✓ γ(τ) is properly scaled: ∫γ d(ln τ) = {scaled_integral:.4f} Ω = R_pol")
+            st.caption("Note: γ(τ) is defined per unit ln τ. Area under curve equals R_pol.")
             
             col_prev, col_next = st.columns(2)
             with col_prev:
@@ -3311,29 +3312,31 @@ def step3_gaussian_deconvolution():
     
     drt_result = st.session_state.app_state.drt_result
     
-    # Use correctly scaled gamma for deconvolution (∫γ d(ln τ) = R_pol)
-    gamma_correct = drt_result.get_scaled_gamma_for_deconvolution()
+    # Get correctly scaled gamma for deconvolution
+    # This ensures that total area under peaks equals R_pol
+    gamma_scaled = drt_result.get_scaled_gamma_for_deconvolution()
     log_tau = np.log10(drt_result.tau_grid)
     
     # Show scaling info
     with st.expander("ℹ️ DRT Scaling Information", expanded=False):
         integral_ln = drt_result.get_integral_ln()
-        scaled_integral = np.trapezoid(gamma_correct, np.log(drt_result.tau_grid))
+        integral_log10 = drt_result.get_integral_log10()
+        scaling_factor = drt_result.R_pol / integral_ln if integral_ln > 0 else 1.0
         
         st.info(f"""
         **DRT Scaling Details:**
-        - Raw ∫ γ d(ln τ): {integral_ln:.4f} Ω
+        - Original ∫ γ d(ln τ): {integral_ln:.4f} Ω
         - Expected ∫ γ d(ln τ) (R_pol): {drt_result.R_pol:.4f} Ω
-        - Corrected ∫ γ d(ln τ): {scaled_integral:.4f} Ω
+        - Applied scaling factor: {scaling_factor:.4f}
         
-        DRT is now properly scaled: area under γ(τ) equals R_pol = {drt_result.R_pol:.4f} Ω.
-        Gaussian deconvolution will use this physically correct distribution.
+        After scaling, the area under γ(τ) correctly represents R_pol = {drt_result.R_pol:.4f} Ω.
+        Gaussian deconvolution will use the scaled distribution.
         """)
     
-    # Create deconvolver with correctly scaled gamma
+    # Create deconvolver with scaled gamma
     deconvolver = GaussianDeconvolver(
         x_linear=drt_result.tau_grid,
-        y_original=gamma_correct,  # Use correctly scaled gamma
+        y_original=gamma_scaled,  # Use scaled gamma
         use_log_x=True,
         use_log_y=False,
         clip_negative=st.session_state.app_state.clip_negative,
@@ -3407,7 +3410,7 @@ def step3_gaussian_deconvolution():
                     st.session_state.app_state.initial_peak_params = []
                 st.session_state.app_state.initial_peak_params.extend(new_params)
                 st.session_state.app_state.manual_peaks.append(new_peak)
-                st.success(f"Manual peak added at τ = {manual_position:.3e} s with amplitude = {new_peak['amp_est']:.4e} Ω")
+                st.success(f"Manual peak added at τ = {manual_position:.3e} s")
                 st.rerun()
         
         with col_add2:
@@ -3509,15 +3512,15 @@ def step3_gaussian_deconvolution():
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
-            # Plot correctly scaled DRT data
+            # Plot scaled DRT data
             ax.plot(deconvolver.x_linear, deconvolver.y_original, 
                    'o-', markersize=3, linewidth=1, alpha=0.7, 
-                   label='Correctly Scaled DRT Data', color='black', zorder=1)
+                   label='Scaled DRT Data', color='black', zorder=1)
             
             # Add reference line for expected total area
             expected_area = drt_result.R_pol
             ax.axhline(y=expected_area / (np.max(deconvolver.x_linear) - np.min(deconvolver.x_linear)) * 0.1,
-                      color='gray', linestyle=':', alpha=0.5, label=f'R_pol = {expected_area:.3f} Ω')
+                      color='gray', linestyle=':', alpha=0.5, label=f'Expected R_pol = {expected_area:.3f} Ω')
             
             source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
             for idx, info in enumerate(st.session_state.app_state.peak_info):
@@ -3527,8 +3530,8 @@ def step3_gaussian_deconvolution():
                        markersize=8, markeredgecolor='darkred', 
                        markerfacecolor=color, zorder=3)
                 ax.text(info['x_linear'], info.get('y_original', info.get('y', 0)) * 1.05, 
-                       f'τ={info["x_linear"]:.2e}s\nγ={info.get("amp_est", 0):.3e}Ω', 
-                       ha='center', fontsize=7, rotation=45)
+                       f'τ={info["x_linear"]:.2e}s', ha='center', 
+                       fontsize=8, rotation=45)
             
             if st.session_state.app_state.manual_peak_position is not None:
                 idx = np.argmin(np.abs(deconvolver.x_linear - st.session_state.app_state.manual_peak_position))
@@ -3540,19 +3543,19 @@ def step3_gaussian_deconvolution():
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
             ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')
-            ax.set_title(f'Correctly Scaled DRT with Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
+            ax.set_title(f'Detected Peaks on Scaled DRT ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
             ax.legend(loc='upper left')
             ax.grid(True, alpha=0.3, linestyle='--')
             
             st.pyplot(fig)
             plt.close()
             
-            # Peak info table with physical amplitudes
+            # Peak info table
             if st.session_state.app_state.peak_info:
-                st.subheader("Peak List (Physical Scale)")
+                st.subheader("Peak List")
                 
                 for i, info in enumerate(st.session_state.app_state.peak_info):
-                    col_a, col_b, col_c, col_d, col_e, col_f = st.columns([0.5, 2, 2.5, 2, 2, 1])
+                    col_a, col_b, col_c, col_d, col_e = st.columns([0.5, 2, 2, 2, 1])
                     source = info.get('source', 'auto')
                     source_icon = "🟢" if source == 'auto' else "🟠" if source == 'manual' else "🔵"
                     
@@ -3563,11 +3566,9 @@ def step3_gaussian_deconvolution():
                     with col_c:
                         st.write(f"τ = {info['x_linear']:.4e} s")
                     with col_d:
-                        st.write(f"γ = {info.get('amp_est', 0):.4e} Ω")
+                        y_value = info.get('y_original', info.get('y', 0))
+                        st.write(f"γ = {y_value:.4e} Ω")
                     with col_e:
-                        freq = 1/(2*np.pi*info['x_linear'])
-                        st.write(f"f = {freq:.2e} Hz")
-                    with col_f:
                         if st.button("🗑️", key=f"delete_peak_{i}", help=f"Delete peak {i+1}"):
                             if deconvolver.remove_peak_by_id(i+1):
                                 st.success(f"Peak {i+1} removed")
@@ -3592,7 +3593,7 @@ def step3_gaussian_deconvolution():
 # ============================================================================
 
 def step4_results():
-    """Step 4: Display results, tables, and export options with consistent scaling"""
+    """Step 4: Display results, tables, and export options"""
     st.header("📊 Step 4: Results and Export")
     
     if st.session_state.app_state.deconv_result is None:
@@ -3603,7 +3604,6 @@ def step4_results():
         return
     
     deconv_result = st.session_state.app_state.deconv_result
-    drt_result = st.session_state.app_state.drt_result
     
     # Navigation buttons
     col_prev, col_next = st.columns([1, 5])
@@ -3614,34 +3614,24 @@ def step4_results():
     
     st.markdown("---")
     
-    # Display scaling verification
-    if drt_result is not None:
-        st.info(f"**Scale Verification:** DRT is correctly scaled with ∫γ d(ln τ) = {drt_result.R_pol:.4f} Ω")
-        if deconv_result.total_area > 0:
-            area_ratio = deconv_result.total_area / drt_result.R_pol if drt_result.R_pol > 0 else 0
-            if abs(area_ratio - 1.0) < 0.05:
-                st.success(f"✓ Deconvolution area ({deconv_result.total_area:.4f} Ω) matches R_pol")
-            else:
-                st.warning(f"⚠ Deconvolution area ({deconv_result.total_area:.4f} Ω) differs from R_pol ({drt_result.R_pol:.4f} Ω)")
-    
     # Tabs for different views
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Deconvolution Plot", "📊 Area Distribution", "📋 Complete Dataset", 
                                              "📈 Normalized View", "📥 Export"])
     
     with tab1:
-        st.subheader("Gaussian Deconvolution Result (Physical Scale)")
+        st.subheader("Gaussian Deconvolution Result")
         
         fig, ax = plt.subplots(figsize=(12, 7))
         
-        # Apply log scale if needed
+        # Применяем логарифмическую шкалу если нужно
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        # Original DRT data - already correctly scaled
+        # Оригинальные данные - они уже в правильном масштабе (7 Ом)
         ax.scatter(deconv_result.x_linear, deconv_result.y_original, 
-                   s=15, alpha=0.5, color='black', label='DRT Data (correctly scaled)', zorder=1)
+                   s=15, alpha=0.5, color='black', label='Original DRT Data', zorder=1)
         
-        # Create dense grid for smooth curves
+        # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
             x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
             x_max = np.max(deconv_result.x_linear)
@@ -3652,14 +3642,14 @@ def step4_results():
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
-        # Draw components (Gaussians) in physical scale
+        # Рисуем компоненты (гауссианы) в оригинальном масштабе
         if deconv_result.peaks:
             colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
             for peak, color in zip(deconv_result.peaks, colors):
-                # Use physical amplitude directly
+                # Используем оригинальную амплитуду peak.amplitude (уже в Омах)
                 y_component = peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 
-                    1.0,  # shape with amplitude 1
+                    1.0,  # форма с амплитудой 1
                     peak.center_log, 
                     peak.sigma_log
                 )
@@ -3669,7 +3659,7 @@ def step4_results():
                 ax.plot(x_dense, y_component, '-', color=color, linewidth=2,
                        label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
         
-        # Draw baseline if present
+        # Рисуем базовую линию если есть
         if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
             if deconv_result.baseline_method == 'constant':
                 y_baseline = np.full_like(x_dense, deconv_result.baseline_params[0])
@@ -3683,16 +3673,16 @@ def step4_results():
                              deconv_result.baseline_params[2] * x_dense_log**2)
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
-        # Draw total fit - sum all components
+        # Рисуем общую сумму - используем сумму компонент
         if deconv_result.peaks:
-            # Sum all components
+            # Суммируем все компоненты
             y_total = np.zeros_like(x_dense)
             for peak in deconv_result.peaks:
                 y_total += peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )
             
-            # Add baseline if present
+            # Добавляем базовую линию если есть
             if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
                 if deconv_result.baseline_method == 'constant':
                     y_total += deconv_result.baseline_params[0]
@@ -3707,15 +3697,14 @@ def step4_results():
         
         ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
         ax.set_ylabel('γ(τ) (Ω)', fontweight='bold', fontsize=12)
-        ax.set_title('Gaussian Deconvolution of DRT Spectrum (Physical Scale)', fontweight='bold', fontsize=14)
+        ax.set_title('Gaussian Deconvolution of DRT Spectrum', fontweight='bold', fontsize=14)
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
         
-        # Add quality metrics
+        # Добавляем метрики качества
         if deconv_result.quality_metrics:
             metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
-            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e} Ω\n"
-            metrics_text += f"Total Area = {deconv_result.total_area:.4e} Ω"
+            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
             ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
@@ -3779,33 +3768,30 @@ def step4_results():
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Area (R_pol)", f"{deconv_result.total_area:.4f} Ω")
-            if drt_result:
-                st.caption(f"Expected: {drt_result.R_pol:.4f} Ω")
+            st.metric("Total Area", f"{deconv_result.total_area:.4e}")
         with col2:
             st.metric("Number of Peaks", len(deconv_result.peaks))
         with col3:
             max_peak = max(deconv_result.peaks, key=lambda p: p.fraction)
             st.metric("Dominant Peak", f"Peak {max_peak.id} ({max_peak.fraction_percent:.1f}%)")
-            st.caption(f"Amplitude: {max_peak.amplitude:.4e} Ω")
         with col4:
             avg_area = deconv_result.total_area / len(deconv_result.peaks) if deconv_result.peaks else 0
-            st.metric("Average Area", f"{avg_area:.4e} Ω·s")
+            st.metric("Average Area", f"{avg_area:.4e}")
     
     with tab3:
-        st.subheader("Complete Dataset - Peak Parameters (Physical Scale)")
+        st.subheader("Complete Dataset - Peak Parameters")
         
         # Create detailed table
         data = []
         for peak in deconv_result.peaks:
-            freq = 1 / (2 * np.pi * peak.center)
             data.append({
                 'Peak ID': peak.id,
-                'Center τ (s)': f"{peak.center:.4e}",
-                'Frequency (Hz)': f"{freq:.4e}",
+                'Center (τ, s)': f"{peak.center:.4e}",
+                'Center (log τ)': f"{peak.center_log:.4f}",
                 'Amplitude (Ω)': f"{peak.amplitude:.4e}",
-                'Sigma (log τ)': f"{peak.sigma_log:.4f}",
-                'FWHM (log τ)': f"{peak.fwhm:.4f}",
+                'Amplitude (norm)': f"{peak.amplitude_norm:.4f}",
+                'Sigma (log)': f"{peak.sigma_log:.4f}",
+                'FWHM': f"{peak.fwhm:.4f}",
                 'Area (Ω·s)': f"{peak.area:.4e}",
                 'Fraction (%)': f"{peak.fraction_percent:.2f}",
                 'Source': peak.source
@@ -3822,7 +3808,7 @@ def step4_results():
         with col1:
             st.metric("R²", f"{metrics.get('R²', 0):.6f}")
         with col2:
-            st.metric("RMSE", f"{metrics.get('RMSE', 0):.2e} Ω")
+            st.metric("RMSE", f"{metrics.get('RMSE', 0):.2e}")
         with col3:
             st.metric("AIC", f"{metrics.get('AIC', 0):.2f}")
         with col4:
@@ -3833,7 +3819,7 @@ def step4_results():
             st.subheader("Baseline Parameters")
             baseline_df = pd.DataFrame([{
                 'Method': deconv_result.baseline_method,
-                'Parameters (Ω)': ', '.join([f"{p:.4e}" for p in deconv_result.baseline_params])
+                'Parameters': ', '.join([f"{p:.4e}" for p in deconv_result.baseline_params])
             }])
             st.dataframe(baseline_df, use_container_width=True)
     
@@ -3842,20 +3828,20 @@ def step4_results():
         
         fig, ax = plt.subplots(figsize=(12, 7))
         
-        # Apply log scale if needed
+        # Применяем логарифмическую шкалу если нужно
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        # Find maximum amplitude for normalization
+        # Находим максимальную амплитуду для нормализации
         max_amp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
         
-        # Normalized original data
+        # Нормализованные оригинальные данные
         y_original_norm = deconv_result.y_original / max_amp
         
         ax.scatter(deconv_result.x_linear, y_original_norm, 
-                   s=15, alpha=0.5, color='black', label='DRT Data (normalized)', zorder=1)
+                   s=15, alpha=0.5, color='black', label='Original DRT Data (normalized)', zorder=1)
         
-        # Create dense grid for smooth curves
+        # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
             x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
             x_max = np.max(deconv_result.x_linear)
@@ -3866,11 +3852,11 @@ def step4_results():
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
-        # Draw normalized components
+        # Рисуем нормализованные компоненты (гауссианы)
         if deconv_result.peaks:
             colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
             for peak, color in zip(deconv_result.peaks, colors):
-                # Normalize component
+                # Нормализуем компоненту (делим на максимальную амплитуду)
                 y_component_norm = (peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 
                     1.0,
@@ -3883,7 +3869,7 @@ def step4_results():
                 ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
                        label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
         
-        # Draw normalized baseline
+        # Рисуем нормализованную базовую линию если есть
         if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
             if deconv_result.baseline_method == 'constant':
                 y_baseline_norm = deconv_result.baseline_params[0] / max_amp
@@ -3898,7 +3884,7 @@ def step4_results():
                                   deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
                 ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
-        # Draw normalized total fit
+        # Рисуем нормализованную общую сумму
         if deconv_result.peaks:
             y_total_norm = np.zeros_like(x_dense)
             for peak in deconv_result.peaks:
@@ -3925,10 +3911,10 @@ def step4_results():
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
         
-        # Add metrics
+        # Добавляем метрики качества
         if deconv_result.quality_metrics:
             metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
-            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e} Ω"
+            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
             ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
@@ -3937,8 +3923,8 @@ def step4_results():
         st.pyplot(fig)
         plt.close()
         
-        # Add explanation
-        st.caption(f"Normalized to maximum γ_max = {max_amp:.4e} Ω (physical scale)")
+        # Добавляем пояснение
+        st.caption(f"Нормализовано к максимальному значению γ_max = {max_amp:.4e} Ω")
     
     with tab5:
         st.subheader("Export Results")
@@ -3948,14 +3934,15 @@ def step4_results():
         with col1:
             st.markdown("**Export Peak Data**")
             
-            # Create peaks DataFrame with physical units
+            # Create peaks DataFrame
             peaks_df = pd.DataFrame([{
                 'Peak_ID': p.id,
                 'Center_tau_s': p.center,
-                'Frequency_Hz': 1/(2*np.pi*p.center),
+                'Center_log_tau': p.center_log,
                 'Amplitude_Ohm': p.amplitude,
-                'Sigma_log_tau': p.sigma_log,
-                'FWHM_log_tau': p.fwhm,
+                'Amplitude_Normalized': p.amplitude_norm,
+                'Sigma_log': p.sigma_log,
+                'FWHM': p.fwhm,
                 'Area_Ohm_s': p.area,
                 'Fraction': p.fraction,
                 'Fraction_Percent': p.fraction_percent,
@@ -3973,8 +3960,8 @@ def step4_results():
             
             st.markdown("**Export Fitting Data**")
             
-            # Create fitting data DataFrame - use physical units
-            # Reconstruct fit for each point
+            # Create fitting data DataFrame - используем оригинальные значения
+            # Реконструируем fit для каждой точки
             fit_values = np.zeros_like(deconv_result.x_linear)
             for i, tau in enumerate(deconv_result.x_linear):
                 if deconv_result.use_log_x:
@@ -3982,14 +3969,14 @@ def step4_results():
                 else:
                     log_tau = tau
                 
-                # Sum all components
+                # Суммируем все компоненты
                 total = 0
                 for peak in deconv_result.peaks:
                     total += peak.amplitude * GaussianModelDeconv.gaussian(
                         log_tau, 1.0, peak.center_log, peak.sigma_log
                     )
                 
-                # Add baseline
+                # Добавляем базовую линию
                 if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
                     if deconv_result.baseline_method == 'constant':
                         total += deconv_result.baseline_params[0]
@@ -4026,13 +4013,12 @@ def step4_results():
             if st.button("📄 Generate Detailed Report", use_container_width=True):
                 max_amp = max([p.amplitude for p in deconv_result.peaks]) if deconv_result.peaks else 1.0
                 
-                report = f"""GAUSSIAN DECONVOLUTION REPORT (Physical Scale)
+                report = f"""GAUSSIAN DECONVOLUTION REPORT
 {"="*80}
 
 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Number of points: {len(deconv_result.x_linear)}
 τ range: [{deconv_result.x_linear[0]:.2e}, {deconv_result.x_linear[-1]:.2e}] s
-R_pol (total area): {deconv_result.total_area:.6e} Ω
 Logarithmic X scale: {deconv_result.use_log_x}
 Baseline method: {deconv_result.baseline_method}
 Smoothing level: {st.session_state.app_state.smoothing_level}
@@ -4043,32 +4029,31 @@ R²: {deconv_result.quality_metrics.get('R²', 0):.6f}
 AIC: {deconv_result.quality_metrics.get('AIC', 0):.2f}
 BIC: {deconv_result.quality_metrics.get('BIC', 0):.2f}
 χ²: {deconv_result.quality_metrics.get('χ²', 0):.2e}
-RMSE: {deconv_result.quality_metrics.get('RMSE', 0):.2e} Ω
-Max Error: {deconv_result.quality_metrics.get('Max Error', 0):.2e} Ω
+RMSE: {deconv_result.quality_metrics.get('RMSE', 0):.2e}
+Max Error: {deconv_result.quality_metrics.get('Max Error', 0):.2e}
 
 """
                 if deconv_result.baseline_method != 'none':
                     report += f"""BASELINE PARAMETERS:
 {"-"*40}
 Method: {deconv_result.baseline_method}
-Parameters (Ω): {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
+Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
 
 """
                 
-                report += f"""PEAK PARAMETERS (Physical Scale):
+                report += f"""PEAK PARAMETERS:
 {"-"*80}
-ID    τ (s)           f (Hz)          Amplitude (Ω)   Area (Ω·s)      Fraction(%)
+ID    Center (s)      Amplitude (Ω)    Area (Ω·s)       Fraction(%)
 {"-"*80}"""
                 
                 for p in deconv_result.peaks:
-                    freq = 1/(2*np.pi*p.center)
-                    report += f"\n{p.id:<4} {p.center:.4e}   {freq:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
+                    report += f"\n{p.id:<4} {p.center:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
                 
                 report += f"""
 
-NORMALIZED PARAMETERS (Max Peak Amplitude = 1):
+NORMALIZED PARAMETERS (Max Peak = 1):
 {"-"*80}
-ID    τ (s)           Norm. Amplitude    Original Amplitude    Fraction(%)
+ID    Center (s)      Norm. Amplitude    Original Amplitude    Fraction(%)
 {"-"*80}"""
                 
                 for p in deconv_result.peaks:
@@ -4077,7 +4062,7 @@ ID    τ (s)           Norm. Amplitude    Original Amplitude    Fraction(%)
                 
                 report += f"""
 {"="*80}
-Total Area (R_pol): {deconv_result.total_area:.6e} Ω·s
+Total Area: {deconv_result.total_area:.6e} Ω·s
 Maximum Amplitude: {max_amp:.6e} Ω
 Number of Peaks: {len(deconv_result.peaks)}
 {"="*80}"""
