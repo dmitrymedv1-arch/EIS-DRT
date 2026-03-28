@@ -3944,23 +3944,36 @@ def step4_results():
                     try:
                         # Create Excel file with multiple sheets
                         output = io.BytesIO()
-                        
+
                         with pd.ExcelWriter(output, engine='openpyxl') as writer:
                             # Sheet 1: Impedance Data
                             df_impedance = create_impedance_data_sheet(data, solver, drt_result)
+                            # Ensure dataframe is not empty
+                            if df_impedance.empty:
+                                df_impedance = pd.DataFrame({'Note': ['No impedance data available']})
                             df_impedance.to_excel(writer, sheet_name='Impedance Data', index=False)
                             
                             # Sheet 2: DRT Spectrum
                             df_drt = create_drt_spectrum_sheet(drt_result)
+                            if df_drt.empty:
+                                df_drt = pd.DataFrame({'Note': ['No DRT spectrum data available']})
                             df_drt.to_excel(writer, sheet_name='DRT Spectrum', index=False)
                             
                             # Sheet 3: Gaussian Deconvolution
                             df_deconv = create_deconvolution_sheet(deconv_result)
+                            if df_deconv.empty:
+                                df_deconv = pd.DataFrame({'Note': ['No deconvolution data available']})
                             df_deconv.to_excel(writer, sheet_name='Gaussian Deconvolution', index=False)
                             
                             # Sheet 4: Analysis Report
                             df_report = create_analysis_report_sheet(deconv_result, drt_result)
+                            if df_report.empty:
+                                df_report = pd.DataFrame({'Note': ['No analysis report data available']})
                             df_report.to_excel(writer, sheet_name='Analysis Report', index=False)
+                            
+                            # Set the first sheet as active
+                            workbook = writer.book
+                            workbook.active = workbook['Impedance Data']
                             
                             # Apply formatting to all sheets
                             format_excel_sheets(writer)
@@ -3995,6 +4008,10 @@ def create_impedance_data_sheet(data: ImpedanceData, solver, drt_result: DRTResu
     Create DataFrame for Impedance Data sheet.
     Includes original and reconstructed impedance data for Nyquist and Bode plots.
     """
+    # Check if data is valid
+    if data is None or len(data.freq) == 0:
+        return pd.DataFrame({'Note': ['No impedance data available']})
+        
     # Get reconstructed impedance from DRT
     if solver is not None and drt_result is not None:
         Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(drt_result.tau_grid, drt_result.gamma)
@@ -4066,6 +4083,10 @@ def create_drt_spectrum_sheet(drt_result: DRTResult) -> pd.DataFrame:
     Create DataFrame for DRT Spectrum sheet.
     Includes both τ and frequency representations.
     """
+    # Check if drt_result is valid
+    if drt_result is None or len(drt_result.tau_grid) == 0:
+        return pd.DataFrame({'Note': ['No DRT spectrum data available']})
+        
     # Calculate frequencies from tau
     frequencies = 1 / (2 * np.pi * drt_result.tau_grid)
     
@@ -4092,53 +4113,73 @@ def create_drt_spectrum_sheet(drt_result: DRTResult) -> pd.DataFrame:
     
     return df
 
-
 def create_deconvolution_sheet(deconv_result: DeconvolutionResult) -> pd.DataFrame:
     """
     Create DataFrame for Gaussian Deconvolution sheet.
     Includes original DRT, total fit, individual peaks, and baseline.
     Also includes interpolated data for smooth curves.
     """
+    # Check if deconv_result has valid data
+    if deconv_result is None or len(deconv_result.x_linear) == 0:
+        return pd.DataFrame({'Note': ['No deconvolution data available']})
+    
     # Create dense grid for smooth curves (1000 points)
-    if deconv_result.use_log_x:
-        x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
-        x_max = np.max(deconv_result.x_linear)
-        x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 1000)
-        x_dense_log = np.log10(x_dense)
-    else:
-        x_dense = np.linspace(np.min(deconv_result.x_linear), 
-                              np.max(deconv_result.x_linear), 1000)
-        x_dense_log = x_dense
+    try:
+        if deconv_result.use_log_x:
+            x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
+            x_max = np.max(deconv_result.x_linear)
+            if x_min >= x_max:
+                x_min = x_max / 100 if x_max > 0 else 1e-15
+            x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 1000)
+            x_dense_log = np.log10(x_dense)
+        else:
+            x_dense = np.linspace(np.min(deconv_result.x_linear), 
+                                  np.max(deconv_result.x_linear), 1000)
+            x_dense_log = x_dense
+    except Exception:
+        # Fallback if logspace fails
+        x_dense = deconv_result.x_linear
+        x_dense_log = deconv_result.x
     
     # Calculate total fit and individual peaks on dense grid
     total_fit_dense = np.zeros_like(x_dense)
     peaks_data = {}
     
-    if deconv_result.peaks:
+    if deconv_result.peaks and len(deconv_result.peaks) > 0:
         for peak in deconv_result.peaks:
-            y_peak = peak.amplitude * GaussianModelDeconv.gaussian(
-                x_dense_log, 1.0, peak.center_log, peak.sigma_log
-            )
-            total_fit_dense += y_peak
-            peaks_data[f'Peak_{peak.id}_Ohm'] = y_peak
+            try:
+                y_peak = peak.amplitude * GaussianModelDeconv.gaussian(
+                    x_dense_log, 1.0, peak.center_log, peak.sigma_log
+                )
+                total_fit_dense += y_peak
+                peaks_data[f'Peak_{peak.id}_Ohm'] = y_peak
+            except Exception:
+                peaks_data[f'Peak_{peak.id}_Ohm'] = np.zeros_like(x_dense)
         
         # Add baseline if present
         if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-            if deconv_result.baseline_method == 'constant':
-                baseline_dense = np.full_like(x_dense, deconv_result.baseline_params[0])
-            elif deconv_result.baseline_method == 'linear':
-                baseline_dense = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
-            elif deconv_result.baseline_method == 'quadratic':
-                baseline_dense = (deconv_result.baseline_params[0] + 
-                                 deconv_result.baseline_params[1] * x_dense_log +
-                                 deconv_result.baseline_params[2] * x_dense_log**2)
-            else:
-                baseline_dense = np.zeros_like(x_dense)
-            
-            total_fit_dense += baseline_dense
-            peaks_data['Baseline_Ohm'] = baseline_dense
+            try:
+                if deconv_result.baseline_method == 'constant':
+                    baseline_dense = np.full_like(x_dense, deconv_result.baseline_params[0])
+                elif deconv_result.baseline_method == 'linear':
+                    baseline_dense = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
+                elif deconv_result.baseline_method == 'quadratic':
+                    baseline_dense = (deconv_result.baseline_params[0] + 
+                                     deconv_result.baseline_params[1] * x_dense_log +
+                                     deconv_result.baseline_params[2] * x_dense_log**2)
+                else:
+                    baseline_dense = np.zeros_like(x_dense)
+                
+                total_fit_dense += baseline_dense
+                peaks_data['Baseline_Ohm'] = baseline_dense
+            except Exception:
+                peaks_data['Baseline_Ohm'] = np.zeros_like(x_dense)
         else:
             peaks_data['Baseline_Ohm'] = np.zeros_like(x_dense)
+    else:
+        # If no peaks, create empty arrays
+        total_fit_dense = np.zeros_like(x_dense)
+        peaks_data['Baseline_Ohm'] = np.zeros_like(x_dense)
     
     # Create DataFrame with original data (on original grid)
     df_original = pd.DataFrame({
@@ -4147,7 +4188,7 @@ def create_deconvolution_sheet(deconv_result: DeconvolutionResult) -> pd.DataFra
     })
     
     # Add fit values at original points if available
-    if deconv_result.fit_y_original is not None:
+    if deconv_result.fit_y_original is not None and len(deconv_result.fit_y_original) == len(deconv_result.x_linear):
         df_original['Total_Fit_original_Ohm'] = deconv_result.fit_y_original
     else:
         df_original['Total_Fit_original_Ohm'] = np.full_like(deconv_result.x_linear, np.nan)
@@ -4162,21 +4203,32 @@ def create_deconvolution_sheet(deconv_result: DeconvolutionResult) -> pd.DataFra
     # Add note column
     df_smooth['Note'] = 'Smooth curves for plotting (1000 points)'
     
-    # Combine dataframes with a separator row
-    separator = pd.DataFrame([['--- END OF ORIGINAL DATA ---'] * len(df_smooth.columns)], columns=df_smooth.columns)
-    
-    # Use concat to combine
-    df_combined = pd.concat([df_original, pd.DataFrame([[''] * len(df_original.columns)], columns=df_original.columns), 
-                             df_smooth], ignore_index=True)
+    # Combine dataframes
+    if len(df_original) > 0 and len(df_smooth) > 0:
+        # Create separator rows
+        separator_original = pd.DataFrame([['--- ORIGINAL DATA GRID ---'] + [''] * (len(df_original.columns) - 1)], 
+                                          columns=df_original.columns)
+        separator_smooth = pd.DataFrame([['--- SMOOTH CURVES (1000 points) ---'] + [''] * (len(df_smooth.columns) - 1)], 
+                                        columns=df_smooth.columns)
+        
+        # Combine
+        df_combined = pd.concat([separator_original, df_original, 
+                                pd.DataFrame([[''] * len(df_original.columns)], columns=df_original.columns),
+                                separator_smooth, df_smooth], ignore_index=True)
+    else:
+        df_combined = pd.DataFrame({'Note': ['No deconvolution data available for export']})
     
     return df_combined
-
 
 def create_analysis_report_sheet(deconv_result: DeconvolutionResult, drt_result: DRTResult) -> pd.DataFrame:
     """
     Create DataFrame for Analysis Report sheet.
     Includes peak parameters, quality metrics, and regularization parameters.
     """
+    # Check if we have any data
+    if deconv_result is None and drt_result is None:
+        return pd.DataFrame({'Note': ['No analysis data available']})
+        
     # Section 1: Peak Parameters (table format)
     peaks_data = []
     for peak in deconv_result.peaks:
