@@ -4745,6 +4745,16 @@ def create_export_excel(data: ImpedanceData, drt_result: DRTResult,
         
         df_summary = pd.DataFrame(summary_data, columns=['Parameter', 'Value'])
         df_summary.to_excel(writer, sheet_name='Report_Summary', index=False)
+        df_summary = pd.DataFrame(summary_data, columns=['Parameter', 'Value'])
+        df_summary.to_excel(writer, sheet_name='Report_Summary', index=False)
+        
+    # FIX: Ensure first sheet is visible and active
+    if writer.book.sheetnames:
+        writer.book[writer.book.sheetnames[0]].sheet_state = 'visible'
+            riter.book.active = writer.book[writer.book.sheetnames[0]]
+    
+    # Prepare download button
+    output.seek(0)
     
     output.seek(0)
     return output.getvalue()
