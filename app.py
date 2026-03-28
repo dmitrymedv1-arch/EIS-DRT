@@ -685,11 +685,11 @@ class DRTCore:
         else:
             R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
         self.R_pol = R_total - self.R_inf if R_total > self.R_inf else 1.0
-    
+
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Build kernel matrix for given time grid.
-        IMPORTANT: Kernels are NOT scaled here - scaling is handled separately
+        IMPORTANT: Kernels are scaled for integration over d(ln τ)
         """
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
@@ -697,26 +697,26 @@ class DRTCore:
         
         omega = 2 * np.pi * self.frequencies
         
-        # Do NOT pre-multiply by dln_tau here - kernels are for γ(τ) itself
-        # The integration ∫ γ(τ) d(ln τ) will be handled by the discretization scheme
-        # where γ(τ) is defined at grid points and integration is done via trapezoidal rule
+        # Calculate step in natural logarithm (ln) for proper integration
+        # d(ln τ) = d(log10 τ) * ln(10)
+        dln_tau = np.mean(np.diff(np.log(tau_grid)))  # This is the step in ln(τ)
         
         for i in range(self.N):
             for j in range(M):
                 # Standard DRT kernel for RC elements
                 denominator = 1 + (omega[i] * tau_grid[j])**2
                 
-                # K_real = 1 / (1 + ω²τ²) - this is the kernel for γ(τ) itself
-                K_real[i, j] = 1.0 / denominator
+                # K_real = 1 / (1 + ω²τ²) * d(ln τ)
+                K_real[i, j] = 1.0 / denominator * dln_tau
                 
-                # K_imag = -ωτ / (1 + ω²τ²) - this is the kernel for γ(τ) itself
-                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
+                # K_imag = -ωτ / (1 + ω²τ²) * d(ln τ)
+                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator * dln_tau
                 
                 if include_rl:
                     # For inductive loops: modify kernels
                     rl_denom = 1 + (omega[i] * tau_grid[j])**2
-                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
-                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
+                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom * dln_tau
+                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom * dln_tau
         
         return K_real, K_imag
     
