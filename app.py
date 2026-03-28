@@ -254,7 +254,6 @@ st.markdown("""
 # Data Classes for Results Storage
 # ============================================================================
 
-@dataclass
 class DRTResult:
     """Container for DRT calculation results"""
     tau_grid: np.ndarray
@@ -270,34 +269,34 @@ class DRTResult:
     def log_tau(self) -> np.ndarray:
         return np.log10(self.tau_grid)
     
-    def get_integral(self) -> float:
-        """Calculate correct integral ∫ γ(τ) d(ln τ)"""
-        # Check if we have d_ln_tau from metadata
-        if 'd_ln_tau' in self.metadata and self.metadata['d_ln_tau'] is not None:
-            return np.sum(self.gamma * self.metadata['d_ln_tau'])
+    def get_integral_over_log10(self) -> float:
+        """Calculate ∫ γ(τ) d(log₁₀τ) - should equal R_pol"""
+        if 'd_log10_tau' in self.metadata and self.metadata['d_log10_tau'] is not None:
+            return np.sum(self.gamma * self.metadata['d_log10_tau'])
         else:
-            # Fallback to trapezoidal integration over ln(τ)
-            log_tau = np.log(self.tau_grid)
-            return np.trapezoid(self.gamma, log_tau)
+            # Fallback using trapezoidal rule
+            return np.trapezoid(self.gamma, np.log10(self.tau_grid))
     
-    def get_integral_log10(self) -> float:
-        """Calculate integral over log₁₀τ (for reference)"""
-        # ∫ γ d(log₁₀τ) = ∫ γ d(ln τ) / ln(10)
-        return self.get_integral() / np.log(10)
+    def get_integral_over_ln(self) -> float:
+        """Calculate ∫ γ(τ) d(ln τ) = R_pol / ln(10)"""
+        return self.get_integral_over_log10() * np.log(10)
+    
+    def get_integral(self) -> float:
+        """Alias for get_integral_over_ln() for compatibility"""
+        return self.get_integral_over_ln()
     
     def get_polarization_resistance(self) -> float:
         """Get polarization resistance from DRT (should equal R_pol)"""
-        return self.get_integral()
+        return self.get_integral_over_log10()
     
     def check_consistency(self) -> Tuple[bool, float]:
         """Check if DRT integral matches R_pol"""
-        integral = self.get_integral()
+        integral = self.get_integral_over_log10()
         if self.R_pol > 0:
             relative_error = abs(integral - self.R_pol) / self.R_pol
             is_consistent = relative_error < 0.05
             return is_consistent, relative_error
         return False, 1.0
-
 
 @dataclass
 class ImpedanceData:
@@ -635,33 +634,44 @@ class DRTCore:
         self.d_log_tau = None
     
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Build kernel matrix for given time grid, properly scaled for integration over ln(τ)"""
+        """Build kernel matrix for given time grid, properly scaled with Δ(log τ)"""
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
         K_imag = np.zeros((self.N, M))
         
         omega = 2 * np.pi * self.frequencies
         
-        # Calculate d(ln τ) for proper scaling - using log spacing
-        log_tau = np.log(tau_grid)
-        d_ln_tau = np.gradient(log_tau)
+        # Calculate Δ(log₁₀τ) for proper scaling
+        log10_tau = np.log10(tau_grid)
+        d_log10_tau = np.zeros(M)
         
-        # Store for later use in integration
+        # Handle edges properly
+        if M > 1:
+            d_log10_tau[0] = log10_tau[1] - log10_tau[0]
+            d_log10_tau[-1] = log10_tau[-1] - log10_tau[-2]
+            for j in range(1, M-1):
+                d_log10_tau[j] = (log10_tau[j+1] - log10_tau[j-1]) / 2
+        
+        # Also calculate d(ln τ) = d(log₁₀τ) * ln(10)
+        d_ln_tau = d_log10_tau * np.log(10)
+        
+        # Store for later use
+        self.d_log10_tau = d_log10_tau
         self.d_ln_tau = d_ln_tau
-        self.d_log10_tau = d_ln_tau / np.log(10)
+        self.tau_grid = tau_grid
         
         for i in range(self.N):
             for j in range(M):
                 denominator = 1 + (omega[i] * tau_grid[j])**2
-                # Correct kernel: γ(τ) is defined per unit ln(τ), so we need d(ln τ) in integration
-                # But the kernel itself doesn't include d(ln τ) - that's for integration later
-                K_real[i, j] = 1.0 / denominator
-                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
+                # CRITICAL: Multiply by Δ(log₁₀τ) for proper scaling
+                # This ensures that ∫ γ d(log₁₀τ) = R_pol
+                K_real[i, j] = (1.0 / denominator) * d_log10_tau[j]
+                K_imag[i, j] = (-omega[i] * tau_grid[j] / denominator) * d_log10_tau[j]
                 
                 if include_rl:
                     rl_denom = 1 + (omega[i] * tau_grid[j])**2
-                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
-                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
+                    K_real[i, j] += ((omega[i] * tau_grid[j])**2 / rl_denom) * d_log10_tau[j]
+                    K_imag[i, j] += (omega[i] * tau_grid[j] / rl_denom) * d_log10_tau[j]
         
         return K_real, K_imag
     
@@ -741,9 +751,11 @@ class TikhonovDRT(DRTCore):
         """Compute DRT using Tikhonov regularization with NNLS"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        # Build kernel with proper Δ(log τ) scaling
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
-        # Build target vector - note: no scaling here, kernel handles it correctly
+        # Build target vector
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
@@ -791,11 +803,27 @@ class TikhonovDRT(DRTCore):
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
+        # CRITICAL: gamma now has units of [Ω / Δ(log₁₀τ)]
+        # To get γ(τ) per unit d(log₁₀τ), we need to divide by Δ(log₁₀τ)
+        # But since we already multiplied kernel by Δ(log₁₀τ), 
+        # gamma is already correctly scaled as γ(τ) * Δ(log₁₀τ)
+        # Therefore, for plotting and integration, we need to keep gamma as is
+        # and use d_log10_tau for integration
+        
         # Calculate uncertainty
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         
         # Store tau_grid for integration methods
         self.tau_grid = tau_grid
+        
+        # Verify consistency
+        if hasattr(self, 'd_log10_tau'):
+            integral_log10 = np.sum(gamma * self.d_log10_tau)  # This should equal R_pol
+            integral_ln = integral_log10 * np.log(10)
+            
+            logging.info(f"DRT integral over d(log₁₀τ): {integral_log10:.4f} Ω")
+            logging.info(f"DRT integral over d(ln τ): {integral_ln:.4f} Ω")
+            logging.info(f"Target R_pol: {self.R_pol:.4f} Ω")
         
         return DRTResult(
             tau_grid=tau_grid,
@@ -808,8 +836,8 @@ class TikhonovDRT(DRTCore):
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
-                'd_ln_tau': self.d_ln_tau if hasattr(self, 'd_ln_tau') else None,
-                'd_log10_tau': self.d_log10_tau if hasattr(self, 'd_log10_tau') else None
+                'd_log10_tau': self.d_log10_tau if hasattr(self, 'd_log10_tau') else None,
+                'd_ln_tau': self.d_ln_tau if hasattr(self, 'd_ln_tau') else None
             }
         )
     
