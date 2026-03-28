@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+EIS-DRT Analysis Tool v5.0
+Updated with proper inductance handling based on DRTtools implementation
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,7 +15,8 @@ from scipy.signal import savgol_filter, find_peaks, peak_widths
 from scipy.integrate import trapezoid
 from scipy.special import gamma as gamma_func
 from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import curve_fit, least_squares
+from scipy.optimize import curve_fit, least_squares, nnls
+from scipy.stats import linregress
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
@@ -22,12 +29,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 import time
+import cvxopt
+from cvxopt import matrix, solvers
 
 warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="EIS-DRT Analysis Tool v4.1",
+    page_title="EIS-DRT Analysis Tool v5.0",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -232,6 +241,8 @@ class DRTResult:
     method: str = ""
     R_inf: float = 0.0
     R_pol: float = 0.0
+    L: float = 0.0  # Added: inductance value
+    lambda_opt: float = None  # Added: optimal regularization parameter
     convergence: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
     
@@ -334,6 +345,31 @@ class ImpedanceData:
     @property
     def phase(self) -> np.ndarray:
         return np.arctan2(self.im_z, self.re_z) * 180 / np.pi
+    
+    def detect_inductive_behavior(self) -> bool:
+        """
+        Automatically detect if the spectrum shows inductive behavior.
+        Inductive behavior is indicated by positive -Im(Z) at high frequencies
+        or increasing trend in -Im(Z) towards high frequencies.
+        
+        Returns:
+            bool: True if inductive behavior is detected
+        """
+        # Check for positive -Im(Z) at high frequencies
+        high_freq_mask = self.freq > 0.1 * np.max(self.freq)
+        if np.any(high_freq_mask):
+            high_imag = -self.im_z[high_freq_mask]  # -Im(Z)
+            if np.any(high_imag > 0):
+                return True
+        
+        # Check for increasing trend in -Im(Z) at high frequencies
+        if len(self.freq) > 10:
+            high_idx = np.argsort(self.freq)[-10:]  # Top 10 highest frequencies
+            imag_high = -self.im_z[high_idx]
+            if len(imag_high) > 2 and np.all(np.diff(imag_high) > 0):
+                return True
+        
+        return False
 
 
 # ============================================================================
@@ -643,11 +679,8 @@ class DRTCore:
         self.tau_min = 1.0 / (2 * np.pi * np.max(self.frequencies)) * 0.1
         self.tau_max = 1.0 / (2 * np.pi * np.min(self.frequencies)) * 10
         
-        # Estimate ohmic resistance from highest frequencies
-        if len(high_freq_idx) > 3:
-            self.R_inf = np.mean(self.Z_real[high_freq_idx[-5:]])
-        else:
-            self.R_inf = self.Z_real[-1] if len(self.Z_real) > 0 else 0
+        # Robust estimation of ohmic resistance
+        self.R_inf = self._estimate_R_inf_robust()
         
         # Total polarization resistance (difference between low and high frequency real parts)
         low_freq_idx = np.where(self.frequencies < 0.1 * np.max(self.frequencies))[0]
@@ -656,11 +689,91 @@ class DRTCore:
         else:
             R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
         self.R_pol = R_total - self.R_inf if R_total > self.R_inf else 1.0
-
+    
+    def _estimate_R_inf_robust(self) -> float:
+        """
+        Robust estimation of ohmic resistance R∞.
+        For spectra with inductive behavior, extrapolation is used.
+        
+        Returns:
+            float: Estimated R∞ in Ω
+        """
+        # Take highest frequency points (top 20% or at least 3 points)
+        n_high = max(3, len(self.frequencies) // 5)
+        high_freq_indices = np.argsort(self.frequencies)[-n_high:]
+        
+        # Check if inductive behavior is present
+        has_inductive = self.data.detect_inductive_behavior()
+        
+        if has_inductive and len(high_freq_indices) >= 3:
+            # For spectra with inductance, extrapolate R∞ using 1/ω²
+            omega = 2 * np.pi * self.frequencies[high_freq_indices]
+            re_z_high = self.Z_real[high_freq_indices]
+            
+            # Avoid division by zero
+            inv_omega2 = 1 / (omega**2 + 1e-10)
+            
+            try:
+                # Linear regression: Re(Z) = R∞ + slope * (1/ω²)
+                slope, intercept, r_value, p_value, std_err = linregress(inv_omega2, re_z_high)
+                return intercept
+            except Exception as e:
+                logging.warning(f"Extrapolation failed: {e}, using mean of high frequencies")
+                return np.mean(self.Z_real[high_freq_indices])
+        else:
+            # Simple mean of high frequency points
+            return np.mean(self.Z_real[high_freq_indices])
+    
+    def _detect_inductive_behavior(self) -> bool:
+        """
+        Automatically detect if the spectrum shows inductive behavior.
+        
+        Returns:
+            bool: True if inductive behavior is detected
+        """
+        return self.data.detect_inductive_behavior()
+    
+    def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
+        """
+        Find corner of L-curve (maximum curvature) for automatic λ selection.
+        
+        Args:
+            residuals: Array of residuals for different λ values
+            solution_norms: Array of solution norms for different λ values
+        
+        Returns:
+            int: Index of optimal λ in the λ array
+        """
+        if len(residuals) < 3:
+            return len(residuals) // 2
+        
+        log_res = np.log(residuals + 1e-10)
+        log_sol = np.log(solution_norms + 1e-10)
+        
+        dlog_res = np.gradient(log_res)
+        dlog_sol = np.gradient(log_sol)
+        
+        if len(dlog_res) < 2 or len(dlog_sol) < 2:
+            return len(residuals) // 2
+        
+        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
+        
+        if len(curvature) > 0:
+            return np.argmax(curvature) + 1
+        return len(residuals) // 2
+    
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Build kernel matrix for given time grid.
         IMPORTANT: Kernels are scaled for integration over d(ln τ)
+        
+        Args:
+            tau_grid: Array of relaxation times
+            include_rl: If True, includes RL contribution for inductive loops
+                        (Note: In DRTtools, L is handled separately, not in kernel)
+        
+        Returns:
+            Tuple of (K_real, K_imag) matrices
         """
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
@@ -682,34 +795,36 @@ class DRTCore:
                 
                 # K_imag = -ωτ / (1 + ω²τ²) * d(ln τ)
                 K_imag[i, j] = -omega[i] * tau_grid[j] / denominator * dln_tau
-                
-                if include_rl:
-                    # For inductive loops: modify kernels
-                    rl_denom = 1 + (omega[i] * tau_grid[j])**2
-                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom * dln_tau
-                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom * dln_tau
         
         return K_real, K_imag
     
-    def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
-        """Find corner of L-curve (maximum curvature)"""
-        if len(residuals) < 3:
-            return len(residuals) // 2
+    def _build_kernel_matrix_with_inductance(self, tau_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build kernel matrix for DRT and also return the column for inductance.
+        This follows the DRTtools approach where L is handled as a separate parameter.
         
-        log_res = np.log(residuals + 1e-10)
-        log_sol = np.log(solution_norms + 1e-10)
+        Args:
+            tau_grid: Array of relaxation times
         
-        dlog_res = np.gradient(log_res)
-        dlog_sol = np.gradient(log_sol)
+        Returns:
+            Tuple of (K_extended, K_real, K_imag) where:
+            - K_extended: Full matrix for [γ; L] with shape (2N, M+1)
+            - K_real: Real part kernel (without L)
+            - K_imag: Imag part kernel (without L)
+        """
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         
-        if len(dlog_res) < 2 or len(dlog_sol) < 2:
-            return len(residuals) // 2
+        # Build the combined kernel matrix
+        # For Real part: contribution from γ only (L has no real part)
+        # For Imag part: contribution from γ AND from L: -ωL
+        omega = 2 * np.pi * self.frequencies
         
-        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
+        # Create extended matrix: [K_real; K_imag] with extra column for L
+        K_base = np.vstack([K_real, K_imag])
+        L_column = np.concatenate([np.zeros(self.N), -omega])
+        K_extended = np.column_stack([K_base, L_column])
         
-        if len(curvature) > 0:
-            return np.argmax(curvature) + 1
-        return len(residuals) // 2
+        return K_extended, K_real, K_imag
     
     def get_drt_integral(self, gamma: np.ndarray, tau_grid: np.ndarray) -> float:
         """
@@ -717,6 +832,33 @@ class DRTCore:
         R_pol = ∫ γ(τ) d(ln τ)
         """
         return np.trapezoid(gamma, np.log(tau_grid))
+    
+    def verify_reconstruction(self, gamma: np.ndarray, L: float, tau_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Verify reconstruction quality by calculating fitted impedance and error.
+        
+        Args:
+            gamma: DRT array
+            L: Inductance value (0 if not used)
+            tau_grid: Relaxation time grid
+        
+        Returns:
+            Tuple of (Z_rec_real, Z_rec_imag, relative_error)
+        """
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
+        
+        # Reconstruct impedance
+        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
+        
+        # Calculate relative error
+        Z_original = self.Z_real + 1j * self.Z_imag
+        Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
+        error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
+        mean_error = np.mean(error_percent)
+        
+        return Z_rec_real, Z_rec_imag, mean_error
+
 
 # ============================================================================
 # Tikhonov Regularization with NNLS (from EIS code)
@@ -772,7 +914,7 @@ class TikhonovDRT(DRTCore):
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         
         # Build kernel matrices (already scaled with d(ln τ))
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         
         # Target vector: subtract ohmic resistance from real part
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
@@ -852,6 +994,8 @@ class TikhonovDRT(DRTCore):
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
+            L=0.0,
+            lambda_opt=lambda_opt,
             metadata={
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
@@ -861,17 +1005,142 @@ class TikhonovDRT(DRTCore):
             }
         )
     
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
-        Reconstruct impedance from DRT.
+        Compute DRT with inductance using the DRTtools approach.
         
-        Z_reconstructed = R∞ + K_real @ gamma
-        Note: gamma already includes ln(10) factor, but kernel also includes dln_tau,
-        so we need to divide by ln(10) to avoid double multiplication.
+        In this method, L is fitted as a separate parameter along with γ(τ).
+        The model is: Z(ω) = R∞ + i·2πf·L + ∫ γ(τ)/(1 + iωτ) d(ln τ)
+        
+        The extended matrix is: [K_real; K_imag] with an extra column [0; -ω] for L
         """
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
+        
+        # Create logarithmic grid of relaxation times
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        # Build extended kernel matrix with L column
+        K_extended, K_real, K_imag = self._build_kernel_matrix_with_inductance(tau_grid)
+        
+        # Target vector: subtract ohmic resistance from real part
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        
+        # Build regularization matrix for γ only (L is not regularized)
+        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
+        
+        # Number of unknowns: n_tau (γ) + 1 (L)
+        n_total = n_tau + 1
+        
+        # Build extended regularization matrix: zeros for L
+        L_extended = np.zeros((L_reg.shape[0], n_total))
+        L_extended[:, :n_tau] = L_reg
+        
+        lambda_opt = None
+        gamma = None
+        L_value = None
+        
+        if lambda_auto:
+            if lambda_range is None:
+                lambda_range = np.logspace(-8, 2, 30)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    # Augmented system: [K_extended; λL_extended] * x = [Z_target; 0]
+                    A = np.vstack([K_extended, lam * L_extended])
+                    b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                    
+                    x = self._solve_nnls(A, b)
+                    
+                    # Calculate residual and solution norm
+                    residual = np.linalg.norm(K_extended @ x - Z_target)
+                    sol_norm = np.linalg.norm(L_extended @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                x_opt = solutions[best_idx]
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+            else:
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K_extended, lambda_opt * L_extended])
+                b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                x_opt = self._solve_nnls(A, b)
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+        else:
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K_extended, lambda_opt * L_extended])
+            b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+            x_opt = self._solve_nnls(A, b)
+            gamma = x_opt[:n_tau]
+            L_value = x_opt[-1]
+        
+        # Calculate uncertainty estimate from second derivative
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        
+        # Verify integral of DRT equals R_pol
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+        
+        # Log verification
+        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
+        print(f"Fitted inductance L: {L_value:.6e} H")
+        
+        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
+            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
+        
+        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
+        
+        # Recalculate integral with corrected gamma
+        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std * np.log(10),
+            method="Tikhonov Regularization with Inductance",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            L=L_value,
+            lambda_opt=lambda_opt,
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol,
+                'inductance': L_value
+            }
+        )
+    
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reconstruct impedance from DRT and optional inductance.
+        
+        Args:
+            tau_grid: Relaxation time grid
+            gamma: DRT values
+            L: Inductance value (default 0)
+        
+        Returns:
+            Tuple of (Z_rec_real, Z_rec_imag)
+        """
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
         return Z_rec_real, Z_rec_imag
 
 
@@ -937,7 +1206,7 @@ class MaxEntropyDRT(DRTCore):
         """Compute DRT using maximum entropy method with automatic lambda selection"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
@@ -979,6 +1248,8 @@ class MaxEntropyDRT(DRTCore):
             method="Maximum Entropy",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
+            L=0.0,
+            lambda_opt=lambda_opt,
             metadata={
                 'lambda': lambda_opt,
                 'drt_integral': drt_integral_corrected,
@@ -986,11 +1257,38 @@ class MaxEntropyDRT(DRTCore):
             }
         )
     
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                                 lambda_auto: bool = True) -> DRTResult:
+        """
+        Compute DRT with inductance using maximum entropy method.
+        Note: Full implementation would require extending the entropy framework.
+        For now, this is a placeholder that uses the standard method.
+        """
+        # For maximum entropy, the extension to include L is non-trivial
+        # This is a simplified version that just adds L after the fact
+        result = self.compute(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto)
+        
+        # Estimate L from high frequency data
+        has_inductive = self.data.detect_inductive_behavior()
+        if has_inductive:
+            high_freq_mask = self.frequencies > 0.1 * np.max(self.frequencies)
+            if np.any(high_freq_mask):
+                omega_high = 2 * np.pi * self.frequencies[high_freq_mask]
+                imag_high = -self.Z_imag[high_freq_mask]
+                # Estimate L from slope of -Im(Z) vs ω
+                if len(omega_high) > 2:
+                    slope, _, _, _, _ = linregress(omega_high, imag_high)
+                    L_est = -slope  # Since -Im(Z) = -ωL + RC part, slope ≈ -L
+                    result.L = max(0, L_est)
+        
+        result.method = "Maximum Entropy with Inductance (estimated)"
+        return result
+    
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
         return Z_rec_real, Z_rec_imag
 
 
@@ -3070,6 +3368,11 @@ def step2_drt_analysis():
             st.rerun()
         return
     
+    # Auto-detect inductive behavior
+    has_inductive = data.detect_inductive_behavior()
+    if has_inductive:
+        st.info("🔍 **Inductive behavior detected** in the high frequency region. Consider using 'Fitting with Inductance' mode for better results.")
+    
     col1, col2 = st.columns([1, 1.5])
     
     with col1:
@@ -3081,9 +3384,19 @@ def step2_drt_analysis():
              "Maximum Entropy (auto-λ)"]
         )
         
-        n_tau = st.slider("Number of time points", 50, 300, 150)
+        # Inductance handling mode - three options as in DRTtools
+        induct_mode = st.selectbox(
+            "Inductance handling",
+            ["Fitting w/o Inductance", "Fitting with Inductance", "Discard Inductive Data"],
+            index=1 if has_inductive else 0,
+            help="""
+            - Fitting w/o Inductance: Standard DRT model without inductance
+            - Fitting with Inductance: Includes L as fitting parameter: Z = R∞ + i·2πf·L + DRT
+            - Discard Inductive Data: Remove points with positive -Im(Z)
+            """
+        )
         
-        include_inductive = False
+        n_tau = st.slider("Number of time points", 50, 300, 150)
         
         # Method-specific parameters
         lambda_auto = True
@@ -3092,7 +3405,7 @@ def step2_drt_analysis():
         
         if analysis_method == "Tikhonov Regularization (NNLS)":
             reg_order = st.selectbox("Regularization order", [0, 1, 2], index=2)
-            lambda_auto = st.checkbox("Automatic λ selection", value=True)
+            lambda_auto = st.checkbox("Automatic λ selection (L-curve)", value=True)
             if not lambda_auto:
                 lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
         
@@ -3106,7 +3419,7 @@ def step2_drt_analysis():
         st.session_state.app_state.drt_method = analysis_method
         st.session_state.app_state.drt_parameters.update({
             'n_tau': n_tau,
-            'include_inductive': include_inductive,
+            'induct_mode': induct_mode,
             'reg_order': reg_order,
             'lambda_auto': lambda_auto,
             'lambda_value': lambda_value
@@ -3121,29 +3434,85 @@ def step2_drt_analysis():
             if st.button("🚀 Run DRT Analysis", type="primary", use_container_width=True):
                 with st.spinner("Calculating DRT..."):
                     try:
+                        # Handle data discarding if needed
+                        if induct_mode == "Discard Inductive Data":
+                            # Discard points with positive -Im(Z)
+                            mask = -data.im_z > 0  # -Im(Z) > 0 indicates inductive behavior
+                            n_discarded = np.sum(mask)
+                            if n_discarded > 0:
+                                st.info(f"Discarding {n_discarded} inductive data points")
+                                # Create temporary data object with discarded points
+                                temp_data = ImpedanceData(
+                                    data.freq[~mask],
+                                    data.re_z[~mask],
+                                    data.im_z[~mask]
+                                )
+                            else:
+                                temp_data = data
+                        else:
+                            temp_data = data
+                        
+                        # Check if we have enough points after discarding
+                        if len(temp_data.freq) < 3:
+                            st.error("Not enough data points after discarding inductive points. Please use a different mode.")
+                            return
+                        
+                        # Create solver with appropriate settings
+                        include_inductive = (induct_mode == "Fitting with Inductance")
+                        
                         if analysis_method == "Tikhonov Regularization (NNLS)":
-                            drt_solver = TikhonovDRT(data, regularization_order=reg_order, 
+                            drt_solver = TikhonovDRT(temp_data, regularization_order=reg_order, 
                                                      include_inductive=include_inductive)
-                            result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_value, 
-                                                        lambda_auto=lambda_auto)
+                            
+                            if include_inductive:
+                                result = drt_solver.compute_with_inductance(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_value, 
+                                    lambda_auto=lambda_auto
+                                )
+                            else:
+                                result = drt_solver.compute(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_value, 
+                                    lambda_auto=lambda_auto
+                                )
                         
                         elif analysis_method == "Maximum Entropy (auto-λ)":
-                            drt_solver = MaxEntropyDRT(data, include_inductive=include_inductive)
+                            drt_solver = MaxEntropyDRT(temp_data, include_inductive=include_inductive)
                             lambda_auto_val = st.session_state.app_state.drt_parameters.get('lambda_auto', True)
                             lambda_val = st.session_state.app_state.drt_parameters.get('entropy_lambda', None)
-                            result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_val, 
-                                                        lambda_auto=lambda_auto_val)
+                            
+                            if include_inductive:
+                                result = drt_solver.compute_with_inductance(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_val, 
+                                    lambda_auto=lambda_auto_val
+                                )
+                            else:
+                                result = drt_solver.compute(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_val, 
+                                    lambda_auto=lambda_auto_val
+                                )
                         
                         # Store results
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_solver = drt_solver
                         st.session_state.app_state.drt_calculated = True
                         
+                        # Display summary
                         st.success("✅ DRT calculation complete!")
+                        if include_inductive and result.L > 0:
+                            st.info(f"📊 Fitted inductance L = {result.L:.3e} H")
+                        if result.lambda_opt is not None:
+                            st.info(f"📊 Optimal regularization parameter λ = {result.lambda_opt:.3e}")
+                        
                         st.rerun()
                         
                     except Exception as e:
                         st.error(f"DRT calculation failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
     
     with col2:
         if st.session_state.app_state.drt_calculated and st.session_state.app_state.drt_result:
@@ -3159,8 +3528,11 @@ def step2_drt_analysis():
             **τ range:** {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
             """)
             
-            if 'lambda' in result.metadata:
-                st.info(f"**λ:** {result.metadata['lambda']:.3e}")
+            if result.L > 0:
+                st.info(f"**Inductance L:** {result.L:.3e} H")
+            
+            if result.lambda_opt is not None:
+                st.info(f"**λ:** {result.lambda_opt:.3e}")
             
             # Display integral verification
             integral, ratio = result.verify_integral()
@@ -3171,12 +3543,12 @@ def step2_drt_analysis():
             
             # Reconstruct impedance from DRT for validation
             if solver is not None:
-                Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma)
+                Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
                 
                 # Calculate reconstruction error
                 Z_original = data.Z
                 Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
-                error_percent = np.abs((Z_original - Z_reconstructed) / Z_original) * 100
+                error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
                 mean_error = np.mean(error_percent)
                 max_error = np.max(error_percent)
                 
@@ -3251,6 +3623,23 @@ def step2_drt_analysis():
                 ax_err.legend()
                 st.pyplot(fig_err)
                 plt.close()
+                
+                # If inductance was fitted, show its contribution
+                if result.L > 0:
+                    st.markdown("---")
+                    st.subheader("🔌 Inductance Contribution")
+                    
+                    fig_L, ax_L = plt.subplots(figsize=(8, 5))
+                    omega = 2 * np.pi * data.freq
+                    L_contribution = omega * result.L
+                    ax_L.loglog(data.freq, L_contribution, '-', linewidth=2, color='#9467bd', label='L contribution to -Im(Z)')
+                    ax_L.set_xlabel("Frequency / Hz", fontweight='bold')
+                    ax_L.set_ylabel("-ωL / Ohm", fontweight='bold')
+                    ax_L.set_title(f"Inductive Contribution (L = {result.L:.3e} H)", fontweight='bold')
+                    ax_L.grid(True, alpha=0.3, linestyle='--')
+                    ax_L.legend()
+                    st.pyplot(fig_L)
+                    plt.close()
             
             # DRT plot
             st.markdown("---")
@@ -3582,6 +3971,7 @@ def step4_results():
         return
     
     deconv_result = st.session_state.app_state.deconv_result
+    drt_result = st.session_state.app_state.drt_result
     
     # Navigation buttons
     col_prev, col_next = st.columns([1, 5])
@@ -3806,6 +4196,24 @@ def step4_results():
                 'Parameters': ', '.join([f"{p:.4e}" for p in deconv_result.baseline_params])
             }])
             st.dataframe(baseline_df, use_container_width=True)
+        
+        # Add DRT metadata if available
+        if drt_result:
+            st.markdown("---")
+            st.subheader("DRT Calculation Metadata")
+            meta_col1, meta_col2, meta_col3 = st.columns(3)
+            with meta_col1:
+                st.metric("Method", drt_result.method)
+                st.metric("R∞", f"{drt_result.R_inf:.4f} Ω")
+            with meta_col2:
+                st.metric("Rpol", f"{drt_result.R_pol:.4f} Ω")
+                if drt_result.L > 0:
+                    st.metric("Inductance L", f"{drt_result.L:.3e} H")
+            with meta_col3:
+                if drt_result.lambda_opt is not None:
+                    st.metric("Optimal λ", f"{drt_result.lambda_opt:.3e}")
+                integral, ratio = drt_result.verify_integral()
+                st.metric("Integral Ratio", f"{ratio:.3f}")
     
     with tab4:
         st.subheader("Normalized Gaussian Deconvolution Result")
@@ -3937,7 +4345,9 @@ def step4_results():
                 'Area_Ohm_s': p.area,
                 'Fraction': p.fraction,
                 'Fraction_Percent': p.fraction_percent,
-                'Source': p.source
+                'Source': p.source,
+                'Characteristic_Frequency_Hz': p.get_characteristic_frequency(),
+                'Resistance_Contribution_Ohm': p.get_resistance_contribution()
             } for p in deconv_result.peaks])
             
             csv_peaks = peaks_df.to_csv(index=False)
@@ -4017,7 +4427,24 @@ Logarithmic X scale: {deconv_result.use_log_x}
 Baseline method: {deconv_result.baseline_method}
 Smoothing level: {st.session_state.app_state.smoothing_level}
 
-QUALITY METRICS:
+"""
+                
+                if drt_result:
+                    report += f"""DRT METADATA:
+{"-"*40}
+Method: {drt_result.method}
+R∞: {drt_result.R_inf:.6f} Ω
+Rpol: {drt_result.R_pol:.6f} Ω
+"""
+                    if drt_result.L > 0:
+                        report += f"Inductance L: {drt_result.L:.6e} H\n"
+                    if drt_result.lambda_opt is not None:
+                        report += f"Optimal λ: {drt_result.lambda_opt:.6e}\n"
+                    integral, ratio = drt_result.verify_integral()
+                    report += f"DRT Integral: {integral:.6f} Ω\n"
+                    report += f"Integral/Rpol Ratio: {ratio:.4f}\n\n"
+                
+                report += f"""QUALITY METRICS:
 {"-"*40}
 R²: {deconv_result.quality_metrics.get('R²', 0):.6f}
 AIC: {deconv_result.quality_metrics.get('AIC', 0):.2f}
@@ -4037,11 +4464,12 @@ Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
                 
                 report += f"""PEAK PARAMETERS:
 {"-"*80}
-ID    Center (s)      Amplitude (Ω)    Area (Ω·s)       Fraction(%)
+ID    Center (s)      Amplitude (Ω)    Area (Ω·s)       Fraction(%)    f(Hz)
 {"-"*80}"""
                 
                 for p in deconv_result.peaks:
-                    report += f"\n{p.id:<4} {p.center:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
+                    freq_char = p.get_characteristic_frequency()
+                    report += f"\n{p.id:<4} {p.center:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}         {freq_char:.2e}"
                 
                 report += f"""
 
@@ -4056,7 +4484,7 @@ ID    Center (s)      Norm. Amplitude    Original Amplitude    Fraction(%)
                 
                 report += f"""
 {"="*80}
-Total Area: {deconv_result.total_area:.6e} Ω·s
+Total Area (Rpol): {deconv_result.total_area:.6e} Ω·s
 Maximum Amplitude: {max_amp:.6e} Ω
 Number of Peaks: {len(deconv_result.peaks)}
 {"="*80}"""
@@ -4165,7 +4593,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("⚡ **EIS-DRT Analysis Tool v4.1** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis")
+    st.markdown("⚡ **EIS-DRT Analysis Tool v5.0** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis | Updated with proper inductance handling (DRTtools approach)")
 
 
 if __name__ == "__main__":
