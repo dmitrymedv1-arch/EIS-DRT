@@ -3312,7 +3312,7 @@ def step3_gaussian_deconvolution():
     drt_result = st.session_state.app_state.drt_result
     
     # Use correctly scaled gamma for deconvolution (∫γ d(ln τ) = R_pol)
-    gamma_correct = drt_result.get_gamma_for_plotting()
+    gamma_correct = drt_result.get_scaled_gamma_for_deconvolution()
     log_tau = np.log10(drt_result.tau_grid)
     
     # Show scaling info
