@@ -22,6 +22,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 import time
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils.dataframe import dataframe_to_rows
+
 
 warnings.filterwarnings('ignore')
 
