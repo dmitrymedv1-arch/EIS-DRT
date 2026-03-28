@@ -271,19 +271,7 @@ class DRTResult:
         return np.log10(self.tau_grid)
     
     def get_integral(self) -> float:
-        """Calculate integral of gamma over d(ln tau)"""
-        dln_tau = np.diff(np.log(self.tau_grid))
-        dln_tau_padded = np.concatenate([dln_tau, [dln_tau[-1]]])
-        return np.sum(self.gamma * dln_tau_padded)
-    
-    def verify_integral_condition(self, tolerance: float = 0.05) -> Tuple[bool, float]:
-        """Verify that ∫γ(τ) d(ln τ) equals R_pol within tolerance"""
-        integral = self.get_integral()
-        if self.R_pol > 0:
-            ratio = integral / self.R_pol
-            is_valid = abs(ratio - 1.0) <= tolerance
-            return is_valid, ratio
-        return False, 0.0
+        return np.trapezoid(self.gamma, np.log(self.tau_grid))
 
 
 @dataclass
@@ -1794,98 +1782,70 @@ class GaussianDeconvolver:
     """Main class for spectral deconvolution with baseline correction"""
     
     def __init__(self, x_linear, y_original, use_log_x=True, use_log_y=False,
-                     clip_negative=True, show_warnings=True, baseline_method='none',
-                     smoothing_level='none'):
-            # Store original data WITHOUT ANY MODIFICATIONS for display purposes
-            self.x_original = np.array(x_linear).copy()
-            self.y_original_raw = np.array(y_original).copy()
-            
-            # Working arrays that may be modified
-            self.x_linear = np.array(x_linear)
-            self.y_original = np.array(y_original)
-            self.use_log_x = use_log_x
-            self.use_log_y = use_log_y
-            self.baseline_method = baseline_method
-            self.smoothing_level = smoothing_level
-            
-            # Sort by X to ensure monotonic increasing X
-            sort_idx = np.argsort(self.x_linear)
-            self.x_linear = self.x_linear[sort_idx]
-            self.y_original = self.y_original[sort_idx]
-            
-            # Store sorted original data for display
-            self.x_sorted = self.x_linear.copy()
-            self.y_sorted = self.y_original.copy()
-            
-            # CRITICAL FIX: Calculate physical scale from DRT data
-            # The integral of gamma(tau) over d(ln tau) should equal R_pol
-            # But we store the actual physical values for later reconstruction
-            self.physical_scale = 1.0
-            self.has_physical_scale = False
-            
-            # Check if y_original has physical meaning (should be > 0 for DRT)
-            if np.max(self.y_original) > 0:
-                # Calculate approximate R_pol from data (for validation)
-                dln_tau = np.diff(np.log(self.x_linear))
-                # Pad to match length
-                dln_tau_padded = np.concatenate([dln_tau, [dln_tau[-1]]])
-                self.approx_rpol = np.sum(self.y_original * dln_tau_padded)
-                
-                # For DRT data, the values are typically in Ohms (0.1 - 10)
-                # We preserve the physical scale without normalization
-                self.physical_scale = 1.0
-                self.has_physical_scale = True
-                
-                if show_warnings:
-                    print(f"Physical scale detected: γ(τ) range = [{np.min(self.y_original):.3e}, {np.max(self.y_original):.3e}] Ω")
-                    print(f"Approximate R_pol from integral: {self.approx_rpol:.4f} Ω")
-            
-            # Preprocess data
-            self.preprocessor = DataPreprocessor(clip_negative, show_warnings)
-            preprocessed = self.preprocessor.preprocess_for_fitting(
-                self.x_linear, self.y_original, use_log_x, use_log_y, smoothing_level
-            )
-            
-            # Update with preprocessed data
-            self.x_sorted = preprocessed['x_sorted']
-            self.y_sorted = preprocessed['y_sorted']
-            self.x = preprocessed['x']
-            self.y = preprocessed['y']
-            self.y_for_fitting = preprocessed['y_for_fitting']
-            self.x_label = preprocessed['x_label']
-            self.y_label = preprocessed['y_label']
-            self.clipped_points = preprocessed['clipped_points']
-            self.small_values_warning = preprocessed['small_values_warning']
-            
-            # CRITICAL FIX: Store maximum value for potential normalization
-            # But keep track that this is just for numerical stability
-            self.y_max_for_norm = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
-            
-            # For numerical stability, we may use normalized values internally
-            # But we MUST track the scaling factor to restore physical units
-            if self.y_max_for_norm > 0 and self.y_max_for_norm > 1e-10:
-                # Use normalization only for numerical stability
-                self.y_norm = self.y / self.y_max_for_norm
-                self.norm_factor = self.y_max_for_norm
-            else:
-                self.y_norm = self.y
-                self.norm_factor = 1.0
-            
-            # Results containers
-            self.components = []
-            self.fit_y_norm = None
-            self.popt = None
-            self.baseline_params = None
-            self.quality_metrics = {}
-            self.convergence_history = []
-            self.total_area = 0
-            
-            # Fitter
-            self.fitter = None
-            
-            # For compatibility with existing code
-            self.multi_gaussian = GaussianModel.multi_gaussian
-            self.gaussian = GaussianModel.gaussian
+                 clip_negative=True, show_warnings=True, baseline_method='none',
+                 smoothing_level='none'):
+        # Store original data WITHOUT ANY MODIFICATIONS for display purposes
+        self.x_original = np.array(x_linear).copy()
+        self.y_original_raw = np.array(y_original).copy()
+        
+        # Working arrays that may be modified
+        self.x_linear = np.array(x_linear)
+        self.y_original = np.array(y_original)
+        self.use_log_x = use_log_x
+        self.use_log_y = use_log_y
+        self.baseline_method = baseline_method
+        self.smoothing_level = smoothing_level
+        
+        # Sort by X to ensure monotonic increasing X
+        sort_idx = np.argsort(self.x_linear)
+        self.x_linear = self.x_linear[sort_idx]
+        self.y_original = self.y_original[sort_idx]
+        
+        # Store sorted original data for display
+        self.x_sorted = self.x_linear.copy()
+        self.y_sorted = self.y_original.copy()
+        
+        # Preprocess data
+        self.preprocessor = DataPreprocessor(clip_negative, show_warnings)
+        preprocessed = self.preprocessor.preprocess_for_fitting(
+            self.x_linear, self.y_original, use_log_x, use_log_y, smoothing_level
+        )
+        
+        # Update with preprocessed data
+        self.x_sorted = preprocessed['x_sorted']
+        self.y_sorted = preprocessed['y_sorted']
+        self.x = preprocessed['x']
+        self.y = preprocessed['y']
+        self.y_for_fitting = preprocessed['y_for_fitting']
+        self.x_label = preprocessed['x_label']
+        self.y_label = preprocessed['y_label']
+        self.clipped_points = preprocessed['clipped_points']
+        self.small_values_warning = preprocessed['small_values_warning']
+        
+        # Normalization - use 95th percentile instead of max for robustness
+        self.y_max = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
+        
+        # For fitting, we normalize but keep track for denormalization
+        if self.y_max > 0:
+            self.y_norm = self.y / self.y_max
+        else:
+            self.y_norm = self.y
+        
+        # Results containers
+        self.components = []
+        self.fit_y_norm = None
+        self.popt = None
+        self.baseline_params = None
+        self.quality_metrics = {}
+        self.convergence_history = []
+        self.total_area = 0
+        
+        # Fitter
+        self.fitter = None
+        
+        # For compatibility with existing code
+        self.multi_gaussian = GaussianModel.multi_gaussian
+        self.gaussian = GaussianModel.gaussian
     
     def _get_n_baseline_params(self):
         """Get number of baseline parameters"""
@@ -2240,33 +2200,14 @@ class GaussianDeconvolver:
             peak_params = popt[:n_peaks*3]
             baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
             
-            # CRITICAL FIX: Calculate physical scaling factor
-            # We need to restore the original physical units (Ohms)
-            # The fit was done on normalized data (y_norm), but original data is in Ohms
-            # The scaling factor is self.norm_factor which converts normalized to original
-            # BUT we also need to consider if we're working in log space
-            
             for i in range(n_peaks):
-                # These are in normalized units (from fit on y_norm)
                 amp_norm = peak_params[3*i]
                 cen = peak_params[3*i + 1]
                 sigma = abs(peak_params[3*i + 2])
                 
-                # CRITICAL FIX: Restore physical amplitude
-                # amp_norm is in normalized units (0-1 typically)
-                # Multiply by norm_factor to get back to original units
-                # But careful: y_norm = y / norm_factor, so y = y_norm * norm_factor
-                if hasattr(self, 'norm_factor') and self.norm_factor > 0:
-                    # Restore to original physical units
-                    amp = amp_norm * self.norm_factor
-                else:
-                    # Fallback: use the maximum of y_original as reference
-                    amp = amp_norm * np.max(self.y_original)
-                
-                # Calculate area under Gaussian in physical units
-                # Area = amplitude * sigma * sqrt(2π) in the transformed space
-                # But need to account for log transformation if used
-                area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.norm_factor
+                amp = amp_norm * self.y_max
+                # Используем правильный метод расчета площади
+                area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
                 
                 component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
                 
@@ -2279,42 +2220,22 @@ class GaussianDeconvolver:
                 components.append({
                     'id': i + 1,
                     'amp_norm': amp_norm,
-                    'amp': amp,  # Now in Ohms!
+                    'amp': amp,
                     'cen_log': cen,
                     'cen_linear': cen_linear,
                     'sigma_log': sigma,
                     'fwhm': GaussianModel.calculate_fwhm(sigma),
-                    'area': area,  # Now in Ohm·s (or Ohm·log units)
+                    'area': area,
                     'fraction': 0,
                     'y_norm': component_y_norm,
                     'source': 'auto'
                 })
             
-            # Calculate fractions based on physical areas
+            # Calculate fractions
             total_area = sum([c['area'] for c in components])
             for c in components:
                 c['fraction'] = c['area'] / total_area if total_area > 0 else 0
                 c['fraction_percent'] = c['fraction'] * 100
-            
-            # CRITICAL FIX: Validate against expected R_pol if available
-            if hasattr(self, 'approx_rpol') and self.approx_rpol > 0:
-                area_ratio = total_area / self.approx_rpol
-                if abs(area_ratio - 1.0) > 0.1:
-                    if progress_callback:
-                        progress_callback(0.9, f"Warning: Area mismatch detected ({total_area:.3f} vs {self.approx_rpol:.3f} Ω)")
-                    
-                    # Optional: Scale components to match expected R_pol
-                    # This ensures the integral constraint is satisfied
-                    scale_factor = self.approx_rpol / total_area
-                    for c in components:
-                        c['amp'] *= scale_factor
-                        c['area'] *= scale_factor
-                        c['amp_norm'] = c['amp'] / self.norm_factor if self.norm_factor > 0 else c['amp']
-                    
-                    total_area = sum([c['area'] for c in components])
-                    
-                    if progress_callback:
-                        progress_callback(0.9, f"Scaled components to match R_pol = {self.approx_rpol:.3f} Ω")
             
             # Store results
             self.popt = popt
@@ -2323,16 +2244,10 @@ class GaussianDeconvolver:
             self.fit_y_norm = fit_y_norm
             self.total_area = total_area
             
-            # Calculate quality metrics (using normalized data for fitting quality)
+            # Calculate quality metrics
             self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
                 self.y_norm, self.fit_y_norm, len(popt)
             )
-            
-            # Add physical validation to metrics
-            self.quality_metrics['total_area_physical'] = total_area
-            if hasattr(self, 'approx_rpol'):
-                self.quality_metrics['rpol_integral'] = self.approx_rpol
-                self.quality_metrics['area_conservation'] = total_area / self.approx_rpol
             
             if progress_callback:
                 progress_callback(1.0, "Fit complete!")
@@ -2342,7 +2257,7 @@ class GaussianDeconvolver:
         except Exception as e:
             if progress_callback:
                 progress_callback(1.0, f"Fit failed: {e}")
-            print(f"Error in fit: {e}")
+            print(f"Error in fit: {e}")  # For debugging
             return False
     
     def preview_fit(self, initial_params=None):
@@ -2481,18 +2396,18 @@ class GaussianDeconvolver:
         return True
     
     def create_deconvolution_result(self) -> DeconvolutionResult:
-        """Create result container from current components with physical units"""
+        """Create result container from current components"""
         peaks = []
         for c in self.components:
             peak = GaussianPeak(
                 id=c['id'],
                 center=c['cen_linear'],
                 center_log=c['cen_log'],
-                amplitude=c['amp'],  # Already in physical units (Ohms)
+                amplitude=c['amp'],
                 amplitude_norm=c['amp_norm'],
                 sigma_log=c['sigma_log'],
                 fwhm=c['fwhm'],
-                area=c['area'],  # Already in physical units (Ohm·s)
+                area=c['area'],
                 fraction=c['fraction'],
                 fraction_percent=c['fraction_percent'],
                 source=c.get('source', 'auto'),
@@ -2500,29 +2415,26 @@ class GaussianDeconvolver:
             )
             peaks.append(peak)
         
-        # Use original y_original which is in physical units (Ohms)
-        y_original_restored = self.y_original.copy()
-        
-        # Calculate fit in physical units for verification
-        fit_physical = None
-        if self.fit_y_norm is not None:
-            fit_physical = self.fit_y_norm * self.norm_factor
+        # Используем self.y_original напрямую - это уже оригинальные значения
+        # self.y_original хранит оригинальные ненормированные значения
+        y_original_restored = self.y_original.copy()  # Просто копируем, без умножения на y_max
         
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
             y_norm=self.y_norm,
-            y_original=y_original_restored,  # Physical units (Ohms)
+            y_original=y_original_restored,  # Теперь правильные значения (7 Ом)
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
             quality_metrics=self.quality_metrics,
             baseline_params=self.baseline_params,
             baseline_method=self.baseline_method,
-            total_area=self.total_area,  # Now in physical units
+            total_area=self.total_area,
             max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
         )
+
 
 # ============================================================================
 # Visualization Functions (from both codes)
@@ -2695,111 +2607,68 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
 def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_components: bool = True,
                               show_baseline: bool = True, title: str = "Gaussian Deconvolution Result",
                               preview_mode: bool = False, preview_fit: Optional[np.ndarray] = None) -> plt.Figure:
-    """Plot deconvolution result with components and baseline using physical units"""
+    """Plot deconvolution result with components and baseline"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
     # Left plot: Main deconvolution
     if deconv_result.use_log_x:
         ax1.set_xscale('log')
     
-    # Plot original data (already in physical units - Ohms)
     ax1.scatter(deconv_result.x_linear, deconv_result.y_original, 
-                s=15, alpha=0.5, color='black', label='DRT Data (γ(τ))', zorder=1)
+                s=15, alpha=0.5, color='black', label='Data', zorder=1)
     
-    # Create dense grid for smooth curves
     x_dense = np.linspace(np.min(deconv_result.x_linear), np.max(deconv_result.x_linear), 2000)
     if deconv_result.use_log_x:
         x_dense_log = np.log10(x_dense)
     else:
         x_dense_log = x_dense
     
-    # Plot individual components in physical units
     if show_components and deconv_result.peaks:
         colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
         for peak, color in zip(deconv_result.peaks, colors):
-            # Component in physical units (Ohms)
-            y_component = peak.amplitude * GaussianModelDeconv.gaussian(
-                x_dense_log, 
-                1.0,  # Shape with unit amplitude
-                peak.center_log, 
-                peak.sigma_log
-            )
-            
-            ax1.fill_between(x_dense, 0, y_component, 
-                            color=color, alpha=0.3, linewidth=0)
+            y_component = GaussianModelDeconv.gaussian(x_dense_log, peak.amplitude_norm, 
+                                                       peak.center_log, peak.sigma_log) * deconv_result.y_original.max()
+            ax1.fill_between(x_dense, 0, y_component, color=color, alpha=0.3, linewidth=0)
             ax1.plot(x_dense, y_component, '-', color=color, linewidth=2,
                     label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
     
-    # Plot baseline if present
     if show_baseline and deconv_result.baseline_params and deconv_result.baseline_method != 'none':
         if deconv_result.baseline_method == 'constant':
-            y_baseline = np.full_like(x_dense, deconv_result.baseline_params[0] * deconv_result.norm_factor 
-                                      if hasattr(deconv_result, 'norm_factor') else deconv_result.baseline_params[0])
-            ax1.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
+            y_baseline = deconv_result.baseline_params[0] * deconv_result.y_original.max()
+            ax1.axhline(y=y_baseline, color='gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         elif deconv_result.baseline_method == 'linear':
             y_baseline = (deconv_result.baseline_params[0] + 
-                         deconv_result.baseline_params[1] * x_dense_log) * \
-                         (deconv_result.norm_factor if hasattr(deconv_result, 'norm_factor') else 1)
+                         deconv_result.baseline_params[1] * x_dense_log) * deconv_result.y_original.max()
             ax1.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         elif deconv_result.baseline_method == 'quadratic':
             y_baseline = (deconv_result.baseline_params[0] + 
                          deconv_result.baseline_params[1] * x_dense_log +
-                         deconv_result.baseline_params[2] * x_dense_log**2) * \
-                         (deconv_result.norm_factor if hasattr(deconv_result, 'norm_factor') else 1)
+                         deconv_result.baseline_params[2] * x_dense_log**2) * deconv_result.y_original.max()
             ax1.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
     
-    # Plot total fit in physical units
     if preview_mode and preview_fit is not None:
-        # Preview mode
-        y_total = preview_fit * (deconv_result.norm_factor if hasattr(deconv_result, 'norm_factor') else 1)
+        y_total = preview_fit * deconv_result.y_original.max()
         ax1.plot(x_dense, y_total, 'b--', linewidth=2, label='Preview (no fit)', zorder=3, alpha=0.7)
-    elif deconv_result.peaks:
-        # Calculate total fit from components
-        y_total = np.zeros_like(x_dense)
+    elif deconv_result.fit_y_norm is not None:
+        n_peaks = len(deconv_result.peaks)
+        peak_params = []
         for peak in deconv_result.peaks:
-            y_total += peak.amplitude * GaussianModelDeconv.gaussian(
-                x_dense_log, 1.0, peak.center_log, peak.sigma_log
-            )
+            peak_params.extend([peak.amplitude_norm, peak.center_log, peak.sigma_log])
         
-        # Add baseline if present
-        if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-            if deconv_result.baseline_method == 'constant':
-                y_total += deconv_result.baseline_params[0] * (deconv_result.norm_factor if hasattr(deconv_result, 'norm_factor') else 1)
-            elif deconv_result.baseline_method == 'linear':
-                y_total += (deconv_result.baseline_params[0] + 
-                           deconv_result.baseline_params[1] * x_dense_log) * \
-                           (deconv_result.norm_factor if hasattr(deconv_result, 'norm_factor') else 1)
-            elif deconv_result.baseline_method == 'quadratic':
-                y_total += (deconv_result.baseline_params[0] + 
-                           deconv_result.baseline_params[1] * x_dense_log +
-                           deconv_result.baseline_params[2] * x_dense_log**2) * \
-                           (deconv_result.norm_factor if hasattr(deconv_result, 'norm_factor') else 1)
+        y_total = GaussianModelDeconv.multi_gaussian_with_baseline(
+            x_dense_log, n_peaks, peak_params, 
+            deconv_result.baseline_params or [], deconv_result.baseline_method
+        ) * deconv_result.y_original.max()
         
-        ax1.plot(x_dense, y_total, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
+        ax1.plot(x_dense, y_total, 'r--', linewidth=2, label='Total Fit', zorder=3)
     
-    ax1.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
-    ax1.set_ylabel('γ(τ) (Ω)', fontweight='bold', fontsize=12)
-    ax1.set_title(title, fontweight='bold', fontsize=14)
-    ax1.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
+    ax1.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold')
+    ax1.set_ylabel('Intensity', fontweight='bold')
+    ax1.set_title(title, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=9, frameon=True, edgecolor='black')
     ax1.grid(True, alpha=0.3, linestyle='--')
     
-    # Add quality metrics with physical validation
-    if deconv_result.quality_metrics and not preview_mode:
-        metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
-        metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}\n"
-        
-        # Add physical conservation check
-        if 'area_conservation' in deconv_result.quality_metrics:
-            conservation = deconv_result.quality_metrics['area_conservation']
-            metrics_text += f"Area Conservation = {conservation:.3f}"
-            if abs(conservation - 1.0) > 0.05:
-                metrics_text += " ⚠️"
-        
-        ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes,
-                fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
-    
-    # Right plot: Area distribution in physical units
+    # Right plot: Area distribution
     if deconv_result.peaks:
         peaks_ids = [f'Peak {p.id}' for p in deconv_result.peaks]
         fractions = [p.fraction_percent for p in deconv_result.peaks]
@@ -2807,7 +2676,7 @@ def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_component
         
         bars = ax2.bar(peaks_ids, fractions, color=colors, edgecolor='black', alpha=0.7)
         ax2.set_xlabel('Peak', fontweight='bold')
-        ax2.set_ylabel('Fraction of Total Area (%)', fontweight='bold')
+        ax2.set_ylabel('Fraction (%)', fontweight='bold')
         ax2.set_title('Peak Area Distribution', fontweight='bold')
         ax2.set_ylim(0, max(fractions) * 1.2 if fractions else 100)
         ax2.grid(True, alpha=0.3, axis='y')
@@ -2818,13 +2687,14 @@ def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_component
                     f'{frac:.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
         
         ax2.tick_params(axis='x', rotation=45)
-        
-        # Add total area info
-        if deconv_result.total_area > 0:
-            ax2.text(0.98, 0.98, f"Total Area: {deconv_result.total_area:.4f} Ω·s",
-                    transform=ax2.transAxes, fontsize=9, verticalalignment='top',
-                    horizontalalignment='right',
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+    
+    # Add quality metrics text
+    if deconv_result.quality_metrics and not preview_mode:
+        metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
+        metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
+        ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes,
+                fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
     
     plt.tight_layout()
     return fig
@@ -3253,38 +3123,15 @@ def step3_gaussian_deconvolution():
     
     drt_result = st.session_state.app_state.drt_result
     
-    # Add validation display
-    with st.expander("🔍 DRT Validation Check", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("R∞ (Ohm)", f"{drt_result.R_inf:.4f}")
-            st.metric("Rpol (Ohm)", f"{drt_result.R_pol:.4f}")
-        with col2:
-            # Calculate integral of gamma over d(ln tau)
-            tau_grid = drt_result.tau_grid
-            gamma = drt_result.gamma
-            dln_tau = np.diff(np.log(tau_grid))
-            dln_tau_padded = np.concatenate([dln_tau, [dln_tau[-1]]])
-            integral = np.sum(gamma * dln_tau_padded)
-            st.metric("∫γ(τ) d(ln τ) (Ohm)", f"{integral:.4f}")
-            st.metric("Conservation", f"{integral / drt_result.R_pol:.3f}" if drt_result.R_pol > 0 else "N/A")
-        
-        if integral > 0 and drt_result.R_pol > 0:
-            ratio = integral / drt_result.R_pol
-            if abs(ratio - 1.0) > 0.05:
-                st.warning(f"⚠️ DRT integral ({integral:.3f} Ω) differs from Rpol ({drt_result.R_pol:.3f} Ω) by {abs(ratio-1)*100:.1f}%")
-            else:
-                st.success(f"✅ DRT data satisfies integral condition: {integral:.3f} Ω ≈ {drt_result.R_pol:.3f} Ω")
-    
-    # Prepare data for deconvolution
+    # Prepare data for deconvolution - используем оригинальные ненормированные значения
     log_tau = np.log10(drt_result.tau_grid)
-    gamma_original = drt_result.gamma  # Original non-normalized values in Ohms
+    gamma_original = drt_result.gamma  # Оригинальные ненормированные значения
     
     # Create deconvolver if not exists
     if st.session_state.app_state.deconvolver is None:
         deconvolver = GaussianDeconvolver(
             x_linear=drt_result.tau_grid,
-            y_original=gamma_original,
+            y_original=gamma_original,  # Используем оригинальные ненормированные значения
             use_log_x=True,
             use_log_y=False,
             clip_negative=st.session_state.app_state.clip_negative,
