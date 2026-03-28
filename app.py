@@ -3586,6 +3586,9 @@ def step4_results():
         return
     
     deconv_result = st.session_state.app_state.deconv_result
+    drt_result = st.session_state.app_state.drt_result
+    data = st.session_state.app_state.impedance_data
+    solver = st.session_state.app_state.drt_solver
     
     # Navigation buttons
     col_prev, col_next = st.columns([1, 5])
@@ -3770,9 +3773,9 @@ def step4_results():
         st.subheader("Complete Dataset - Peak Parameters")
         
         # Create detailed table
-        data = []
+        data_peaks = []
         for peak in deconv_result.peaks:
-            data.append({
+            data_peaks.append({
                 'Peak ID': peak.id,
                 'Center (τ, s)': f"{peak.center:.4e}",
                 'Center (log τ)': f"{peak.center_log:.4f}",
@@ -3785,7 +3788,7 @@ def step4_results():
                 'Source': peak.source
             })
         
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(data_peaks)
         st.dataframe(df, use_container_width=True)
         
         st.markdown("---")
@@ -3922,156 +3925,63 @@ def step4_results():
         st.caption(f"Нормализовано к максимальному значению γ_max = {max_amp:.4e} Ω")
     
     with tab5:
-        st.subheader("Export Results")
+        st.subheader("Export Results to Excel")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Export Peak Data**")
+        # Check if we have all required data
+        if data is None or drt_result is None or deconv_result is None:
+            st.error("Missing data for export. Please complete all previous steps.")
+        else:
+            st.info("""
+            **Excel Export Contents:**
+            - **Sheet 1: Impedance Data** - Original and reconstructed impedance (Nyquist, Bode plots data)
+            - **Sheet 2: DRT Spectrum** - Relaxation time distribution (τ vs γ)
+            - **Sheet 3: Gaussian Deconvolution** - Original DRT, total fit, individual peaks, baseline
+            - **Sheet 4: Analysis Report** - Peak parameters, quality metrics, regularization parameters
+            """)
             
-            # Create peaks DataFrame
-            peaks_df = pd.DataFrame([{
-                'Peak_ID': p.id,
-                'Center_tau_s': p.center,
-                'Center_log_tau': p.center_log,
-                'Amplitude_Ohm': p.amplitude,
-                'Amplitude_Normalized': p.amplitude_norm,
-                'Sigma_log': p.sigma_log,
-                'FWHM': p.fwhm,
-                'Area_Ohm_s': p.area,
-                'Fraction': p.fraction,
-                'Fraction_Percent': p.fraction_percent,
-                'Source': p.source
-            } for p in deconv_result.peaks])
-            
-            csv_peaks = peaks_df.to_csv(index=False)
-            st.download_button(
-                "📥 Export Peaks as CSV",
-                data=csv_peaks,
-                file_name=f"deconvolution_peaks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-            
-            st.markdown("**Export Fitting Data**")
-            
-            # Create fitting data DataFrame - используем оригинальные значения
-            # Реконструируем fit для каждой точки
-            if deconv_result.fit_y_original is not None:
-                fit_values = deconv_result.fit_y_original
-            else:
-                fit_values = np.zeros_like(deconv_result.x_linear)
-                for i, tau in enumerate(deconv_result.x_linear):
-                    if deconv_result.use_log_x:
-                        log_tau = np.log10(tau)
-                    else:
-                        log_tau = tau
-                    
-                    # Суммируем все компоненты
-                    total = 0
-                    for peak in deconv_result.peaks:
-                        total += peak.amplitude * GaussianModelDeconv.gaussian(
-                            log_tau, 1.0, peak.center_log, peak.sigma_log
+            if st.button("📊 Generate Complete Excel Report", type="primary", use_container_width=True):
+                with st.spinner("Generating Excel report..."):
+                    try:
+                        # Create Excel file with multiple sheets
+                        output = io.BytesIO()
+                        
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            # Sheet 1: Impedance Data
+                            df_impedance = create_impedance_data_sheet(data, solver, drt_result)
+                            df_impedance.to_excel(writer, sheet_name='Impedance Data', index=False)
+                            
+                            # Sheet 2: DRT Spectrum
+                            df_drt = create_drt_spectrum_sheet(drt_result)
+                            df_drt.to_excel(writer, sheet_name='DRT Spectrum', index=False)
+                            
+                            # Sheet 3: Gaussian Deconvolution
+                            df_deconv = create_deconvolution_sheet(deconv_result)
+                            df_deconv.to_excel(writer, sheet_name='Gaussian Deconvolution', index=False)
+                            
+                            # Sheet 4: Analysis Report
+                            df_report = create_analysis_report_sheet(deconv_result, drt_result)
+                            df_report.to_excel(writer, sheet_name='Analysis Report', index=False)
+                            
+                            # Apply formatting to all sheets
+                            format_excel_sheets(writer)
+                        
+                        output.seek(0)
+                        
+                        # Create download button
+                        filename = f"EIS_DRT_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                        st.download_button(
+                            label="📥 Download Excel Report",
+                            data=output,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
                         )
-                    
-                    # Добавляем базовую линию
-                    if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-                        if deconv_result.baseline_method == 'constant':
-                            total += deconv_result.baseline_params[0]
-                        elif deconv_result.baseline_method == 'linear':
-                            total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
-                        elif deconv_result.baseline_method == 'quadratic':
-                            total += (deconv_result.baseline_params[0] + 
-                                     deconv_result.baseline_params[1] * log_tau +
-                                     deconv_result.baseline_params[2] * log_tau**2)
-                    
-                    fit_values[i] = total
-            
-            residuals = deconv_result.y_original - fit_values
-            
-            fit_data = pd.DataFrame({
-                'tau_s': deconv_result.x_linear,
-                'gamma_tau_Ohm': deconv_result.y_original,
-                'gamma_fit_Ohm': fit_values,
-                'Residuals_Ohm': residuals
-            })
-            
-            csv_fit = fit_data.to_csv(index=False)
-            st.download_button(
-                "📥 Export Fitting Data as CSV",
-                data=csv_fit,
-                file_name=f"deconvolution_fit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        
-        with col2:
-            st.markdown("**Generate Report**")
-            
-            if st.button("📄 Generate Detailed Report", use_container_width=True):
-                max_amp = max([p.amplitude for p in deconv_result.peaks]) if deconv_result.peaks else 1.0
-                
-                report = f"""GAUSSIAN DECONVOLUTION REPORT
-{"="*80}
-
-Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Number of points: {len(deconv_result.x_linear)}
-τ range: [{deconv_result.x_linear[0]:.2e}, {deconv_result.x_linear[-1]:.2e}] s
-Logarithmic X scale: {deconv_result.use_log_x}
-Baseline method: {deconv_result.baseline_method}
-Smoothing level: {st.session_state.app_state.smoothing_level}
-
-QUALITY METRICS:
-{"-"*40}
-R²: {deconv_result.quality_metrics.get('R²', 0):.6f}
-AIC: {deconv_result.quality_metrics.get('AIC', 0):.2f}
-BIC: {deconv_result.quality_metrics.get('BIC', 0):.2f}
-χ²: {deconv_result.quality_metrics.get('χ²', 0):.2e}
-RMSE: {deconv_result.quality_metrics.get('RMSE', 0):.2e}
-Max Error: {deconv_result.quality_metrics.get('Max Error', 0):.2e}
-
-"""
-                if deconv_result.baseline_method != 'none':
-                    report += f"""BASELINE PARAMETERS:
-{"-"*40}
-Method: {deconv_result.baseline_method}
-Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
-
-"""
-                
-                report += f"""PEAK PARAMETERS:
-{"-"*80}
-ID    Center (s)      Amplitude (Ω)    Area (Ω·s)       Fraction(%)
-{"-"*80}"""
-                
-                for p in deconv_result.peaks:
-                    report += f"\n{p.id:<4} {p.center:.4e}   {p.amplitude:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
-                
-                report += f"""
-
-NORMALIZED PARAMETERS (Max Peak = 1):
-{"-"*80}
-ID    Center (s)      Norm. Amplitude    Original Amplitude    Fraction(%)
-{"-"*80}"""
-                
-                for p in deconv_result.peaks:
-                    norm_amp = p.amplitude / max_amp
-                    report += f"\n{p.id:<4} {p.center:.4e}   {norm_amp:<18.4f} {p.amplitude:<20.4e} {p.fraction_percent:<10.2f}"
-                
-                report += f"""
-{"="*80}
-Total Area: {deconv_result.total_area:.6e} Ω·s
-Maximum Amplitude: {max_amp:.6e} Ω
-Number of Peaks: {len(deconv_result.peaks)}
-{"="*80}"""
-                
-                st.download_button(
-                    "📥 Download Report",
-                    data=report,
-                    file_name=f"deconvolution_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    use_container_width=True
-                )
+                        
+                        st.success("✅ Excel report generated successfully!")
+                        
+                    except Exception as e:
+                        st.error(f"Error generating Excel report: {str(e)}")
+                        st.exception(e)
         
         st.markdown("---")
         st.markdown("**Start New Analysis**")
@@ -4079,6 +3989,404 @@ Number of Peaks: {len(deconv_result.peaks)}
         if st.button("🔄 New Analysis", use_container_width=True):
             st.session_state.app_state = AppState()
             st.rerun()
+
+def create_impedance_data_sheet(data: ImpedanceData, solver, drt_result: DRTResult) -> pd.DataFrame:
+    """
+    Create DataFrame for Impedance Data sheet.
+    Includes original and reconstructed impedance data for Nyquist and Bode plots.
+    """
+    # Get reconstructed impedance from DRT
+    if solver is not None and drt_result is not None:
+        Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(drt_result.tau_grid, drt_result.gamma)
+        
+        # Interpolate reconstructed data to original frequencies for direct comparison
+        from scipy.interpolate import interp1d
+        
+        # Sort frequencies for interpolation
+        sort_idx = np.argsort(data.freq)
+        freq_sorted = data.freq[sort_idx]
+        re_z_sorted = data.re_z[sort_idx]
+        im_z_sorted = data.im_z[sort_idx]
+        
+        # Create interpolation functions for reconstructed data
+        # Reconstructed data is on tau grid, convert to frequency grid
+        rec_freq = 1 / (2 * np.pi * drt_result.tau_grid)
+        rec_freq_sorted = np.sort(rec_freq)[::-1]  # Sort descending (high to low)
+        
+        # Sort reconstructed data to match frequency order
+        sort_idx_rec = np.argsort(rec_freq)[::-1]
+        rec_real_sorted = Z_rec_real[sort_idx_rec]
+        rec_imag_sorted = Z_rec_imag[sort_idx_rec]
+        
+        # Interpolate to original frequencies
+        interp_real = interp1d(rec_freq_sorted, rec_real_sorted, 
+                               kind='cubic', fill_value='extrapolate', bounds_error=False)
+        interp_imag = interp1d(rec_freq_sorted, rec_imag_sorted,
+                               kind='cubic', fill_value='extrapolate', bounds_error=False)
+        
+        Z_rec_at_orig_freq_real = interp_real(freq_sorted)
+        Z_rec_at_orig_freq_imag = interp_imag(freq_sorted)
+        
+        # Calculate phase and magnitude for Bode plots
+        Z_orig_mag = data.Z_mod
+        Z_orig_phase = data.phase
+        Z_rec_mag = np.sqrt(Z_rec_at_orig_freq_real**2 + Z_rec_at_orig_freq_imag**2)
+        Z_rec_phase = np.arctan2(Z_rec_at_orig_freq_imag, Z_rec_at_orig_freq_real) * 180 / np.pi
+        
+        # Calculate relative error
+        relative_error = np.abs((data.Z - (Z_rec_at_orig_freq_real + 1j * Z_rec_at_orig_freq_imag)) / data.Z) * 100
+        
+    else:
+        # If no reconstruction available, create empty arrays
+        Z_rec_at_orig_freq_real = np.full_like(data.freq, np.nan)
+        Z_rec_at_orig_freq_imag = np.full_like(data.freq, np.nan)
+        Z_rec_mag = np.full_like(data.freq, np.nan)
+        Z_rec_phase = np.full_like(data.freq, np.nan)
+        relative_error = np.full_like(data.freq, np.nan)
+    
+    # Create DataFrame
+    df = pd.DataFrame({
+        'Frequency_Hz': data.freq,
+        'Re_Z_exp_Ohm': data.re_z,
+        'Im_Z_exp_Ohm': -data.im_z,  # Negative imaginary part as per convention
+        'Re_Z_rec_Ohm': Z_rec_at_orig_freq_real,
+        'Im_Z_rec_Ohm': -Z_rec_at_orig_freq_imag,  # Negative imaginary part as per convention
+        '|Z|_exp_Ohm': np.sqrt(data.re_z**2 + data.im_z**2),
+        'Phase_exp_deg': data.phase,
+        '|Z|_rec_Ohm': Z_rec_mag,
+        'Phase_rec_deg': Z_rec_phase,
+        'Relative_Error_percent': relative_error
+    })
+    
+    return df
+
+
+def create_drt_spectrum_sheet(drt_result: DRTResult) -> pd.DataFrame:
+    """
+    Create DataFrame for DRT Spectrum sheet.
+    Includes both τ and frequency representations.
+    """
+    # Calculate frequencies from tau
+    frequencies = 1 / (2 * np.pi * drt_result.tau_grid)
+    
+    # Sort by frequency descending (high to low) for better readability
+    sort_idx = np.argsort(frequencies)[::-1]
+    tau_sorted = drt_result.tau_grid[sort_idx]
+    gamma_sorted = drt_result.gamma[sort_idx]
+    freq_sorted = frequencies[sort_idx]
+    
+    # Include uncertainty if available
+    if drt_result.gamma_std is not None:
+        gamma_std_sorted = drt_result.gamma_std[sort_idx]
+    else:
+        gamma_std_sorted = np.full_like(gamma_sorted, np.nan)
+    
+    df = pd.DataFrame({
+        'Tau_s': tau_sorted,
+        'Gamma_Ohm': gamma_sorted,
+        'Gamma_Std_Ohm': gamma_std_sorted,
+        'Frequency_Hz': freq_sorted,
+        'Log10_Tau': np.log10(tau_sorted),
+        'Log10_Frequency': np.log10(freq_sorted)
+    })
+    
+    return df
+
+
+def create_deconvolution_sheet(deconv_result: DeconvolutionResult) -> pd.DataFrame:
+    """
+    Create DataFrame for Gaussian Deconvolution sheet.
+    Includes original DRT, total fit, individual peaks, and baseline.
+    Also includes interpolated data for smooth curves.
+    """
+    # Create dense grid for smooth curves (1000 points)
+    if deconv_result.use_log_x:
+        x_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
+        x_max = np.max(deconv_result.x_linear)
+        x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 1000)
+        x_dense_log = np.log10(x_dense)
+    else:
+        x_dense = np.linspace(np.min(deconv_result.x_linear), 
+                              np.max(deconv_result.x_linear), 1000)
+        x_dense_log = x_dense
+    
+    # Calculate total fit and individual peaks on dense grid
+    total_fit_dense = np.zeros_like(x_dense)
+    peaks_data = {}
+    
+    if deconv_result.peaks:
+        for peak in deconv_result.peaks:
+            y_peak = peak.amplitude * GaussianModelDeconv.gaussian(
+                x_dense_log, 1.0, peak.center_log, peak.sigma_log
+            )
+            total_fit_dense += y_peak
+            peaks_data[f'Peak_{peak.id}_Ohm'] = y_peak
+        
+        # Add baseline if present
+        if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+            if deconv_result.baseline_method == 'constant':
+                baseline_dense = np.full_like(x_dense, deconv_result.baseline_params[0])
+            elif deconv_result.baseline_method == 'linear':
+                baseline_dense = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
+            elif deconv_result.baseline_method == 'quadratic':
+                baseline_dense = (deconv_result.baseline_params[0] + 
+                                 deconv_result.baseline_params[1] * x_dense_log +
+                                 deconv_result.baseline_params[2] * x_dense_log**2)
+            else:
+                baseline_dense = np.zeros_like(x_dense)
+            
+            total_fit_dense += baseline_dense
+            peaks_data['Baseline_Ohm'] = baseline_dense
+        else:
+            peaks_data['Baseline_Ohm'] = np.zeros_like(x_dense)
+    
+    # Create DataFrame with original data (on original grid)
+    df_original = pd.DataFrame({
+        'Tau_s_original': deconv_result.x_linear,
+        'Gamma_original_Ohm': deconv_result.y_original,
+    })
+    
+    # Add fit values at original points if available
+    if deconv_result.fit_y_original is not None:
+        df_original['Total_Fit_original_Ohm'] = deconv_result.fit_y_original
+    else:
+        df_original['Total_Fit_original_Ohm'] = np.full_like(deconv_result.x_linear, np.nan)
+    
+    # Create DataFrame for smooth curves
+    df_smooth = pd.DataFrame({
+        'Tau_s_smooth': x_dense,
+        'Total_Fit_smooth_Ohm': total_fit_dense,
+        **peaks_data
+    })
+    
+    # Add note column
+    df_smooth['Note'] = 'Smooth curves for plotting (1000 points)'
+    
+    # Combine dataframes with a separator row
+    separator = pd.DataFrame([['--- END OF ORIGINAL DATA ---'] * len(df_smooth.columns)], columns=df_smooth.columns)
+    
+    # Use concat to combine
+    df_combined = pd.concat([df_original, pd.DataFrame([[''] * len(df_original.columns)], columns=df_original.columns), 
+                             df_smooth], ignore_index=True)
+    
+    return df_combined
+
+
+def create_analysis_report_sheet(deconv_result: DeconvolutionResult, drt_result: DRTResult) -> pd.DataFrame:
+    """
+    Create DataFrame for Analysis Report sheet.
+    Includes peak parameters, quality metrics, and regularization parameters.
+    """
+    # Section 1: Peak Parameters (table format)
+    peaks_data = []
+    for peak in deconv_result.peaks:
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Center (τ, s)',
+            'Value': peak.center,
+            'Unit': 's'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Center (log τ)',
+            'Value': peak.center_log,
+            'Unit': 'log10(s)'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Amplitude (Ω)',
+            'Value': peak.amplitude,
+            'Unit': 'Ω'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Amplitude (norm)',
+            'Value': peak.amplitude_norm,
+            'Unit': ''
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Sigma (log)',
+            'Value': peak.sigma_log,
+            'Unit': 'log10(s)'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - FWHM',
+            'Value': peak.fwhm,
+            'Unit': 'log10(s)'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Area (Ω·s)',
+            'Value': peak.area,
+            'Unit': 'Ω·s'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Fraction (%)',
+            'Value': peak.fraction_percent,
+            'Unit': '%'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Characteristic Frequency (Hz)',
+            'Value': peak.get_characteristic_frequency(),
+            'Unit': 'Hz'
+        })
+        peaks_data.append({
+            'Parameter': f'Peak {peak.id} - Resistance Contribution (Ω)',
+            'Value': peak.get_resistance_contribution(),
+            'Unit': 'Ω'
+        })
+        peaks_data.append({'Parameter': '', 'Value': '', 'Unit': ''})  # Empty row separator
+    
+    # Section 2: Quality Metrics
+    quality_data = []
+    if deconv_result.quality_metrics:
+        for key, value in deconv_result.quality_metrics.items():
+            if key != 'Residuals':  # Skip large residuals array
+                quality_data.append({
+                    'Parameter': f'Quality - {key}',
+                    'Value': value,
+                    'Unit': '' if key in ['R²'] else 'Ω' if key == 'RMSE' else ''
+                })
+    
+    # Add empty row separator
+    quality_data.append({'Parameter': '', 'Value': '', 'Unit': ''})
+    
+    # Section 3: DRT Parameters
+    drt_params = []
+    drt_params.append({
+        'Parameter': 'DRT - R_inf (Ω)',
+        'Value': drt_result.R_inf,
+        'Unit': 'Ω'
+    })
+    drt_params.append({
+        'Parameter': 'DRT - R_pol (Ω)',
+        'Value': drt_result.R_pol,
+        'Unit': 'Ω'
+    })
+    drt_params.append({
+        'Parameter': 'DRT - Method',
+        'Value': drt_result.method,
+        'Unit': ''
+    })
+    
+    # Regularization parameter
+    if 'lambda' in drt_result.metadata:
+        drt_params.append({
+            'Parameter': 'DRT - Regularization λ',
+            'Value': drt_result.metadata['lambda'],
+            'Unit': ''
+        })
+    
+    if 'integral_ratio' in drt_result.metadata:
+        drt_params.append({
+            'Parameter': 'DRT - Integral Ratio',
+            'Value': drt_result.metadata['integral_ratio'],
+            'Unit': ''
+        })
+    
+    # Add empty row separator
+    drt_params.append({'Parameter': '', 'Value': '', 'Unit': ''})
+    
+    # Section 4: Deconvolution Settings
+    settings_data = [
+        {'Parameter': 'Deconv - Baseline Method', 'Value': deconv_result.baseline_method, 'Unit': ''},
+        {'Parameter': 'Deconv - Use Log X', 'Value': deconv_result.use_log_x, 'Unit': ''},
+        {'Parameter': 'Deconv - Use Log Y', 'Value': deconv_result.use_log_y, 'Unit': ''},
+        {'Parameter': 'Deconv - Total Area (Ω·s)', 'Value': deconv_result.total_area, 'Unit': 'Ω·s'},
+        {'Parameter': 'Deconv - Number of Peaks', 'Value': len(deconv_result.peaks), 'Unit': ''},
+    ]
+    
+    if deconv_result.baseline_params:
+        settings_data.append({
+            'Parameter': f'Deconv - Baseline Parameters',
+            'Value': ', '.join([f'{p:.4e}' for p in deconv_result.baseline_params]),
+            'Unit': ''
+        })
+    
+    # Combine all sections
+    all_data = []
+    all_data.append({'Parameter': '=== PEAK PARAMETERS ===', 'Value': '', 'Unit': ''})
+    all_data.extend(peaks_data)
+    all_data.append({'Parameter': '=== QUALITY METRICS ===', 'Value': '', 'Unit': ''})
+    all_data.extend(quality_data)
+    all_data.append({'Parameter': '=== DRT PARAMETERS ===', 'Value': '', 'Unit': ''})
+    all_data.extend(drt_params)
+    all_data.append({'Parameter': '=== DECONVOLUTION SETTINGS ===', 'Value': '', 'Unit': ''})
+    all_data.extend(settings_data)
+    
+    # Create summary row
+    all_data.append({'Parameter': '=== SUMMARY ===', 'Value': '', 'Unit': ''})
+    all_data.append({
+        'Parameter': 'Total Polarization Resistance (R_pol)',
+        'Value': drt_result.R_pol,
+        'Unit': 'Ω'
+    })
+    all_data.append({
+        'Parameter': 'Total Deconvolved Area',
+        'Value': sum([p.area for p in deconv_result.peaks]),
+        'Unit': 'Ω·s'
+    })
+    all_data.append({
+        'Parameter': 'Area Ratio (Deconv / R_pol)',
+        'Value': sum([p.area for p in deconv_result.peaks]) / drt_result.R_pol if drt_result.R_pol > 0 else 0,
+        'Unit': ''
+    })
+    all_data.append({
+        'Parameter': 'Best Fit R²',
+        'Value': deconv_result.quality_metrics.get('R²', 0),
+        'Unit': ''
+    })
+    
+    df_report = pd.DataFrame(all_data)
+    
+    return df_report
+
+
+def format_excel_sheets(writer):
+    """
+    Apply formatting to all sheets in the Excel file.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    
+    workbook = writer.book
+    
+    # Define styles
+    header_font = Font(bold=True, size=11)
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font_white = Font(bold=True, size=11, color="FFFFFF")
+    
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    for sheetname in workbook.sheetnames:
+        worksheet = workbook[sheetname]
+        
+        # Auto-adjust column widths
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+        
+        # Format header row
+        for cell in worksheet[1]:
+            if cell.value:
+                cell.font = header_font_white
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = thin_border
+        
+        # Format data cells
+        for row in worksheet.iter_rows(min_row=2):
+            for cell in row:
+                if cell.value:
+                    cell.border = thin_border
+                    cell.alignment = Alignment(horizontal='left', vertical='center')
 
 
 # ============================================================================
