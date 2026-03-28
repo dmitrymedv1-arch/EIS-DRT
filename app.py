@@ -2557,7 +2557,7 @@ class GaussianDeconvolver:
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
             y_norm=self.y_norm,
-            y_original=self.y_for_fitting,
+            y_original=self.y_original,
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
@@ -3513,7 +3513,7 @@ def step3_gaussian_deconvolution():
                 ax.set_xscale('log')
             
             # Plot scaled DRT data
-            ax.plot(deconvolver.x_linear, deconvolver.y_for_fitting, 
+            ax.plot(deconvolver.x_linear, deconvolver.y_original, 
                    'o-', markersize=3, linewidth=1, alpha=0.7, 
                    label='Scaled DRT Data', color='black', zorder=1)
             
@@ -3678,16 +3678,9 @@ def step4_results():
             # Суммируем все компоненты
             y_total = np.zeros_like(x_dense)
             for peak in deconv_result.peaks:
-                # Используем amp_norm вместо amplitude для предотвращения двойного масштабирования
-                # amplitude = amp_norm * y_max, но y_max уже учтен в deconv_result.y_original
-                # Для консистентности используем amp_norm и затем масштабируем до y_max
-                y_total += peak.amp_norm * GaussianModelDeconv.gaussian(
+                y_total += peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )
-            
-            # Масштабируем общую сумму до исходного масштаба
-            y_max_orig = np.max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
-            y_total = y_total * y_max_orig
             
             # Добавляем базовую линию если есть
             if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
@@ -4183,3 +4176,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
