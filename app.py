@@ -3997,10 +3997,6 @@ def step4_results():
                                 interp_imag = interp1d(np.log10(drt_result.tau_grid), Z_rec_imag, 
                                                       kind='cubic', fill_value='extrapolate')
                                 
-                                # Convert tau grid to frequency
-                                tau_freq = 1 / (2 * np.pi * drt_result.tau_grid)
-                                log_tau_freq = np.log10(tau_freq)
-                                
                                 # Interpolate to original frequencies
                                 log_original_freq = np.log10(data.freq)
                                 Z_rec_real_interp = interp_real(log_original_freq)
@@ -4025,240 +4021,257 @@ def step4_results():
                                 sheet1_data['Phase_rec (deg)'] = np.nan * data.freq
                                 sheet1_data['Relative_Error (%)'] = np.nan * data.freq
                             
+                            # ALWAYS create at least one sheet - this is the critical fix
                             df_sheet1 = pd.DataFrame(sheet1_data)
                             df_sheet1.to_excel(writer, sheet_name='Original_Reconstructed', index=False)
                             
-                            # ============================================================
-                            # Sheet 2: DRT Spectrum
-                            # ============================================================
-                            sheet2_data = {
-                                'τ (s)': drt_result.tau_grid,
-                                'log10(τ)': np.log10(drt_result.tau_grid),
-                                'γ(τ) (Ω)': drt_result.gamma
-                            }
-                            
-                            # Add uncertainty if available
-                            if drt_result.gamma_std is not None:
-                                sheet2_data['γ_std (Ω)'] = drt_result.gamma_std
-                                sheet2_data['γ ± 2σ (Ω)'] = drt_result.gamma_std * 2
-                            
-                            # Calculate frequency
-                            frequencies = 1 / (2 * np.pi * drt_result.tau_grid)
-                            sheet2_data['Frequency (Hz)'] = frequencies
-                            sheet2_data['log10(Frequency)'] = np.log10(frequencies)
-                            
-                            df_sheet2 = pd.DataFrame(sheet2_data)
-                            df_sheet2.to_excel(writer, sheet_name='DRT_Spectrum', index=False)
-                            
-                            # ============================================================
-                            # Sheet 3: Gaussian Deconvolution
-                            # ============================================================
-                            
-                            # Prepare data for deconvolution sheet
-                            # Original DRT data
-                            sheet3_data = {
-                                'τ (s)': deconv_result.x_linear,
-                                'γ_original (Ω)': deconv_result.y_original
-                            }
-                            
-                            # Calculate total fit for original points
-                            if deconv_result.fit_y_original is not None:
-                                sheet3_data['γ_fit_total (Ω)'] = deconv_result.fit_y_original
-                            else:
-                                # Calculate total fit
-                                total_fit = np.zeros_like(deconv_result.x_linear)
-                                for i, tau in enumerate(deconv_result.x_linear):
-                                    if deconv_result.use_log_x:
-                                        log_tau = np.log10(tau)
-                                    else:
-                                        log_tau = tau
-                                    
-                                    # Sum peaks
-                                    total = 0
-                                    for peak in deconv_result.peaks:
-                                        total += peak.amplitude * GaussianModelDeconv.gaussian(
-                                            log_tau, 1.0, peak.center_log, peak.sigma_log
-                                        )
-                                    
-                                    # Add baseline
-                                    if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-                                        if deconv_result.baseline_method == 'constant':
-                                            total += deconv_result.baseline_params[0]
-                                        elif deconv_result.baseline_method == 'linear':
-                                            total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
-                                        elif deconv_result.baseline_method == 'quadratic':
-                                            total += (deconv_result.baseline_params[0] + 
-                                                     deconv_result.baseline_params[1] * log_tau +
-                                                     deconv_result.baseline_params[2] * log_tau**2)
-                                    
-                                    total_fit[i] = total
-                                
-                                sheet3_data['γ_fit_total (Ω)'] = total_fit
-                            
-                            # Add individual peaks
-                            for peak in deconv_result.peaks:
-                                peak_col_name = f'γ_peak_{peak.id} (Ω)'
-                                peak_values = np.zeros_like(deconv_result.x_linear)
-                                
-                                for i, tau in enumerate(deconv_result.x_linear):
-                                    if deconv_result.use_log_x:
-                                        log_tau = np.log10(tau)
-                                    else:
-                                        log_tau = tau
-                                    
-                                    peak_values[i] = peak.amplitude * GaussianModelDeconv.gaussian(
-                                        log_tau, 1.0, peak.center_log, peak.sigma_log
-                                    )
-                                
-                                sheet3_data[peak_col_name] = peak_values
-                            
-                            # Add baseline if present
-                            if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-                                baseline_values = np.zeros_like(deconv_result.x_linear)
-                                for i, tau in enumerate(deconv_result.x_linear):
-                                    if deconv_result.use_log_x:
-                                        log_tau = np.log10(tau)
-                                    else:
-                                        log_tau = tau
-                                    
-                                    if deconv_result.baseline_method == 'constant':
-                                        baseline_values[i] = deconv_result.baseline_params[0]
-                                    elif deconv_result.baseline_method == 'linear':
-                                        baseline_values[i] = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
-                                    elif deconv_result.baseline_method == 'quadratic':
-                                        baseline_values[i] = (deconv_result.baseline_params[0] + 
-                                                             deconv_result.baseline_params[1] * log_tau +
-                                                             deconv_result.baseline_params[2] * log_tau**2)
-                                
-                                sheet3_data[f'baseline_{deconv_result.baseline_method} (Ω)'] = baseline_values
-                            
-                            # Add residuals
-                            residuals = sheet3_data['γ_original (Ω)'] - sheet3_data['γ_fit_total (Ω)']
-                            sheet3_data['Residuals (Ω)'] = residuals
-                            
-                            df_sheet3 = pd.DataFrame(sheet3_data)
-                            df_sheet3.to_excel(writer, sheet_name='Gaussian_Deconvolution', index=False)
-                            
-                            # If dense grid requested, add additional sheet for smooth curves
-                            if include_dense_grid:
-                                # Create dense grid for smooth curves
-                                if deconv_result.use_log_x:
-                                    tau_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
-                                    tau_max = np.max(deconv_result.x_linear)
-                                    tau_dense = np.logspace(np.log10(tau_min), np.log10(tau_max), 2000)
-                                    x_dense_log = np.log10(tau_dense)
-                                else:
-                                    tau_dense = np.linspace(np.min(deconv_result.x_linear), 
-                                                            np.max(deconv_result.x_linear), 2000)
-                                    x_dense_log = tau_dense
-                                
-                                dense_data = {
-                                    'τ (s) - dense grid': tau_dense
+                            # Only add other sheets if data is available
+                            if drt_result is not None:
+                                # ============================================================
+                                # Sheet 2: DRT Spectrum
+                                # ============================================================
+                                sheet2_data = {
+                                    'τ (s)': drt_result.tau_grid,
+                                    'log10(τ)': np.log10(drt_result.tau_grid),
+                                    'γ(τ) (Ω)': drt_result.gamma
                                 }
                                 
-                                # Total fit on dense grid
+                                # Add uncertainty if available
+                                if drt_result.gamma_std is not None:
+                                    sheet2_data['γ_std (Ω)'] = drt_result.gamma_std
+                                    sheet2_data['γ ± 2σ (Ω)'] = drt_result.gamma_std * 2
+                                
+                                # Calculate frequency
+                                frequencies = 1 / (2 * np.pi * drt_result.tau_grid)
+                                sheet2_data['Frequency (Hz)'] = frequencies
+                                sheet2_data['log10(Frequency)'] = np.log10(frequencies)
+                                
+                                df_sheet2 = pd.DataFrame(sheet2_data)
+                                df_sheet2.to_excel(writer, sheet_name='DRT_Spectrum', index=False)
+                            
+                            if deconv_result is not None:
+                                # ============================================================
+                                # Sheet 3: Gaussian Deconvolution
+                                # ============================================================
+                                
+                                # Prepare data for deconvolution sheet
+                                # Original DRT data
+                                sheet3_data = {
+                                    'τ (s)': deconv_result.x_linear,
+                                    'γ_original (Ω)': deconv_result.y_original
+                                }
+                                
+                                # Calculate total fit for original points
                                 if deconv_result.fit_y_original is not None:
-                                    from scipy.interpolate import interp1d
-                                    interp_func = interp1d(deconv_result.x_linear, deconv_result.fit_y_original, 
-                                                          kind='cubic', fill_value='extrapolate')
-                                    dense_data['γ_fit_total_smooth (Ω)'] = interp_func(tau_dense)
+                                    sheet3_data['γ_fit_total (Ω)'] = deconv_result.fit_y_original
                                 else:
-                                    total_fit_dense = np.zeros_like(tau_dense)
-                                    for i, tau in enumerate(tau_dense):
+                                    # Calculate total fit
+                                    total_fit = np.zeros_like(deconv_result.x_linear)
+                                    for i, tau in enumerate(deconv_result.x_linear):
+                                        if deconv_result.use_log_x:
+                                            log_tau = np.log10(tau)
+                                        else:
+                                            log_tau = tau
+                                        
+                                        # Sum peaks
                                         total = 0
                                         for peak in deconv_result.peaks:
                                             total += peak.amplitude * GaussianModelDeconv.gaussian(
-                                                x_dense_log[i], 1.0, peak.center_log, peak.sigma_log
+                                                log_tau, 1.0, peak.center_log, peak.sigma_log
                                             )
                                         
+                                        # Add baseline
                                         if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
                                             if deconv_result.baseline_method == 'constant':
                                                 total += deconv_result.baseline_params[0]
                                             elif deconv_result.baseline_method == 'linear':
-                                                total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log[i]
+                                                total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
                                             elif deconv_result.baseline_method == 'quadratic':
                                                 total += (deconv_result.baseline_params[0] + 
-                                                         deconv_result.baseline_params[1] * x_dense_log[i] +
-                                                         deconv_result.baseline_params[2] * x_dense_log[i]**2)
+                                                         deconv_result.baseline_params[1] * log_tau +
+                                                         deconv_result.baseline_params[2] * log_tau**2)
                                         
-                                        total_fit_dense[i] = total
+                                        total_fit[i] = total
                                     
-                                    dense_data['γ_fit_total_smooth (Ω)'] = total_fit_dense
+                                    sheet3_data['γ_fit_total (Ω)'] = total_fit
                                 
-                                # Individual peaks on dense grid
+                                # Add individual peaks
                                 for peak in deconv_result.peaks:
-                                    peak_dense = np.zeros_like(tau_dense)
-                                    for i in range(len(tau_dense)):
-                                        peak_dense[i] = peak.amplitude * GaussianModelDeconv.gaussian(
-                                            x_dense_log[i], 1.0, peak.center_log, peak.sigma_log
+                                    peak_col_name = f'γ_peak_{peak.id} (Ω)'
+                                    peak_values = np.zeros_like(deconv_result.x_linear)
+                                    
+                                    for i, tau in enumerate(deconv_result.x_linear):
+                                        if deconv_result.use_log_x:
+                                            log_tau = np.log10(tau)
+                                        else:
+                                            log_tau = tau
+                                        
+                                        peak_values[i] = peak.amplitude * GaussianModelDeconv.gaussian(
+                                            log_tau, 1.0, peak.center_log, peak.sigma_log
                                         )
-                                    dense_data[f'γ_peak_{peak.id}_smooth (Ω)'] = peak_dense
+                                    
+                                    sheet3_data[peak_col_name] = peak_values
                                 
-                                df_dense = pd.DataFrame(dense_data)
-                                df_dense.to_excel(writer, sheet_name='Gaussian_Deconvolution_Smooth', index=False)
+                                # Add baseline if present
+                                if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+                                    baseline_values = np.zeros_like(deconv_result.x_linear)
+                                    for i, tau in enumerate(deconv_result.x_linear):
+                                        if deconv_result.use_log_x:
+                                            log_tau = np.log10(tau)
+                                        else:
+                                            log_tau = tau
+                                        
+                                        if deconv_result.baseline_method == 'constant':
+                                            baseline_values[i] = deconv_result.baseline_params[0]
+                                        elif deconv_result.baseline_method == 'linear':
+                                            baseline_values[i] = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
+                                        elif deconv_result.baseline_method == 'quadratic':
+                                            baseline_values[i] = (deconv_result.baseline_params[0] + 
+                                                                 deconv_result.baseline_params[1] * log_tau +
+                                                                 deconv_result.baseline_params[2] * log_tau**2)
+                                    
+                                    sheet3_data[f'baseline_{deconv_result.baseline_method} (Ω)'] = baseline_values
+                                
+                                # Add residuals
+                                residuals = sheet3_data['γ_original (Ω)'] - sheet3_data['γ_fit_total (Ω)']
+                                sheet3_data['Residuals (Ω)'] = residuals
+                                
+                                df_sheet3 = pd.DataFrame(sheet3_data)
+                                df_sheet3.to_excel(writer, sheet_name='Gaussian_Deconvolution', index=False)
+                                
+                                # If dense grid requested, add additional sheet for smooth curves
+                                if include_dense_grid:
+                                    # Create dense grid for smooth curves
+                                    if deconv_result.use_log_x:
+                                        tau_min = max(np.min(deconv_result.x_linear[deconv_result.x_linear > 0]), 1e-15)
+                                        tau_max = np.max(deconv_result.x_linear)
+                                        tau_dense = np.logspace(np.log10(tau_min), np.log10(tau_max), 2000)
+                                        x_dense_log = np.log10(tau_dense)
+                                    else:
+                                        tau_dense = np.linspace(np.min(deconv_result.x_linear), 
+                                                                np.max(deconv_result.x_linear), 2000)
+                                        x_dense_log = tau_dense
+                                    
+                                    dense_data = {
+                                        'τ (s) - dense grid': tau_dense
+                                    }
+                                    
+                                    # Total fit on dense grid
+                                    if deconv_result.fit_y_original is not None:
+                                        from scipy.interpolate import interp1d
+                                        interp_func = interp1d(deconv_result.x_linear, deconv_result.fit_y_original, 
+                                                              kind='cubic', fill_value='extrapolate')
+                                        dense_data['γ_fit_total_smooth (Ω)'] = interp_func(tau_dense)
+                                    else:
+                                        total_fit_dense = np.zeros_like(tau_dense)
+                                        for i, tau in enumerate(tau_dense):
+                                            total = 0
+                                            for peak in deconv_result.peaks:
+                                                total += peak.amplitude * GaussianModelDeconv.gaussian(
+                                                    x_dense_log[i], 1.0, peak.center_log, peak.sigma_log
+                                                )
+                                            
+                                            if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+                                                if deconv_result.baseline_method == 'constant':
+                                                    total += deconv_result.baseline_params[0]
+                                                elif deconv_result.baseline_method == 'linear':
+                                                    total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log[i]
+                                                elif deconv_result.baseline_method == 'quadratic':
+                                                    total += (deconv_result.baseline_params[0] + 
+                                                             deconv_result.baseline_params[1] * x_dense_log[i] +
+                                                             deconv_result.baseline_params[2] * x_dense_log[i]**2)
+                                            
+                                            total_fit_dense[i] = total
+                                        
+                                        dense_data['γ_fit_total_smooth (Ω)'] = total_fit_dense
+                                    
+                                    # Individual peaks on dense grid
+                                    for peak in deconv_result.peaks:
+                                        peak_dense = np.zeros_like(tau_dense)
+                                        for i in range(len(tau_dense)):
+                                            peak_dense[i] = peak.amplitude * GaussianModelDeconv.gaussian(
+                                                x_dense_log[i], 1.0, peak.center_log, peak.sigma_log
+                                            )
+                                        dense_data[f'γ_peak_{peak.id}_smooth (Ω)'] = peak_dense
+                                    
+                                    df_dense = pd.DataFrame(dense_data)
+                                    df_dense.to_excel(writer, sheet_name='Gaussian_Deconvolution_Smooth', index=False)
                             
                             # ============================================================
-                            # Sheet 4: Report & Parameters
+                            # Sheet 4: Report & Parameters (always add this sheet)
                             # ============================================================
                             
-                            # Create peak parameters table
-                            peak_params_list = []
-                            for peak in deconv_result.peaks:
-                                peak_params_list.append({
-                                    'Peak ID': peak.id,
-                                    'Center τ (s)': peak.center,
-                                    'Center log10(τ)': peak.center_log,
-                                    'Amplitude (Ω)': peak.amplitude,
-                                    'Amplitude (norm)': peak.amplitude_norm,
-                                    'Sigma (log10)': peak.sigma_log,
-                                    'FWHM (log10)': peak.fwhm,
-                                    'Area (Ω)': peak.area,
-                                    'Fraction (%)': peak.fraction_percent,
-                                    'Characteristic Frequency (Hz)': peak.get_characteristic_frequency(),
-                                    'Source': peak.source
-                                })
-                            
-                            df_peaks = pd.DataFrame(peak_params_list)
-                            
-                            # Create quality metrics table
-                            quality_metrics = deconv_result.quality_metrics
-                            metrics_list = []
-                            for key, value in quality_metrics.items():
-                                if key != 'Residuals':
-                                    metrics_list.append({
-                                        'Metric': key,
-                                        'Value': value
+                            # Create peak parameters table (if deconv_result exists)
+                            if deconv_result is not None and deconv_result.peaks:
+                                peak_params_list = []
+                                for peak in deconv_result.peaks:
+                                    peak_params_list.append({
+                                        'Peak ID': peak.id,
+                                        'Center τ (s)': peak.center,
+                                        'Center log10(τ)': peak.center_log,
+                                        'Amplitude (Ω)': peak.amplitude,
+                                        'Amplitude (norm)': peak.amplitude_norm,
+                                        'Sigma (log10)': peak.sigma_log,
+                                        'FWHM (log10)': peak.fwhm,
+                                        'Area (Ω)': peak.area,
+                                        'Fraction (%)': peak.fraction_percent,
+                                        'Characteristic Frequency (Hz)': peak.get_characteristic_frequency(),
+                                        'Source': peak.source
                                     })
+                                df_peaks = pd.DataFrame(peak_params_list)
+                                df_peaks.to_excel(writer, sheet_name='Report_Peak_Parameters', index=False)
+                            else:
+                                # Create empty sheet with message if no peaks
+                                df_empty = pd.DataFrame({'Note': ['No peaks detected or deconvolution not performed']})
+                                df_empty.to_excel(writer, sheet_name='Report_Peak_Parameters', index=False)
                             
-                            df_metrics = pd.DataFrame(metrics_list)
+                            # Create quality metrics table (if deconv_result exists)
+                            if deconv_result is not None and deconv_result.quality_metrics:
+                                quality_metrics = deconv_result.quality_metrics
+                                metrics_list = []
+                                for key, value in quality_metrics.items():
+                                    if key != 'Residuals':
+                                        metrics_list.append({
+                                            'Metric': key,
+                                            'Value': value
+                                        })
+                                df_metrics = pd.DataFrame(metrics_list)
+                                df_metrics.to_excel(writer, sheet_name='Report_Quality_Metrics', index=False)
+                            else:
+                                df_empty = pd.DataFrame({'Note': ['Quality metrics not available']})
+                                df_empty.to_excel(writer, sheet_name='Report_Quality_Metrics', index=False)
                             
-                            # Create DRT parameters table
-                            drt_params = {
-                                'Parameter': [
-                                    'DRT Method',
-                                    'R_inf (Ω)',
-                                    'R_pol (Ω)',
-                                    'Regularization λ',
-                                    'Number of tau points',
-                                    'Tau min (s)',
-                                    'Tau max (s)',
-                                    'DRT integral verification (Ω)',
-                                    'Integral ratio (∫γ/R_pol)'
-                                ],
-                                'Value': [
-                                    drt_result.method,
-                                    drt_result.R_inf,
-                                    drt_result.R_pol,
-                                    drt_result.metadata.get('lambda', 'N/A'),
-                                    len(drt_result.tau_grid),
-                                    drt_result.tau_grid.min(),
-                                    drt_result.tau_grid.max(),
-                                    drt_result.metadata.get('drt_integral', 0),
-                                    drt_result.metadata.get('integral_ratio', 0)
-                                ]
-                            }
-                            
-                            df_drt_params = pd.DataFrame(drt_params)
+                            # Create DRT parameters table (always add this if drt_result exists)
+                            if drt_result is not None:
+                                drt_params = {
+                                    'Parameter': [
+                                        'DRT Method',
+                                        'R_inf (Ω)',
+                                        'R_pol (Ω)',
+                                        'Regularization λ',
+                                        'Number of tau points',
+                                        'Tau min (s)',
+                                        'Tau max (s)',
+                                        'DRT integral verification (Ω)',
+                                        'Integral ratio (∫γ/R_pol)'
+                                    ],
+                                    'Value': [
+                                        drt_result.method,
+                                        drt_result.R_inf,
+                                        drt_result.R_pol,
+                                        drt_result.metadata.get('lambda', 'N/A'),
+                                        len(drt_result.tau_grid),
+                                        drt_result.tau_grid.min(),
+                                        drt_result.tau_grid.max(),
+                                        drt_result.metadata.get('drt_integral', 0),
+                                        drt_result.metadata.get('integral_ratio', 0)
+                                    ]
+                                }
+                                df_drt_params = pd.DataFrame(drt_params)
+                                df_drt_params.to_excel(writer, sheet_name='Report_DRT_Parameters', index=False)
+                            else:
+                                df_empty = pd.DataFrame({'Note': ['DRT results not available']})
+                                df_empty.to_excel(writer, sheet_name='Report_DRT_Parameters', index=False)
                             
                             # Create deconvolution settings table
                             deconv_settings = {
@@ -4272,22 +4285,17 @@ def step4_results():
                                     'Max amplitude (Ω)'
                                 ],
                                 'Value': [
-                                    deconv_result.baseline_method,
+                                    deconv_result.baseline_method if deconv_result is not None else 'N/A',
                                     st.session_state.app_state.smoothing_level,
                                     st.session_state.app_state.fitting_method,
                                     st.session_state.app_state.fit_quality,
-                                    len(deconv_result.peaks),
-                                    deconv_result.total_area,
-                                    deconv_result.max_amplitude
+                                    len(deconv_result.peaks) if deconv_result is not None else 0,
+                                    deconv_result.total_area if deconv_result is not None else 0,
+                                    deconv_result.max_amplitude if deconv_result is not None else 0
                                 ]
                             }
                             
                             df_deconv_settings = pd.DataFrame(deconv_settings)
-                            
-                            # Write all to Excel with formatting
-                            df_peaks.to_excel(writer, sheet_name='Report_Peak_Parameters', index=False)
-                            df_metrics.to_excel(writer, sheet_name='Report_Quality_Metrics', index=False)
-                            df_drt_params.to_excel(writer, sheet_name='Report_DRT_Parameters', index=False)
                             df_deconv_settings.to_excel(writer, sheet_name='Report_Deconv_Settings', index=False)
                             
                             # Create summary sheet with all key information
@@ -4297,21 +4305,42 @@ def step4_results():
                             summary_data.append(['Frequency range', f"{data.freq.min():.2e} - {data.freq.max():.2e} Hz"])
                             summary_data.append(['', ''])
                             summary_data.append(['DRT ANALYSIS SUMMARY', ''])
-                            summary_data.append(['R_inf (Ω)', drt_result.R_inf])
-                            summary_data.append(['R_pol (Ω)', drt_result.R_pol])
-                            summary_data.append(['Regularization λ', drt_result.metadata.get('lambda', 'N/A')])
+                            
+                            if drt_result is not None:
+                                summary_data.append(['R_inf (Ω)', drt_result.R_inf])
+                                summary_data.append(['R_pol (Ω)', drt_result.R_pol])
+                                summary_data.append(['Regularization λ', drt_result.metadata.get('lambda', 'N/A')])
+                            else:
+                                summary_data.append(['R_inf (Ω)', 'N/A'])
+                                summary_data.append(['R_pol (Ω)', 'N/A'])
+                                summary_data.append(['Regularization λ', 'N/A'])
+                            
                             summary_data.append(['', ''])
                             summary_data.append(['DECONVOLUTION SUMMARY', ''])
-                            summary_data.append(['Number of peaks', len(deconv_result.peaks)])
-                            summary_data.append(['Total area (Ω)', deconv_result.total_area])
-                            summary_data.append(['R²', quality_metrics.get('R²', 0)])
-                            summary_data.append(['RMSE', quality_metrics.get('RMSE', 0)])
-                            summary_data.append(['Baseline method', deconv_result.baseline_method])
-                            summary_data.append(['', ''])
-                            summary_data.append(['PEAK AREA DISTRIBUTION', ''])
                             
-                            for peak in deconv_result.peaks:
-                                summary_data.append([f'Peak {peak.id}', f'{peak.fraction_percent:.2f}% ({peak.area:.4e} Ω)'])
+                            if deconv_result is not None:
+                                summary_data.append(['Number of peaks', len(deconv_result.peaks)])
+                                summary_data.append(['Total area (Ω)', deconv_result.total_area])
+                                if deconv_result.quality_metrics:
+                                    summary_data.append(['R²', deconv_result.quality_metrics.get('R²', 0)])
+                                    summary_data.append(['RMSE', deconv_result.quality_metrics.get('RMSE', 0)])
+                                else:
+                                    summary_data.append(['R²', 'N/A'])
+                                    summary_data.append(['RMSE', 'N/A'])
+                                summary_data.append(['Baseline method', deconv_result.baseline_method])
+                                summary_data.append(['', ''])
+                                summary_data.append(['PEAK AREA DISTRIBUTION', ''])
+                                
+                                for peak in deconv_result.peaks:
+                                    summary_data.append([f'Peak {peak.id}', f'{peak.fraction_percent:.2f}% ({peak.area:.4e} Ω)'])
+                            else:
+                                summary_data.append(['Number of peaks', 'N/A'])
+                                summary_data.append(['Total area (Ω)', 'N/A'])
+                                summary_data.append(['R²', 'N/A'])
+                                summary_data.append(['RMSE', 'N/A'])
+                                summary_data.append(['Baseline method', 'N/A'])
+                                summary_data.append(['', ''])
+                                summary_data.append(['PEAK AREA DISTRIBUTION', 'No peaks available'])
                             
                             df_summary = pd.DataFrame(summary_data, columns=['Parameter', 'Value'])
                             df_summary.to_excel(writer, sheet_name='Report_Summary', index=False)
