@@ -1433,6 +1433,123 @@ class GaussianFitter:
             upper_bounds.append(x_range**2)
         
         return lower_bounds, upper_bounds
+
+    def _create_bounds_with_fixed_centers(self, x, y_norm, n_peaks, n_baseline, fixed_centers):
+        """
+        Create bounds with fixed centers for stage 1 optimization.
+        Centers are fixed to initial positions, only amplitudes and sigmas vary.
+        
+        Args:
+            x: x data array
+            y_norm: normalized y data
+            n_peaks: number of peaks
+            n_baseline: number of baseline parameters
+            fixed_centers: list of fixed center positions for each peak
+        
+        Returns:
+            lower_bounds, upper_bounds lists
+        """
+        lower_bounds = []
+        upper_bounds = []
+        x_range = np.max(x) - np.min(x)
+        
+        # Peak bounds with fixed centers
+        for i in range(n_peaks):
+            # Amplitude bounds
+            lower_bounds.append(0)
+            upper_bounds.append(2 * np.max(y_norm))
+            
+            # Center bounds - fixed to exact position (very narrow range)
+            center_fixed = fixed_centers[i]
+            lower_bounds.append(center_fixed - 1e-10)
+            upper_bounds.append(center_fixed + 1e-10)
+            
+            # Sigma bounds
+            lower_bounds.append(x_range * 0.001)
+            upper_bounds.append(x_range * 0.5)
+        
+        # Baseline bounds (unchanged)
+        if n_baseline >= 1:  # constant
+            lower_bounds.append(-np.max(y_norm))
+            upper_bounds.append(np.max(y_norm))
+        if n_baseline >= 2:  # linear term
+            lower_bounds.append(-x_range)
+            upper_bounds.append(x_range)
+        if n_baseline >= 3:  # quadratic term
+            lower_bounds.append(-x_range**2)
+            upper_bounds.append(x_range**2)
+        
+        return lower_bounds, upper_bounds
+    
+    def _create_bounds_with_limited_centers(self, x, y_norm, n_peaks, n_baseline, initial_centers, shift_range):
+        """
+        Create bounds with limited center movement for stage 2 optimization.
+        
+        Args:
+            x: x data array
+            y_norm: normalized y data
+            n_peaks: number of peaks
+            n_baseline: number of baseline parameters
+            initial_centers: list of initial center positions for each peak
+            shift_range: maximum allowed shift in x units (e.g., 3 * dx)
+        
+        Returns:
+            lower_bounds, upper_bounds lists
+        """
+        lower_bounds = []
+        upper_bounds = []
+        x_range = np.max(x) - np.min(x)
+        dx = np.mean(np.diff(x))
+        max_shift = shift_range * dx
+        
+        # Peak bounds with limited center movement
+        for i in range(n_peaks):
+            # Amplitude bounds
+            lower_bounds.append(0)
+            upper_bounds.append(2 * np.max(y_norm))
+            
+            # Center bounds - allow limited shift
+            center_initial = initial_centers[i]
+            lower_bounds.append(max(np.min(x), center_initial - max_shift))
+            upper_bounds.append(min(np.max(x), center_initial + max_shift))
+            
+            # Sigma bounds
+            lower_bounds.append(x_range * 0.001)
+            upper_bounds.append(x_range * 0.5)
+        
+        # Baseline bounds (unchanged)
+        if n_baseline >= 1:  # constant
+            lower_bounds.append(-np.max(y_norm))
+            upper_bounds.append(np.max(y_norm))
+        if n_baseline >= 2:  # linear term
+            lower_bounds.append(-x_range)
+            upper_bounds.append(x_range)
+        if n_baseline >= 3:  # quadratic term
+            lower_bounds.append(-x_range**2)
+            upper_bounds.append(x_range**2)
+        
+        return lower_bounds, upper_bounds
+    
+    def _check_improvement(self, prev_metrics, curr_metrics, tolerance=1e-4):
+        """
+        Check if fit improved significantly.
+        
+        Args:
+            prev_metrics: previous quality metrics dict
+            curr_metrics: current quality metrics dict
+            tolerance: minimum relative improvement in R²
+        
+        Returns:
+            bool: True if improvement is significant
+        """
+        if prev_metrics is None or 'R²' not in prev_metrics or 'R²' not in curr_metrics:
+            return True
+        
+        prev_r2 = prev_metrics.get('R²', 0)
+        curr_r2 = curr_metrics.get('R²', 0)
+        
+        # Significant improvement if R² increased by more than tolerance
+        return (curr_r2 - prev_r2) > tolerance
     
     def preview_fit(self, x, peak_params, y_max, baseline_params=None):
         """Preview fit without optimization (fast)"""
@@ -1984,8 +2101,16 @@ class GaussianDeconvolver:
         return lower_bounds, upper_bounds
     
     def fit(self, initial_params=None, method='trf', maxfev=5000, 
-            fit_quality='balanced', last_popt=None, progress_callback=None):
-        """Perform fitting with selected method and baseline"""
+            fit_quality='balanced', last_popt=None, progress_callback=None,
+            use_iterative_refinement=True):
+        """
+        Perform fitting with iterative refinement (Stage 1: fixed centers, 
+        Stage 2: limited centers, Stage 3: free centers).
+        
+        Args:
+            use_iterative_refinement: If True, use 3-stage optimization.
+                                     If False, use single-stage optimization.
+        """
         if initial_params is None:
             _, _, initial_params, _ = self.auto_detect_peaks()
         
@@ -1997,8 +2122,11 @@ class GaussianDeconvolver:
         n_peaks = len(initial_params) // 3
         n_baseline = self._get_n_baseline_params()
         
+        # Extract initial centers
+        initial_centers = [initial_params[3*i + 1] for i in range(n_peaks)]
+        
         # Use last good parameters if available
-        if last_popt is not None:
+        if last_popt is not None and not use_iterative_refinement:
             expected_len = n_peaks * 3 + n_baseline
             if len(last_popt) == expected_len:
                 initial_params = last_popt.copy()
@@ -2007,44 +2135,316 @@ class GaussianDeconvolver:
         else:
             initial_params = self._prepare_initial_params(initial_params, n_baseline)
         
-        # Create bounds
-        lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
+        # Set tolerances based on fit quality
+        if fit_quality == 'fast':
+            xtol, ftol, gtol = 1e-3, 1e-3, 1e-3
+            maxfev_stage = min(maxfev // 3, 2000)
+        elif fit_quality == 'balanced':
+            xtol, ftol, gtol = 1e-5, 1e-5, 1e-5
+            maxfev_stage = min(maxfev // 3, 3000)
+        else:  # precise
+            xtol, ftol, gtol = 1e-8, 1e-8, 1e-8
+            maxfev_stage = min(maxfev // 3, 4000)
         
-        # Ensure initial_params are within bounds
-        for i in range(len(initial_params)):
-            initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
+        # Define the model function for curve_fit
+        def model_func(x, *params):
+            if n_baseline == 0:
+                return GaussianModel.multi_gaussian(x, *params)
+            else:
+                peak_params = params[:n_peaks*3]
+                baseline_params = params[n_peaks*3:]
+                return GaussianModel.multi_gaussian_with_baseline(
+                    x, n_peaks, peak_params, baseline_params, self.baseline_method
+                )
+        
+        # If not using iterative refinement, do single-stage fit
+        if not use_iterative_refinement:
+            lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
+            
+            for i in range(len(initial_params)):
+                initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
+            
+            try:
+                if progress_callback:
+                    progress_callback(0.3, "Initializing fit...")
+                
+                if progress_callback:
+                    progress_callback(0.5, "Running curve_fit...")
+                
+                popt, pcov = curve_fit(
+                    model_func,
+                    self.x,
+                    self.y_norm,
+                    p0=initial_params,
+                    bounds=(lower_bounds, upper_bounds),
+                    method=method,
+                    maxfev=maxfev,
+                    xtol=xtol,
+                    ftol=ftol,
+                    gtol=gtol
+                )
+                
+                if progress_callback:
+                    progress_callback(0.8, "Calculating components...")
+                
+                return self._process_fit_result(popt, n_peaks, n_baseline, progress_callback)
+                
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(1.0, f"Fit failed: {e}")
+                return False
+        
+        # ITERATIVE REFINEMENT - 3 STAGES
+        current_params = initial_params.copy()
+        prev_metrics = None
+        stage_results = []
+        
+        # Stage 1: Fixed centers (only amplitudes and sigmas vary)
+        if progress_callback:
+            progress_callback(0.1, "Stage 1/3: Optimizing amplitudes and widths (centers fixed)...")
         
         try:
+            lower_bounds_fixed, upper_bounds_fixed = self._create_bounds_with_fixed_centers(
+                self.x, self.y_norm, n_peaks, n_baseline, initial_centers
+            )
+            
+            for i in range(len(current_params)):
+                current_params[i] = np.clip(current_params[i], lower_bounds_fixed[i], upper_bounds_fixed[i])
+            
+            popt_stage1, _ = curve_fit(
+                model_func,
+                self.x,
+                self.y_norm,
+                p0=current_params,
+                bounds=(lower_bounds_fixed, upper_bounds_fixed),
+                method=method,
+                maxfev=maxfev_stage,
+                xtol=xtol,
+                ftol=ftol,
+                gtol=gtol
+            )
+            
+            current_params = popt_stage1.copy()
+            
+            # Calculate metrics for stage 1
+            fit_y_norm_stage1 = model_func(self.x, *current_params)
+            metrics_stage1 = FitQualityAnalyzer.calculate_metrics(
+                self.y_norm, fit_y_norm_stage1, len(current_params)
+            )
+            stage_results.append(('Stage 1 (fixed centers)', metrics_stage1))
+            prev_metrics = metrics_stage1
+            
             if progress_callback:
-                progress_callback(0.3, "Initializing fit...")
+                progress_callback(0.3, f"Stage 1 complete. R² = {metrics_stage1.get('R²', 0):.6f}")
             
-            # Define the model function for curve_fit
-            def model_func(x, *params):
-                if n_baseline == 0:
-                    return GaussianModel.multi_gaussian(x, *params)
-                else:
-                    peak_params = params[:n_peaks*3]
-                    baseline_params = params[n_peaks*3:]
-                    return GaussianModel.multi_gaussian_with_baseline(
-                        x, n_peaks, peak_params, baseline_params, self.baseline_method
-                    )
+        except Exception as e:
+            if progress_callback:
+                progress_callback(0.3, f"Stage 1 failed: {e}")
+            # Fall back to regular fit
+            return self._fallback_fit(model_func, initial_params, n_peaks, n_baseline, 
+                                      method, maxfev, xtol, ftol, gtol, progress_callback)
+        
+        # Stage 2: Limited centers (±3 points)
+        if progress_callback:
+            progress_callback(0.4, "Stage 2/3: Refining peak positions (limited shift)...")
+        
+        try:
+            # Extract updated centers from stage 1
+            updated_centers = [current_params[3*i + 1] for i in range(n_peaks)]
             
-            # Set tolerances based on fit quality
-            if fit_quality == 'fast':
-                xtol, ftol, gtol = 1e-3, 1e-3, 1e-3
-                maxfev = min(maxfev, 2000)
-            elif fit_quality == 'balanced':
-                xtol, ftol, gtol = 1e-5, 1e-5, 1e-5
-                maxfev = min(maxfev, 5000)
-            else:  # precise
-                xtol, ftol, gtol = 1e-8, 1e-8, 1e-8
-                maxfev = min(maxfev, 10000)
+            lower_bounds_limited, upper_bounds_limited = self._create_bounds_with_limited_centers(
+                self.x, self.y_norm, n_peaks, n_baseline, updated_centers, shift_range=3
+            )
+            
+            for i in range(len(current_params)):
+                current_params[i] = np.clip(current_params[i], lower_bounds_limited[i], upper_bounds_limited[i])
+            
+            popt_stage2, _ = curve_fit(
+                model_func,
+                self.x,
+                self.y_norm,
+                p0=current_params,
+                bounds=(lower_bounds_limited, upper_bounds_limited),
+                method=method,
+                maxfev=maxfev_stage,
+                xtol=xtol,
+                ftol=ftol,
+                gtol=gtol
+            )
+            
+            current_params = popt_stage2.copy()
+            
+            # Calculate metrics for stage 2
+            fit_y_norm_stage2 = model_func(self.x, *current_params)
+            metrics_stage2 = FitQualityAnalyzer.calculate_metrics(
+                self.y_norm, fit_y_norm_stage2, len(current_params)
+            )
+            stage_results.append(('Stage 2 (limited centers)', metrics_stage2))
+            
+            # Check if improvement is significant
+            if not self._check_improvement(prev_metrics, metrics_stage2):
+                if progress_callback:
+                    progress_callback(0.6, "Stage 2: No significant improvement, stopping early.")
+            else:
+                prev_metrics = metrics_stage2
             
             if progress_callback:
-                progress_callback(0.5, "Running curve_fit...")
+                progress_callback(0.6, f"Stage 2 complete. R² = {metrics_stage2.get('R²', 0):.6f}")
             
-            # Perform fit
-            popt, pcov = curve_fit(
+        except Exception as e:
+            if progress_callback:
+                progress_callback(0.6, f"Stage 2 failed: {e}, continuing with stage 1 results...")
+        
+        # Stage 3: Full freedom
+        if progress_callback:
+            progress_callback(0.7, "Stage 3/3: Final optimization (full freedom)...")
+        
+        try:
+            lower_bounds_free, upper_bounds_free = self._create_bounds(
+                self.x, self.y_norm, n_peaks, n_baseline
+            )
+            
+            for i in range(len(current_params)):
+                current_params[i] = np.clip(current_params[i], lower_bounds_free[i], upper_bounds_free[i])
+            
+            popt_stage3, _ = curve_fit(
+                model_func,
+                self.x,
+                self.y_norm,
+                p0=current_params,
+                bounds=(lower_bounds_free, upper_bounds_free),
+                method=method,
+                maxfev=maxfev_stage,
+                xtol=xtol,
+                ftol=ftol,
+                gtol=gtol
+            )
+            
+            current_params = popt_stage3.copy()
+            
+            # Calculate metrics for stage 3
+            fit_y_norm_stage3 = model_func(self.x, *current_params)
+            metrics_stage3 = FitQualityAnalyzer.calculate_metrics(
+                self.y_norm, fit_y_norm_stage3, len(current_params)
+            )
+            stage_results.append(('Stage 3 (full freedom)', metrics_stage3))
+            
+            if progress_callback:
+                progress_callback(0.9, f"Stage 3 complete. R² = {metrics_stage3.get('R²', 0):.6f}")
+            
+        except Exception as e:
+            if progress_callback:
+                progress_callback(0.9, f"Stage 3 failed: {e}, using stage 2 results...")
+        
+        # Log stage results for debugging
+        if self.show_warnings:
+            print("\n=== Iterative Refinement Results ===")
+            for stage_name, metrics in stage_results:
+                print(f"{stage_name}: R² = {metrics.get('R²', 0):.8f}, RMSE = {metrics.get('RMSE', 0):.2e}")
+        
+        # Process final result
+        if progress_callback:
+            progress_callback(0.95, "Calculating components...")
+        
+        return self._process_fit_result(current_params, n_peaks, n_baseline, progress_callback)
+    
+    def _process_fit_result(self, popt, n_peaks, n_baseline, progress_callback=None):
+        """
+        Process fit result: extract components, calculate metrics, store results.
+        
+        Args:
+            popt: optimized parameters from curve_fit
+            n_peaks: number of peaks
+            n_baseline: number of baseline parameters
+            progress_callback: optional callback for progress updates
+        
+        Returns:
+            bool: True if successful
+        """
+        # Calculate fit in normalized space
+        def model_func(x, *params):
+            if n_baseline == 0:
+                return GaussianModel.multi_gaussian(x, *params)
+            else:
+                peak_params = params[:n_peaks*3]
+                baseline_params = params[n_peaks*3:]
+                return GaussianModel.multi_gaussian_with_baseline(
+                    x, n_peaks, peak_params, baseline_params, self.baseline_method
+                )
+        
+        fit_y_norm = model_func(self.x, *popt)
+        # Calculate fit in original space
+        fit_y_original = fit_y_norm * self.y_max
+        
+        # Extract components
+        components = []
+        peak_params = popt[:n_peaks*3]
+        baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
+        
+        for i in range(n_peaks):
+            amp_norm = peak_params[3*i]
+            cen = peak_params[3*i + 1]
+            sigma = abs(peak_params[3*i + 2])
+            
+            amp = amp_norm * self.y_max
+            area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
+            
+            component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
+            
+            # Calculate center in linear space
+            if self.use_log_x:
+                cen_linear = 10**cen
+            else:
+                cen_linear = cen
+            
+            components.append({
+                'id': i + 1,
+                'amp_norm': amp_norm,
+                'amp': amp,
+                'cen_log': cen,
+                'cen_linear': cen_linear,
+                'sigma_log': sigma,
+                'fwhm': GaussianModel.calculate_fwhm(sigma),
+                'area': area,
+                'fraction': 0,
+                'y_norm': component_y_norm,
+                'source': 'auto'
+            })
+        
+        # Calculate fractions
+        total_area = sum([c['area'] for c in components])
+        for c in components:
+            c['fraction'] = c['area'] / total_area if total_area > 0 else 0
+            c['fraction_percent'] = c['fraction'] * 100
+        
+        # Store results
+        self.popt = popt
+        self.components = components
+        self.baseline_params = baseline_params
+        self.fit_y_norm = fit_y_norm
+        self.fit_y_original = fit_y_original
+        self.total_area = total_area
+        
+        # Calculate quality metrics
+        self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
+            self.y_norm, self.fit_y_norm, len(popt)
+        )
+        
+        if progress_callback:
+            progress_callback(1.0, "Fit complete!")
+        
+        return True
+    
+    def _fallback_fit(self, model_func, initial_params, n_peaks, n_baseline, 
+                      method, maxfev, xtol, ftol, gtol, progress_callback):
+        """Fallback to regular fit if iterative refinement fails"""
+        try:
+            lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
+            
+            for i in range(len(initial_params)):
+                initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
+            
+            popt, _ = curve_fit(
                 model_func,
                 self.x,
                 self.y_norm,
@@ -2057,214 +2457,12 @@ class GaussianDeconvolver:
                 gtol=gtol
             )
             
-            if progress_callback:
-                progress_callback(0.8, "Calculating components...")
-            
-            # Calculate fit in normalized space
-            fit_y_norm = model_func(self.x, *popt)
-            # Calculate fit in original space
-            fit_y_original = fit_y_norm * self.y_max
-            
-            # Extract components
-            components = []
-            peak_params = popt[:n_peaks*3]
-            baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
-            
-            for i in range(n_peaks):
-                amp_norm = peak_params[3*i]
-                cen = peak_params[3*i + 1]
-                sigma = abs(peak_params[3*i + 2])
-                
-                amp = amp_norm * self.y_max
-                # Используем правильный метод расчета площади
-                area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
-                
-                component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
-                
-                # Calculate center in linear space
-                if self.use_log_x:
-                    cen_linear = 10**cen
-                else:
-                    cen_linear = cen
-                
-                components.append({
-                    'id': i + 1,
-                    'amp_norm': amp_norm,
-                    'amp': amp,
-                    'cen_log': cen,
-                    'cen_linear': cen_linear,
-                    'sigma_log': sigma,
-                    'fwhm': GaussianModel.calculate_fwhm(sigma),
-                    'area': area,
-                    'fraction': 0,
-                    'y_norm': component_y_norm,
-                    'source': 'auto'
-                })
-            
-            # Calculate fractions
-            total_area = sum([c['area'] for c in components])
-            for c in components:
-                c['fraction'] = c['area'] / total_area if total_area > 0 else 0
-                c['fraction_percent'] = c['fraction'] * 100
-            
-            # Store results
-            self.popt = popt
-            self.components = components
-            self.baseline_params = baseline_params
-            self.fit_y_norm = fit_y_norm
-            self.fit_y_original = fit_y_original  # Store original scale fit
-            self.total_area = total_area
-            
-            # Calculate quality metrics
-            self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
-                self.y_norm, self.fit_y_norm, len(popt)
-            )
-            
-            if progress_callback:
-                progress_callback(1.0, "Fit complete!")
-            
-            return True
+            return self._process_fit_result(popt, n_peaks, n_baseline, progress_callback)
             
         except Exception as e:
             if progress_callback:
-                progress_callback(1.0, f"Fit failed: {e}")
-            print(f"Error in fit: {e}")  # For debugging
+                progress_callback(1.0, f"Fallback fit failed: {e}")
             return False
-    
-    def preview_fit(self, initial_params=None):
-        """Preview fit without optimization (fast)"""
-        if initial_params is None:
-            _, _, initial_params, _ = self.auto_detect_peaks()
-        
-        if len(initial_params) == 0:
-            return None
-        
-        n_peaks = len(initial_params) // 3
-        n_baseline = self._get_n_baseline_params()
-        
-        # Prepare parameters with baseline
-        full_params = self._prepare_initial_params(initial_params, n_baseline)
-        
-        # Calculate fit
-        if n_baseline == 0:
-            fit_y_norm = GaussianModel.multi_gaussian(self.x, *full_params)
-        else:
-            peak_params = full_params[:n_peaks*3]
-            baseline_params = full_params[n_peaks*3:]
-            fit_y_norm = GaussianModel.multi_gaussian_with_baseline(
-                self.x, n_peaks, peak_params, baseline_params, self.baseline_method
-            )
-        
-        return fit_y_norm
-    
-    def remove_peak(self, peak_id):
-        """Remove a peak (does NOT perform fit, just marks for removal)"""
-        if peak_id > len(self.components):
-            return False
-        
-        # Store the operation
-        st.session_state.app_state.pending_remove = peak_id
-        return True
-    
-    def split_peak(self, peak_id, split_position):
-        """Split a peak into two (does NOT perform fit, just marks for splitting)"""
-        if peak_id > len(self.components):
-            return False
-        
-        # Store the operation
-        st.session_state.app_state.pending_split = (peak_id, split_position)
-        return True
-    
-    def apply_pending_operations(self, fit_quality='balanced', progress_callback=None):
-        """Apply all pending operations and perform fit"""
-        # Get current parameters
-        if self.components:
-            current_params = []
-            for c in self.components:
-                current_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
-        else:
-            return False
-        
-        # Apply pending remove
-        if st.session_state.app_state.pending_remove is not None:
-            remove_id = st.session_state.app_state.pending_remove
-            new_params = []
-            for i, c in enumerate(self.components):
-                if i != remove_id - 1:
-                    new_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
-            current_params = new_params
-            st.session_state.app_state.pending_remove = None
-        
-        # Apply pending split
-        if st.session_state.app_state.pending_split is not None:
-            peak_id, split_position = st.session_state.app_state.pending_split
-            peak = self.components[peak_id - 1]
-            
-            new_params = []
-            for i, c in enumerate(self.components):
-                if i == peak_id - 1:
-                    amp1 = c['amp_norm'] * 0.6
-                    amp2 = c['amp_norm'] * 0.4
-                    
-                    cen1 = split_position - c['sigma_log'] * 0.3
-                    cen2 = split_position + c['sigma_log'] * 0.3
-                    
-                    cen1 = np.clip(cen1, np.min(self.x), np.max(self.x))
-                    cen2 = np.clip(cen2, np.min(self.x), np.max(self.x))
-                    
-                    sigma1 = c['sigma_log'] * 0.7
-                    sigma2 = c['sigma_log'] * 0.7
-                    
-                    new_params.extend([amp1, cen1, sigma1])
-                    new_params.extend([amp2, cen2, sigma2])
-                else:
-                    new_params.extend([c['amp_norm'], c['cen_log'], c['sigma_log']])
-            
-            current_params = new_params
-            st.session_state.app_state.pending_split = None
-        
-        # Perform fit
-        return self.fit(
-            initial_params=current_params,
-            method=st.session_state.app_state.fitting_method,
-            maxfev=st.session_state.app_state.max_nfev,
-            fit_quality=fit_quality,
-            last_popt=st.session_state.app_state.last_popt,
-            progress_callback=progress_callback
-        )
-    
-    def remove_peak_by_id(self, peak_id):
-        """Remove a peak by its ID from peak_info and initial_params"""
-        if st.session_state.app_state.peak_info is None:
-            return False
-        
-        # Find the peak in peak_info
-        peak_to_remove = None
-        for i, info in enumerate(st.session_state.app_state.peak_info):
-            if info.get('id', i+1) == peak_id or i+1 == peak_id:
-                peak_to_remove = i
-                break
-        
-        if peak_to_remove is None:
-            return False
-        
-        # Remove from peak_info
-        removed_peak = st.session_state.app_state.peak_info.pop(peak_to_remove)
-        
-        # Remove from initial_params (3 parameters per peak)
-        if st.session_state.app_state.initial_peak_params is not None:
-            start_idx = peak_to_remove * 3
-            del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
-        
-        # Also remove from manual_peaks or residuals_peaks if present
-        if removed_peak.get('source') == 'manual':
-            st.session_state.app_state.manual_peaks = [p for p in st.session_state.app_state.manual_peaks 
-                                                        if p.get('x_linear') != removed_peak.get('x_linear')]
-        elif removed_peak.get('source') == 'residuals':
-            st.session_state.app_state.residuals_peaks = [p for p in st.session_state.app_state.residuals_peaks 
-                                                           if p.get('x_linear') != removed_peak.get('x_linear')]
-        
-        return True
     
     def create_deconvolution_result(self) -> DeconvolutionResult:
         """Create result container from current components"""
@@ -3254,7 +3452,8 @@ def step3_gaussian_deconvolution():
                             maxfev=st.session_state.app_state.max_nfev,
                             fit_quality=st.session_state.app_state.fit_quality,
                             last_popt=st.session_state.app_state.last_popt,
-                            progress_callback=update_progress
+                            progress_callback=update_progress,
+                            use_iterative_refinement=True  # Enable 3-stage optimization
                         )
                         
                         progress_bar.empty()
