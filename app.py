@@ -3190,15 +3190,9 @@ def step2_drt_analysis():
                             drt_solver = TikhonovDRT(data, regularization_order=2, include_inductive=include_inductive)
                             result = drt_solver.compute(n_tau=n_tau, lambda_auto=True)
                         
-                        # Store the original result
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_calculated = True
                         st.session_state.app_state.drt_solver = drt_solver
-                        
-                        # ALSO store the SCALED version for consistent display across steps
-                        gamma_scaled = result.get_scaled_gamma_for_deconvolution()
-                        st.session_state.app_state.drt_gamma_scaled = gamma_scaled
-                        st.session_state.app_state.drt_scaling_factor = result.R_pol / result.get_integral_ln() if result.get_integral_ln() > 0 else 1.0
                         
                         st.success("✅ DRT calculation complete!")
                         st.rerun()
@@ -3246,10 +3240,6 @@ def step2_drt_analysis():
                 st.metric("∫ γ d(log₁₀τ)", f"{integral_log10:.4f} Ω")
                 st.caption(f"= R_pol/ln(10) = {expected_ln/2.3026:.4f} Ω")
             
-            # Display scaling factor info
-            scaling_factor = st.session_state.app_state.drt_scaling_factor
-            st.info(f"📊 Scaling factor for display: {scaling_factor:.4f} (original γ × {scaling_factor:.4f} = scaled γ for deconvolution)")
-            
             # Display validation if available
             if 'validation' in result.metadata:
                 st.markdown("---")
@@ -3279,45 +3269,19 @@ def step2_drt_analysis():
                 else:
                     st.warning("⚠ Validation shows discrepancies - consider adjusting parameters")
                 
+                # Add expander for detailed validation
                 with st.expander("📋 Detailed Validation Report"):
                     st.code(result.get_validation_report(), language='text')
             
-            # Display peaks on ORIGINAL (unsaled) gamma
+            # Display peaks
             peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
             
-            # Plot DRT with BOTH original and scaled for comparison
-            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-            
-            # Left plot: Original (unscaled) DRT
-            axes[0].semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='Original DRT')
-            if peaks:
-                peak_tau = [p['tau'] for p in peaks]
-                peak_drt = [p['amplitude'] for p in peaks]
-                axes[0].plot(peak_tau, peak_drt, 'rv', markersize=8, label='Detected peaks')
-            axes[0].set_xlabel(r"Relaxation Time $\tau$ / s", fontweight='bold')
-            axes[0].set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
-            axes[0].set_title(f"Original DRT (unscaled)\nMax = {np.max(result.gamma):.4f} Ω", fontweight='bold')
-            axes[0].legend(loc='best')
-            axes[0].grid(True, alpha=0.3, linestyle='--')
-            
-            # Right plot: Scaled DRT (for deconvolution)
-            gamma_scaled = st.session_state.app_state.drt_gamma_scaled
-            axes[1].semilogx(result.tau_grid, gamma_scaled, '-', linewidth=2, color='#ff7f0e', label='Scaled DRT')
-            if peaks:
-                peak_tau = [p['tau'] for p in peaks]
-                peak_drt_scaled = [gamma_scaled[np.argmin(np.abs(result.tau_grid - t))] for t in peak_tau]
-                axes[1].plot(peak_tau, peak_drt_scaled, 'rv', markersize=8, label='Detected peaks')
-            axes[1].set_xlabel(r"Relaxation Time $\tau$ / s", fontweight='bold')
-            axes[1].set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
-            axes[1].set_title(f"Scaled DRT (for deconvolution)\nMax = {np.max(gamma_scaled):.4f} Ω\nArea = {result.R_pol:.4f} Ω", fontweight='bold')
-            axes[1].legend(loc='best')
-            axes[1].grid(True, alpha=0.3, linestyle='--')
-            
-            plt.tight_layout()
-            st.pyplot(fig)
+            # Plot DRT with correct scaling note
+            fig_drt = plot_drt_matplotlib(result, peaks)
+            st.pyplot(fig_drt)
             plt.close()
             
-            st.caption("Note: Left plot shows original DRT from inversion. Right plot shows scaled DRT where ∫ γ d(ln τ) = R_pol. Deconvolution uses the scaled version.")
+            st.caption("Note: γ(τ) is defined per unit ln τ. Area under curve equals R_pol.")
             
             col_prev, col_next = st.columns(2)
             with col_prev:
@@ -3348,28 +3312,28 @@ def step3_gaussian_deconvolution():
     
     drt_result = st.session_state.app_state.drt_result
     
-    # Use the PRE-SCALED gamma that was stored in session state
-    if 'drt_gamma_scaled' not in st.session_state.app_state or st.session_state.app_state.drt_gamma_scaled is None:
-        # If not stored, calculate now
-        gamma_scaled = drt_result.get_scaled_gamma_for_deconvolution()
-        st.session_state.app_state.drt_gamma_scaled = gamma_scaled
-        st.session_state.app_state.drt_scaling_factor = drt_result.R_pol / drt_result.get_integral_ln() if drt_result.get_integral_ln() > 0 else 1.0
+    # Get correctly scaled gamma for deconvolution
+    # This ensures that total area under peaks equals R_pol
+    gamma_scaled = drt_result.get_scaled_gamma_for_deconvolution()
+    log_tau = np.log10(drt_result.tau_grid)
     
-    gamma_scaled = st.session_state.app_state.drt_gamma_scaled
-    scaling_factor = st.session_state.app_state.drt_scaling_factor
+    # Show scaling info
+    with st.expander("ℹ️ DRT Scaling Information", expanded=False):
+        integral_ln = drt_result.get_integral_ln()
+        integral_log10 = drt_result.get_integral_log10()
+        scaling_factor = drt_result.R_pol / integral_ln if integral_ln > 0 else 1.0
+        
+        st.info(f"""
+        **DRT Scaling Details:**
+        - Original ∫ γ d(ln τ): {integral_ln:.4f} Ω
+        - Expected ∫ γ d(ln τ) (R_pol): {drt_result.R_pol:.4f} Ω
+        - Applied scaling factor: {scaling_factor:.4f}
+        
+        After scaling, the area under γ(τ) correctly represents R_pol = {drt_result.R_pol:.4f} Ω.
+        Gaussian deconvolution will use the scaled distribution.
+        """)
     
-    # Show scaling info prominently
-    st.info(f"""
-    📊 **DRT Data Scaling Information:**
-    - Original DRT max intensity: {np.max(drt_result.gamma):.4f} Ω
-    - Scaled DRT max intensity: {np.max(gamma_scaled):.4f} Ω
-    - Scaling factor applied: {scaling_factor:.4f}
-    - Total area after scaling: {drt_result.R_pol:.4f} Ω (matches R_pol)
-    
-    **The scaled DRT will be used for deconvolution.** This ensures that peak areas sum to R_pol.
-    """)
-    
-    # Create deconvolver with SCALED gamma
+    # Create deconvolver with scaled gamma
     deconvolver = GaussianDeconvolver(
         x_linear=drt_result.tau_grid,
         y_original=gamma_scaled,  # Use scaled gamma
@@ -3383,8 +3347,8 @@ def step3_gaussian_deconvolution():
     )
     st.session_state.app_state.deconvolver = deconvolver
     
-    # Auto-detect peaks on scaled data
-    with st.spinner("Auto-detecting peaks on scaled DRT..."):
+    # Auto-detect peaks
+    with st.spinner("Auto-detecting peaks..."):
         peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
             sensitivity=st.session_state.app_state.sensitivity,
             min_distance=st.session_state.app_state.min_distance
@@ -3409,7 +3373,7 @@ def step3_gaussian_deconvolution():
         if sensitivity != st.session_state.app_state.sensitivity or min_distance != st.session_state.app_state.min_distance:
             st.session_state.app_state.sensitivity = sensitivity
             st.session_state.app_state.min_distance = min_distance
-            with st.spinner("Re-detecting peaks on scaled DRT..."):
+            with st.spinner("Re-detecting peaks..."):
                 peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
                     sensitivity=sensitivity, min_distance=min_distance
                 )
@@ -3451,7 +3415,7 @@ def step3_gaussian_deconvolution():
         
         with col_add2:
             if st.button("🔍 Find Missing Peaks", use_container_width=True):
-                with st.spinner("Analyzing residuals on scaled DRT..."):
+                with st.spinner("Analyzing residuals..."):
                     if st.session_state.app_state.peak_info is None:
                         _, st.session_state.app_state.peak_info, st.session_state.app_state.initial_peak_params, _ = deconvolver.auto_detect_peaks(
                             sensitivity=sensitivity, min_distance=min_distance
@@ -3483,7 +3447,7 @@ def step3_gaussian_deconvolution():
                 st.rerun()
         with col_next:
             if st.button("🎯 Perform Deconvolution", type="primary", use_container_width=True):
-                with st.spinner("Performing Gaussian deconvolution on scaled DRT..."):
+                with st.spinner("Performing Gaussian deconvolution..."):
                     if st.session_state.app_state.peak_info is None or len(st.session_state.app_state.peak_info) == 0:
                         peaks, peak_info, initial_params, _ = deconvolver.auto_detect_peaks(
                             sensitivity=sensitivity, min_distance=min_distance
@@ -3540,7 +3504,7 @@ def step3_gaussian_deconvolution():
                             st.error("Deconvolution failed. Try adjusting parameters.")
     
     with col2:
-        st.subheader("📊 Peak Detection Preview (Scaled DRT)")
+        st.subheader("📊 Peak Detection Preview")
         
         if st.session_state.app_state.peak_info is not None:
             fig, ax = plt.subplots(figsize=(10, 6))
@@ -3548,15 +3512,15 @@ def step3_gaussian_deconvolution():
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
-            # Plot SCALED DRT data (this is what's used for deconvolution)
+            # Plot scaled DRT data
             ax.plot(deconvolver.x_linear, deconvolver.y_original, 
-                   'o-', markersize=3, linewidth=1.5, alpha=0.7, 
-                   label='Scaled DRT Data (for deconvolution)', color='#1f77b4', zorder=1)
+                   'o-', markersize=3, linewidth=1, alpha=0.7, 
+                   label='Scaled DRT Data', color='black', zorder=1)
             
-            # Add reference line for R_pol (total area)
-            ax.axhline(y=drt_result.R_pol / (np.max(deconvolver.x_linear) - np.min(deconvolver.x_linear)) * 0.2,
-                      color='gray', linestyle=':', alpha=0.5, 
-                      label=f'Total area = R_pol = {drt_result.R_pol:.3f} Ω')
+            # Add reference line for expected total area
+            expected_area = drt_result.R_pol
+            ax.axhline(y=expected_area / (np.max(deconvolver.x_linear) - np.min(deconvolver.x_linear)) * 0.1,
+                      color='gray', linestyle=':', alpha=0.5, label=f'Expected R_pol = {expected_area:.3f} Ω')
             
             source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
             for idx, info in enumerate(st.session_state.app_state.peak_info):
@@ -3578,8 +3542,8 @@ def step3_gaussian_deconvolution():
                        'ro', markersize=10)
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-            ax.set_ylabel('γ(τ) (Ω) - Scaled', fontweight='bold')
-            ax.set_title(f'Detected Peaks on Scaled DRT\nMax = {np.max(deconvolver.y_original):.4f} Ω, Total Area = {drt_result.R_pol:.3f} Ω', fontweight='bold')
+            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')
+            ax.set_title(f'Detected Peaks on Scaled DRT ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
             ax.legend(loc='upper left')
             ax.grid(True, alpha=0.3, linestyle='--')
             
@@ -3588,7 +3552,7 @@ def step3_gaussian_deconvolution():
             
             # Peak info table
             if st.session_state.app_state.peak_info:
-                st.subheader("Peak List (Scaled DRT)")
+                st.subheader("Peak List")
                 
                 for i, info in enumerate(st.session_state.app_state.peak_info):
                     col_a, col_b, col_c, col_d, col_e = st.columns([0.5, 2, 2, 2, 1])
