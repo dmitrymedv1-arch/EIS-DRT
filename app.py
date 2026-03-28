@@ -268,10 +268,35 @@ class DRTResult:
     
     @property
     def log_tau(self) -> np.ndarray:
+        """Log10 of relaxation times"""
         return np.log10(self.tau_grid)
     
     def get_integral(self) -> float:
+        """
+        Calculate total polarization resistance from DRT.
+        R_pol = ∫ γ(τ) d(ln τ)
+        
+        This should equal self.R_pol (within regularization error)
+        """
         return np.trapezoid(self.gamma, np.log(self.tau_grid))
+    
+    def get_integral_linear(self) -> float:
+        """
+        Calculate integral over linear τ (for reference only).
+        This is NOT the correct way to get R_pol.
+        """
+        return np.trapezoid(self.gamma, self.tau_grid)
+    
+    def verify_integral(self) -> Tuple[float, float]:
+        """
+        Verify that DRT integral matches R_pol.
+        
+        Returns:
+            Tuple[float, float]: (integral_value, ratio_to_R_pol)
+        """
+        integral = self.get_integral()
+        ratio = integral / self.R_pol if self.R_pol > 0 else 0
+        return integral, ratio
 
 
 @dataclass
@@ -350,17 +375,37 @@ class ImpedanceData:
 class GaussianPeak:
     """Container for Gaussian peak parameters"""
     id: int
-    center: float          # Center in linear space
-    center_log: float      # Center in log space
-    amplitude: float       # Amplitude in original scale
+    center: float          # Center in linear space (τ in seconds)
+    center_log: float      # Center in log10 space
+    amplitude: float       # Amplitude in original scale (Ω)
     amplitude_norm: float  # Normalized amplitude
-    sigma_log: float       # Sigma in log space
-    fwhm: float           # Full width at half maximum
-    area: float           # Area under peak
-    fraction: float       # Fraction of total area
-    fraction_percent: float  # Percentage fraction
+    sigma_log: float       # Sigma in log10 space
+    fwhm: float           # Full width at half maximum in log10 space
+    area: float           # Area under peak (Ω) - this equals resistance contribution
+    fraction: float       # Fraction of total area (0-1)
+    fraction_percent: float  # Percentage fraction (0-100)
     source: str = 'auto'  # Source: 'auto', 'manual', 'residuals'
     y_norm: np.ndarray = None  # Normalized y values for plotting
+    
+    def get_characteristic_frequency(self) -> float:
+        """
+        Get characteristic frequency of this peak.
+        f = 1/(2πτ)
+        
+        Returns:
+            float: Characteristic frequency in Hz
+        """
+        return 1.0 / (2 * np.pi * self.center)
+    
+    def get_resistance_contribution(self) -> float:
+        """
+        Get resistance contribution of this peak.
+        This equals the area under the peak.
+        
+        Returns:
+            float: Resistance contribution in Ω
+        """
+        return self.area
 
 
 @dataclass
@@ -379,6 +424,36 @@ class DeconvolutionResult:
     baseline_method: str = 'none'
     total_area: float = 0.0
     max_amplitude: float = 0.0
+    
+    def verify_resistance_conservation(self) -> Tuple[float, float]:
+        """
+        Verify that sum of peak areas equals total DRT integral (R_pol).
+        
+        Returns:
+            Tuple[float, float]: (sum_peak_areas, ratio_to_total)
+        """
+        sum_areas = sum([p.area for p in self.peaks])
+        ratio = sum_areas / self.total_area if self.total_area > 0 else 0
+        return sum_areas, ratio
+    
+    def get_peak_resistances(self) -> List[float]:
+        """
+        Get resistance contribution of each peak in Ω.
+        
+        Returns:
+            List[float]: Peak resistances in Ω
+        """
+        return [p.area for p in self.peaks]
+    
+    def get_peak_frequencies(self) -> List[float]:
+        """
+        Get characteristic frequencies of peaks.
+        f = 1/(2πτ)
+        
+        Returns:
+            List[float]: Characteristic frequencies in Hz
+        """
+        return [1.0 / (2 * np.pi * p.center) for p in self.peaks]
 
 
 # ============================================================================
@@ -597,33 +672,51 @@ class DRTCore:
         self.tau_min = 1.0 / (2 * np.pi * np.max(self.frequencies)) * 0.1
         self.tau_max = 1.0 / (2 * np.pi * np.min(self.frequencies)) * 10
         
-        # Estimate ohmic resistance
+        # Estimate ohmic resistance from highest frequencies
         if len(high_freq_idx) > 3:
             self.R_inf = np.mean(self.Z_real[high_freq_idx[-5:]])
         else:
             self.R_inf = self.Z_real[-1] if len(self.Z_real) > 0 else 0
         
-        # Total polarization resistance
-        self.R_pol = np.max(self.Z_real) - self.R_inf if np.max(self.Z_real) > self.R_inf else 1.0
+        # Total polarization resistance (difference between low and high frequency real parts)
+        low_freq_idx = np.where(self.frequencies < 0.1 * np.max(self.frequencies))[0]
+        if len(low_freq_idx) > 3:
+            R_total = np.mean(self.Z_real[low_freq_idx[:5]])
+        else:
+            R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
+        self.R_pol = R_total - self.R_inf if R_total > self.R_inf else 1.0
     
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Build kernel matrix for given time grid, optionally including RL elements"""
+        """
+        Build kernel matrix for given time grid.
+        IMPORTANT: Kernels are scaled for integration over d(ln τ)
+        """
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
         K_imag = np.zeros((self.N, M))
         
         omega = 2 * np.pi * self.frequencies
         
+        # Calculate step in natural logarithm (ln) for proper integration
+        # d(ln τ) = d(log10 τ) * ln(10)
+        dln_tau = np.mean(np.diff(np.log(tau_grid)))  # This is the step in ln(τ)
+        
         for i in range(self.N):
             for j in range(M):
+                # Standard DRT kernel for RC elements
                 denominator = 1 + (omega[i] * tau_grid[j])**2
-                K_real[i, j] = 1.0 / denominator
-                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
+                
+                # K_real = 1 / (1 + ω²τ²) * d(ln τ)
+                K_real[i, j] = 1.0 / denominator * dln_tau
+                
+                # K_imag = -ωτ / (1 + ω²τ²) * d(ln τ)
+                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator * dln_tau
                 
                 if include_rl:
+                    # For inductive loops: modify kernels
                     rl_denom = 1 + (omega[i] * tau_grid[j])**2
-                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
-                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
+                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom * dln_tau
+                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom * dln_tau
         
         return K_real, K_imag
     
@@ -646,7 +739,13 @@ class DRTCore:
         if len(curvature) > 0:
             return np.argmax(curvature) + 1
         return len(residuals) // 2
-
+    
+    def get_drt_integral(self, gamma: np.ndarray, tau_grid: np.ndarray) -> float:
+        """
+        Calculate integral of DRT over ln(τ) which equals polarization resistance.
+        R_pol = ∫ γ(τ) d(ln τ)
+        """
+        return np.trapezoid(gamma, np.log(tau_grid))
 
 # ============================================================================
 # Tikhonov Regularization with NNLS (from EIS code)
@@ -680,6 +779,7 @@ class TikhonovDRT(DRTCore):
             return np.eye(M)
     
     def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Solve non-negative least squares problem"""
         from scipy.optimize import nnls
         x, resid = nnls(A, b)
         if resid > 1e-6 * np.linalg.norm(b):
@@ -688,17 +788,30 @@ class TikhonovDRT(DRTCore):
     
     def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
-        """Compute DRT using Tikhonov regularization with NNLS"""
+        """
+        Compute DRT using Tikhonov regularization with NNLS.
         
+        The DRT gamma(τ) satisfies:
+        Z(ω) = R∞ + ∫ γ(τ) / (1 + iωτ) d(ln τ)
+        
+        Therefore: R_pol = ∫ γ(τ) d(ln τ)
+        """
+        
+        # Create logarithmic grid of relaxation times
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        # Build kernel matrices (already scaled with d(ln τ))
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
+        # Target vector: subtract ohmic resistance from real part
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
+        # Build regularization matrix
         L = self._build_regularization_matrix(n_tau, self.regularization_order)
         
         lambda_opt = None
+        gamma = None
         
         if lambda_auto:
             if lambda_range is None:
@@ -710,11 +823,13 @@ class TikhonovDRT(DRTCore):
             
             for lam in lambda_range:
                 try:
+                    # Augmented system: [K; λL] * gamma = [Z_target; 0]
                     A = np.vstack([K, lam * L])
                     b = np.concatenate([Z_target, np.zeros(L.shape[0])])
                     
                     x = self._solve_nnls(A, b)
                     
+                    # Calculate residual and solution norm
                     residual = np.linalg.norm(K @ x - Z_target)
                     sol_norm = np.linalg.norm(L @ x)
                     
@@ -740,7 +855,19 @@ class TikhonovDRT(DRTCore):
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
+        # Calculate uncertainty estimate from second derivative
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        
+        # Verify integral of DRT equals R_pol
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+        
+        # Log verification
+        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
+        
+        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
+            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
         
         return DRTResult(
             tau_grid=tau_grid,
@@ -752,12 +879,18 @@ class TikhonovDRT(DRTCore):
             metadata={
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
-                'lambda_auto': lambda_auto
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol
             }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Reconstruct impedance from DRT"""
+        """
+        Reconstruct impedance from DRT.
+        
+        Z_reconstructed = R∞ + K_real @ gamma
+        """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
@@ -786,6 +919,7 @@ class BayesianDRT(DRTCore):
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
+        # Second-order regularization matrix
         L = np.zeros((n_tau-2, n_tau))
         for i in range(n_tau-2):
             L[i, i] = 1
@@ -793,23 +927,38 @@ class BayesianDRT(DRTCore):
             L[i, i+2] = 1
         
         with pm.Model() as model:
+            # Gamma is positive
             gamma_raw = pm.HalfNormal('gamma_raw', sigma=1.0, shape=n_tau)
             
+            # Smoothness prior
             smoothness = pm.HalfCauchy('smoothness', beta=0.1)
             reg_penalty = smoothness * pm.math.sum(pm.math.abs(L @ gamma_raw))
             
+            # Noise standard deviation
             sigma = pm.HalfCauchy('sigma', beta=0.1)
+            
+            # Forward model
             Z_pred = pm.math.dot(K, gamma_raw)
+            
+            # Likelihood
             likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
             
+            # Regularization potential
             pm.Potential('reg', -reg_penalty)
             
+            # Sample
             trace = pm.sample(draws=n_samples, tune=n_tune, chains=n_chains, 
                              return_inferencedata=True, progressbar=False)
         
         gamma_samples = trace.posterior['gamma_raw'].values.reshape(-1, n_tau)
         gamma_mean = np.mean(gamma_samples, axis=0)
         gamma_std = np.std(gamma_samples, axis=0)
+        
+        # Verify integral
+        drt_integral = self.get_drt_integral(gamma_mean, tau_grid)
+        print(f"Bayesian DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"Bayesian DRT - Integral: {drt_integral:.6f} Ω")
+        print(f"Bayesian DRT - Ratio: {drt_integral/self.R_pol:.4f}")
         
         r_hat = az.rhat(trace).to_array().values
         converged = np.all(r_hat < 1.05)
@@ -822,7 +971,13 @@ class BayesianDRT(DRTCore):
             R_inf=self.R_inf,
             R_pol=self.R_pol,
             convergence=converged,
-            metadata={'n_samples': n_samples, 'n_tune': n_tune, 'n_chains': n_chains}
+            metadata={
+                'n_samples': n_samples, 
+                'n_tune': n_tune, 
+                'n_chains': n_chains,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol
+            }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -916,6 +1071,12 @@ class MaxEntropyDRT(DRTCore):
             gamma = result.x
             lambda_opt = lam
         
+        # Verify integral
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+        print(f"MaxEntropy DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"MaxEntropy DRT - Integral: {drt_integral:.6f} Ω")
+        print(f"MaxEntropy DRT - Ratio: {drt_integral/self.R_pol:.4f}")
+        
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
         
         return DRTResult(
@@ -925,7 +1086,11 @@ class MaxEntropyDRT(DRTCore):
             method="Maximum Entropy",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            metadata={'lambda': lambda_opt}
+            metadata={
+                'lambda': lambda_opt,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol
+            }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1822,6 +1987,17 @@ class GaussianDeconvolver:
         self.clipped_points = preprocessed['clipped_points']
         self.small_values_warning = preprocessed['small_values_warning']
         
+        # Calculate the integral of DRT to verify scaling
+        if self.use_log_x:
+            # Integration over d(ln τ) - this should equal R_pol
+            self.drt_integral = np.trapezoid(self.y_original, np.log(self.x_linear))
+        else:
+            # Integration over dτ (not correct, for reference only)
+            self.drt_integral = np.trapezoid(self.y_original, self.x_linear)
+        
+        print(f"DRT integral before deconvolution: {self.drt_integral:.6f} Ω")
+        print(f"This should equal the polarization resistance R_pol from EIS")
+        
         # Normalization - use 95th percentile instead of max for robustness
         self.y_max = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
         
@@ -2415,26 +2591,63 @@ class GaussianDeconvolver:
             )
             peaks.append(peak)
         
-        # Используем self.y_original напрямую - это уже оригинальные значения
-        # self.y_original хранит оригинальные ненормированные значения
-        y_original_restored = self.y_original.copy()  # Просто копируем, без умножения на y_max
+        # Use original y_original values
+        y_original_restored = self.y_original.copy()
+        
+        # Calculate total area from components (should be close to drt_integral)
+        total_component_area = sum([c['area'] for c in self.components])
+        
+        print(f"Original DRT integral: {self.drt_integral:.6f} Ω")
+        print(f"Total area from deconvolution: {total_component_area:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {total_component_area/self.drt_integral:.4f}")
         
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
             y_norm=self.y_norm,
-            y_original=y_original_restored,  # Теперь правильные значения (7 Ом)
+            y_original=y_original_restored,
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
             quality_metrics=self.quality_metrics,
             baseline_params=self.baseline_params,
             baseline_method=self.baseline_method,
-            total_area=self.total_area,
+            total_area=self.drt_integral,  # Use the original DRT integral as total area
             max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
         )
-
+        
+    def calculate_peak_area(self, amplitude: float, sigma: float, is_log_scale: bool = True) -> float:
+        """
+        Calculate area under Gaussian peak.
+        
+        For peaks in log space: area = amplitude * sigma * sqrt(2π)
+        This area corresponds to contribution to polarization resistance in Ω.
+        
+        Args:
+            amplitude: Peak amplitude in original units (Ω)
+            sigma: Standard deviation in log space
+            is_log_scale: Whether X is in log scale (should be True for DRT)
+            
+        Returns:
+            Area under peak (Ω)
+        """
+        if is_log_scale:
+            # For log-scale X, area = amplitude * sigma * sqrt(2π)
+            # This integrates over d(ln τ)
+            return amplitude * sigma * np.sqrt(2 * np.pi)
+        else:
+            # For linear scale (not typical for DRT)
+            return amplitude * sigma * np.sqrt(2 * np.pi)
+    
+    def get_total_resistance(self) -> float:
+        """
+        Get total polarization resistance from DRT integral.
+        
+        Returns:
+            float: Total polarization resistance in Ω
+        """
+        return self.drt_integral
 
 # ============================================================================
 # Visualization Functions (from both codes)
