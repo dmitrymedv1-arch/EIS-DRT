@@ -3513,7 +3513,10 @@ def step3_gaussian_deconvolution():
                 ax.set_xscale('log')
             
             # Plot scaled DRT data
-            ax.plot(deconvolver.x_linear, deconvolver.y_original, 
+            scale_factor_vis = np.log(10)  # ≈ 2.302585
+            y_original_scaled = deconvolver.y_original * scale_factor_vis
+            
+            ax.plot(deconvolver.x_linear, y_original_scaled, 
                    'o-', markersize=3, linewidth=1, alpha=0.7, 
                    label='Scaled DRT Data', color='black', zorder=1)
             
@@ -3627,9 +3630,11 @@ def step4_results():
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        # Оригинальные данные - они уже в правильном масштабе (7 Ом)
-        ax.scatter(deconv_result.x_linear, deconv_result.y_original, 
-                   s=15, alpha=0.5, color='black', label='Original DRT Data', zorder=1)
+        scale_factor_vis = np.log(10)  # ≈ 2.302585
+        y_original_scaled = deconv_result.y_original * scale_factor_vis
+        
+        ax.scatter(deconv_result.x_linear, y_original_scaled, 
+                   s=15, alpha=0.5, color='black', label='Original DRT Data (scaled)', zorder=1)
         
         # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
@@ -3836,10 +3841,13 @@ def step4_results():
         max_amp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
         
         # Нормализованные оригинальные данные
-        y_original_norm = deconv_result.y_original / max_amp
+        scale_factor_vis = np.log(10)  # ≈ 2.302585
+        y_original_scaled = deconv_result.y_original * scale_factor_vis
+        max_amp_scaled = max(y_original_scaled) if len(y_original_scaled) > 0 else 1.0
+        y_original_norm = y_original_scaled / max_amp_scaled
         
         ax.scatter(deconv_result.x_linear, y_original_norm, 
-                   s=15, alpha=0.5, color='black', label='Original DRT Data (normalized)', zorder=1)
+                   s=15, alpha=0.5, color='black', label='Original DRT Data (normalized, scaled)', zorder=1)
         
         # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
@@ -3989,13 +3997,19 @@ def step4_results():
                 
                 fit_values[i] = total
             
-            residuals = deconv_result.y_original - fit_values
+            residuals_original = deconv_result.y_original - fit_values  # исходные residuals
+            residuals_scaled = (deconv_result.y_original * scale_factor_vis) - fit_values  # масштабированные
+            
+            scale_factor_vis = np.log(10)
+            gamma_scaled = deconv_result.y_original * scale_factor_vis
             
             fit_data = pd.DataFrame({
                 'tau_s': deconv_result.x_linear,
                 'gamma_tau_Ohm': deconv_result.y_original,
+                'gamma_tau_Ohm_scaled_for_plot': gamma_scaled,  # для визуализации
                 'gamma_fit_Ohm': fit_values,
-                'Residuals_Ohm': residuals
+                'Residuals_Ohm': residuals,
+                'Residuals_Ohm_scaled': fit_values - gamma_scaled  # скорректированные residuals
             })
             
             csv_fit = fit_data.to_csv(index=False)
