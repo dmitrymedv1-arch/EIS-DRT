@@ -2768,14 +2768,16 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
         
         for i, (t, d) in enumerate(zip(peak_tau, peak_drt)):
             freq = 1/(2*np.pi*t)
-            ax1.annotate(f'τ={t:.2e}s\nf={freq:.2e}Hz',
+            # Убираем LaTeX-разметку из аннотаций
+            ax1.annotate(f'tau={t:.2e}s\nf={freq:.2e}Hz',
                        xy=(t, d), xytext=(t*1.5, d*1.2),
                        fontsize=8, ha='center',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
-    ax1.set_xlabel(r"Relaxation Time $\tau$ / s", fontweight='bold')
-    ax1.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
-    ax1.set_title(r"$\gamma(\tau)$ vs $\tau$", fontweight='bold')
+    # Убираем символы $ из меток, используем обычный текст
+    ax1.set_xlabel("Relaxation Time tau (s)", fontweight='bold')
+    ax1.set_ylabel("gamma(tau) (Ohm)", fontweight='bold')
+    ax1.set_title("gamma(tau) vs tau", fontweight='bold')
     ax1.legend(loc='best', frameon=True)
     ax1.grid(True, alpha=0.3, linestyle='--', which='both')
     
@@ -2801,14 +2803,15 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
         
         for i, (f, d) in enumerate(zip(peak_freqs_sorted, peak_amplitudes_sorted)):
             tau_val = 1/(2*np.pi*f)
-            ax2.annotate(f'f={f:.2e}Hz\nτ={tau_val:.2e}s',
+            # Убираем LaTeX-разметку из аннотаций
+            ax2.annotate(f'f={f:.2e}Hz\ntau={tau_val:.2e}s',
                        xy=(f, d), xytext=(f*1.5, d*1.2),
                        fontsize=8, ha='center',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
-    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel(r"$\gamma(\tau)$ / $\Omega$", fontweight='bold')
-    ax2.set_title(r"$\gamma(\tau)$ vs Frequency (High → Low)", fontweight='bold')
+    ax2.set_xlabel("Frequency (Hz)", fontweight='bold')
+    ax2.set_ylabel("gamma(tau) (Ohm)", fontweight='bold')
+    ax2.set_title("gamma(tau) vs Frequency (High -> Low)", fontweight='bold')
     ax2.legend(loc='best', frameon=True)
     ax2.grid(True, alpha=0.3, linestyle='--', which='both')
     ax2.set_xscale('log')
