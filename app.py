@@ -3532,7 +3532,15 @@ def step3_gaussian_deconvolution():
                         st.write(f"γ = {y_value:.4e} Ω")
                     with col_e:
                         if st.button("🗑️", key=f"delete_peak_{i}", help=f"Delete peak {i+1}"):
-                            if deconvolver.remove_component(i+1):
+                            if 0 <= i < len(st.session_state.app_state.peak_info):
+                                # Удаляем информацию о пике
+                                st.session_state.app_state.peak_info.pop(i)
+                                # Удаляем параметры пика (3 параметра на пик)
+                                if st.session_state.app_state.initial_peak_params:
+                                    start_idx = i * 3
+                                    del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
+                                st.success(f"Peak {i+1} removed")
+                                st.rerun()
                                 st.success(f"Peak {i+1} removed")
                                 st.rerun()
                 
