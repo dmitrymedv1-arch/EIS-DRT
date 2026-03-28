@@ -2755,6 +2755,10 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     """Create publication-quality DRT plot with both tau and frequency axes"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
+    # Отключаем LaTeX для всех текстовых элементов
+    plt.rcParams['text.usetex'] = False
+    plt.rcParams['axes.formatter.use_mathtext'] = False
+    
     if result.gamma_std is not None:
         ax1.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
                         result.gamma + 2*result.gamma_std,
@@ -2768,13 +2772,13 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
         
         for i, (t, d) in enumerate(zip(peak_tau, peak_drt)):
             freq = 1/(2*np.pi*t)
-            # Убираем LaTeX-разметку из аннотаций
+            # Используем обычный текст без LaTeX
             ax1.annotate(f'tau={t:.2e}s\nf={freq:.2e}Hz',
                        xy=(t, d), xytext=(t*1.5, d*1.2),
                        fontsize=8, ha='center',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
-    # Убираем символы $ из меток, используем обычный текст
+    # Используем обычный текст без LaTeX
     ax1.set_xlabel("Relaxation Time tau (s)", fontweight='bold')
     ax1.set_ylabel("gamma(tau) (Ohm)", fontweight='bold')
     ax1.set_title("gamma(tau) vs tau", fontweight='bold')
@@ -2803,7 +2807,7 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
         
         for i, (f, d) in enumerate(zip(peak_freqs_sorted, peak_amplitudes_sorted)):
             tau_val = 1/(2*np.pi*f)
-            # Убираем LaTeX-разметку из аннотаций
+            # Используем обычный текст без LaTeX
             ax2.annotate(f'f={f:.2e}Hz\ntau={tau_val:.2e}s',
                        xy=(f, d), xytext=(f*1.5, d*1.2),
                        fontsize=8, ha='center',
@@ -2823,7 +2827,6 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     plt.tight_layout()
     
     return fig
-
 
 def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_components: bool = True,
                               show_baseline: bool = True, title: str = "Gaussian Deconvolution Result",
