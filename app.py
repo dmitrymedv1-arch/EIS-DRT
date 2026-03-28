@@ -4346,6 +4346,24 @@ def step4_results():
                             df_summary = pd.DataFrame(summary_data, columns=['Parameter', 'Value'])
                             df_summary.to_excel(writer, sheet_name='Report_Summary', index=False)
                         
+                        # CRITICAL FIX: Ensure at least one sheet is visible and active
+                        workbook = writer.book
+                        if len(workbook.sheetnames) == 0:
+                            # This should never happen now, but just in case
+                            df_fallback = pd.DataFrame({'Status': ['Analysis completed']})
+                            df_fallback.to_excel(writer, sheet_name='Results', index=False)
+                            workbook = writer.book
+                        
+                        # Make the first sheet visible and set as active
+                        if workbook.sheetnames:
+                            first_sheet = workbook[workbook.sheetnames[0]]
+                            first_sheet.sheet_state = 'visible'
+                            workbook.active = first_sheet
+                            
+                            # Also ensure all other sheets are visible (optional)
+                            for sheet_name in workbook.sheetnames[1:]:
+                                workbook[sheet_name].sheet_state = 'visible'
+                        
                         # Prepare download button
                         output.seek(0)
                         st.success("✅ Excel file generated successfully!")
