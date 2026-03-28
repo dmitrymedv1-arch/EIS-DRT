@@ -383,7 +383,6 @@ class DeconvolutionResult:
     """Container for Gaussian deconvolution results"""
     peaks: List[GaussianPeak]
     fit_y_norm: np.ndarray
-    fit_y_original: Optional[np.ndarray] = None  # Added for original scale fit
     x: np.ndarray
     y_norm: np.ndarray
     y_original: np.ndarray
@@ -391,6 +390,7 @@ class DeconvolutionResult:
     use_log_x: bool
     use_log_y: bool
     quality_metrics: Dict[str, Any]
+    fit_y_original: Optional[np.ndarray] = None  # Added for original scale fit
     baseline_params: Optional[List[float]] = None
     baseline_method: str = 'none'
     total_area: float = 0.0
