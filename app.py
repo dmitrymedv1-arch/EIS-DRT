@@ -1,24 +1,3 @@
-"""
-Electrochemical Impedance Spectroscopy (EIS) Analysis Tool
-Distribution of Relaxation Times (DRT) Analysis with Gaussian Deconvolution
-
-Поддерживаемые методы:
-- Тихоновская регуляризация (Tikhonov) с NNLS
-- Байесовский метод с MCMC (PyMC)
-- Метод максимальной энтропии (Maximum Entropy) с авто-выбором λ
-- Гауссовские процессы (fGP-DRT) с non-negativity constraints
-- Loewner Framework (RLF) - data-driven метод
-- Generalized DRT для обработки индуктивных петель
-
-Дополнительно:
-- Gaussian Deconvolution of DRT Peaks
-- Multi-stage workflow with state preservation
-- Peak editing and area distribution analysis
-
-Author: DRT Analysis Tool
-Version: 4.0.0
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -44,20 +23,11 @@ from enum import Enum
 import re
 import time
 
-# PyMC for Bayesian MCMC
-try:
-    import pymc as pm
-    import arviz as az
-    PYMC_AVAILABLE = True
-except ImportError:
-    PYMC_AVAILABLE = False
-    warnings.warn("PyMC not installed. Bayesian MCMC will be disabled.")
-
 warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="EIS-DRT Analysis Tool v4.0",
+    page_title="EIS-DRT Analysis Tool v4.1",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -413,6 +383,7 @@ class DeconvolutionResult:
     """Container for Gaussian deconvolution results"""
     peaks: List[GaussianPeak]
     fit_y_norm: np.ndarray
+    fit_y_original: Optional[np.ndarray] = None  # Added for original scale fit
     x: np.ndarray
     y_norm: np.ndarray
     y_original: np.ndarray
@@ -472,6 +443,7 @@ class AppState:
     
     # Step 2: DRT calculation
     drt_result: Optional[DRTResult] = None
+    drt_solver: Optional[Any] = None  # Added to store solver for reconstruction
     drt_method: str = "Tikhonov Regularization (NNLS)"
     drt_parameters: Dict[str, Any] = field(default_factory=dict)
     drt_calculated: bool = False
@@ -903,97 +875,6 @@ class TikhonovDRT(DRTCore):
 
 
 # ============================================================================
-# Bayesian DRT with MCMC (from EIS code)
-# ============================================================================
-
-class BayesianDRT(DRTCore):
-    """Bayesian method for DRT with MCMC sampling"""
-    
-    def __init__(self, data: ImpedanceData, include_inductive: bool = False):
-        super().__init__(data, include_inductive)
-        if not PYMC_AVAILABLE:
-            raise ImportError("PyMC is required for Bayesian DRT with MCMC")
-    
-    def compute(self, n_tau: int = 150, n_samples: int = 2000, n_tune: int = 1000,
-                n_chains: int = 4) -> DRTResult:
-        """Compute DRT using Bayesian method with MCMC"""
-        
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
-        K = np.vstack([K_real, K_imag])
-        
-        # Second-order regularization matrix
-        L = np.zeros((n_tau-2, n_tau))
-        for i in range(n_tau-2):
-            L[i, i] = 1
-            L[i, i+1] = -2
-            L[i, i+2] = 1
-        
-        with pm.Model() as model:
-            # Gamma is positive
-            gamma_raw = pm.HalfNormal('gamma_raw', sigma=1.0, shape=n_tau)
-            
-            # Smoothness prior
-            smoothness = pm.HalfCauchy('smoothness', beta=0.1)
-            reg_penalty = smoothness * pm.math.sum(pm.math.abs(L @ gamma_raw))
-            
-            # Noise standard deviation
-            sigma = pm.HalfCauchy('sigma', beta=0.1)
-            
-            # Forward model
-            Z_pred = pm.math.dot(K, gamma_raw)
-            
-            # Likelihood
-            likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
-            
-            # Regularization potential
-            pm.Potential('reg', -reg_penalty)
-            
-            # Sample
-            trace = pm.sample(draws=n_samples, tune=n_tune, chains=n_chains, 
-                             return_inferencedata=True, progressbar=False)
-        
-        gamma_samples = trace.posterior['gamma_raw'].values.reshape(-1, n_tau)
-        gamma_mean = np.mean(gamma_samples, axis=0)
-        gamma_std = np.std(gamma_samples, axis=0)
-        
-        # Verify integral
-        drt_integral = self.get_drt_integral(gamma_mean, tau_grid)
-        print(f"Bayesian DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
-        print(f"Bayesian DRT - Integral: {drt_integral:.6f} Ω")
-        print(f"Bayesian DRT - Ratio: {drt_integral/self.R_pol:.4f}")
-        
-        r_hat = az.rhat(trace).to_array().values
-        converged = np.all(r_hat < 1.05)
-        
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma_mean,
-            gamma_std=gamma_std,
-            method="Bayesian MCMC",
-            R_inf=self.R_inf,
-            R_pol=self.R_pol,
-            convergence=converged,
-            metadata={
-                'n_samples': n_samples, 
-                'n_tune': n_tune, 
-                'n_chains': n_chains,
-                'drt_integral': drt_integral,
-                'integral_ratio': drt_integral / self.R_pol
-            }
-        )
-    
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
-        return Z_rec_real, Z_rec_imag
-
-
-# ============================================================================
 # Maximum Entropy DRT with Automatic Lambda Selection (from EIS code)
 # ============================================================================
 
@@ -1076,234 +957,37 @@ class MaxEntropyDRT(DRTCore):
             gamma = result.x
             lambda_opt = lam
         
-        # Verify integral
-        drt_integral = self.get_drt_integral(gamma, tau_grid)
-        print(f"MaxEntropy DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
-        print(f"MaxEntropy DRT - Integral: {drt_integral:.6f} Ω")
-        print(f"MaxEntropy DRT - Ratio: {drt_integral/self.R_pol:.4f}")
-        
+        # Calculate uncertainty estimate from second derivative
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
+        
+        # Apply ln(10) correction for consistency with Tikhonov method
+        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
+        
+        # Recalculate integral with corrected gamma
+        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        print(f"MaxEntropy DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"MaxEntropy DRT - Integral (before correction): {self.get_drt_integral(gamma, tau_grid):.6f} Ω")
+        print(f"MaxEntropy DRT - Integral (after correction): {drt_integral_corrected:.6f} Ω")
+        print(f"MaxEntropy DRT - Ratio (after correction): {drt_integral_corrected/self.R_pol:.4f}")
         
         return DRTResult(
             tau_grid=tau_grid,
-            gamma=gamma,
-            gamma_std=gamma_std,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
             method="Maximum Entropy",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
             metadata={
                 'lambda': lambda_opt,
-                'drt_integral': drt_integral,
-                'integral_ratio': drt_integral / self.R_pol
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol
             }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
-        return Z_rec_real, Z_rec_imag
-
-
-# ============================================================================
-# Finite Gaussian Process DRT (fGP-DRT) (from EIS code)
-# ============================================================================
-
-class FiniteGaussianProcessDRT(DRTCore):
-    """Finite Gaussian Process for DRT with non-negativity constraints"""
-    
-    def __init__(self, data: ImpedanceData, include_inductive: bool = False):
-        super().__init__(data, include_inductive)
-    
-    def _rbf_kernel(self, x1: np.ndarray, x2: np.ndarray, length_scale: float = 1.0, sigma_f: float = 1.0) -> np.ndarray:
-        """Radial Basis Function kernel"""
-        dist_matrix = np.subtract.outer(x1, x2)**2
-        return sigma_f**2 * np.exp(-0.5 * dist_matrix / length_scale**2)
-    
-    def compute(self, n_tau: int = 150, n_components: int = 30, n_samples: int = 100) -> DRTResult:
-        """Compute DRT using finite Gaussian Process"""
-        
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        log_tau_grid = np.log10(tau_grid)
-        
-        basis_centers = np.linspace(log_tau_grid[0], log_tau_grid[-1], n_components)
-        length_scale = (log_tau_grid[-1] - log_tau_grid[0]) / n_components
-        
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        K_full = np.vstack([K_real, K_imag])
-        
-        Phi = np.zeros((self.N * 2, n_components))
-        for i, center in enumerate(basis_centers):
-            phi = np.exp(-0.5 * ((log_tau_grid - center) / length_scale)**2)
-            phi = phi / np.sum(phi)
-            Phi[:, i] = K_full @ phi
-        
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
-        
-        lam = 1e-4
-        A = Phi.T @ Phi + lam * np.eye(n_components)
-        b = Phi.T @ Z_target
-        weights_init = np.linalg.solve(A, b)
-        weights_init = np.maximum(weights_init, 0)
-        
-        if PYMC_AVAILABLE:
-            with pm.Model() as model:
-                weights = pm.TruncatedNormal('weights', mu=weights_init, sigma=1.0, 
-                                             lower=0, shape=n_components)
-                
-                sigma = pm.HalfCauchy('sigma', beta=0.1)
-                Z_pred = pm.math.dot(Phi, weights)
-                likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
-                
-                trace = pm.sample(draws=n_samples, tune=n_samples//2, 
-                                 chains=2, progressbar=False)
-                
-                weights_samples = trace.posterior['weights'].values.reshape(-1, n_components)
-                weights_mean = np.mean(weights_samples, axis=0)
-                weights_std = np.std(weights_samples, axis=0)
-        else:
-            weights_mean = weights_init
-            weights_std = np.ones_like(weights_init) * 0.1
-        
-        gamma = np.zeros(n_tau)
-        gamma_std = np.zeros(n_tau)
-        for i, center in enumerate(basis_centers):
-            phi = np.exp(-0.5 * ((log_tau_grid - center) / length_scale)**2)
-            phi = phi / np.sum(phi)
-            gamma += weights_mean[i] * phi
-            gamma_std += weights_std[i] * phi
-        
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma,
-            gamma_std=gamma_std,
-            method="Finite Gaussian Process (fGP-DRT)",
-            R_inf=self.R_inf,
-            R_pol=self.R_pol,
-            metadata={'n_components': n_components}
-        )
-    
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
-        return Z_rec_real, Z_rec_imag
-
-
-# ============================================================================
-# Loewner Framework (RLF) - Data-Driven DRT (from EIS code)
-# ============================================================================
-
-class LoewnerFrameworkDRT(DRTCore):
-    """Loewner Framework for data-driven DRT extraction"""
-    
-    def __init__(self, data: ImpedanceData):
-        super().__init__(data, include_inductive=False)
-    
-    def _build_loewner_matrices(self, omega: np.ndarray, Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Build Loewner and shifted Loewner matrices"""
-        n = len(omega)
-        n_left = n // 2
-        n_right = n - n_left
-        
-        left_omega = omega[:n_left]
-        right_omega = omega[n_left:]
-        left_Z = Z[:n_left]
-        right_Z = Z[n_left:]
-        
-        L = np.zeros((n_left, n_right), dtype=complex)
-        Ls = np.zeros((n_left, n_right), dtype=complex)
-        
-        for i in range(n_left):
-            for j in range(n_right):
-                denom = left_omega[i] - right_omega[j]
-                if abs(denom) > 1e-10:
-                    L[i, j] = (left_Z[i] - right_Z[j]) / denom
-                    Ls[i, j] = (left_omega[i] * left_Z[i] - right_omega[j] * right_Z[j]) / denom
-        
-        return L, Ls, left_Z, right_Z
-    
-    def _scree_not_threshold(self, singular_values: np.ndarray) -> int:
-        """ScreeNOT algorithm for optimal SVD truncation"""
-        n = len(singular_values)
-        if n < 3:
-            return n // 2
-        
-        diffs = np.diff(singular_values)
-        diffs2 = np.diff(diffs)
-        
-        if len(diffs2) > 0:
-            knee_idx = np.argmax(np.abs(diffs2)) + 1
-            return min(knee_idx + 1, n)
-        
-        return n // 2
-    
-    def compute(self, n_tau: int = 150, model_order: Optional[int] = None) -> DRTResult:
-        """Compute DRT using Loewner Framework"""
-        
-        omega = 2 * np.pi * self.frequencies
-        Z = self.Z
-        
-        L, Ls, left_Z, right_Z = self._build_loewner_matrices(omega, Z)
-        
-        U, S, Vh = np.linalg.svd(L, full_matrices=False)
-        
-        if model_order is None:
-            model_order = self._scree_not_threshold(S)
-        
-        model_order = max(1, min(model_order, len(S) - 1))
-        
-        U_r = U[:, :model_order]
-        S_r = np.diag(S[:model_order])
-        V_r = Vh[:model_order, :]
-        
-        E_r = -U_r.conj().T @ L @ V_r.conj().T
-        A_r = -U_r.conj().T @ Ls @ V_r.conj().T
-        B_r = U_r.conj().T @ left_Z
-        C_r = right_Z @ V_r.conj().T
-        
-        try:
-            eigvals, eigvecs = linalg.eig(A_r, E_r)
-            
-            tau_loewner = -1.0 / eigvals
-            valid = (np.real(tau_loewner) > 0) & (np.imag(tau_loewner) < 1e-6)
-            tau_loewner = np.real(tau_loewner[valid])
-            
-            R_loewner = np.zeros(len(tau_loewner))
-            for i in range(len(tau_loewner)):
-                R_loewner[i] = np.abs(C_r @ eigvecs[:, i] * (eigvecs[:, i].conj().T @ B_r))
-        except:
-            tau_loewner = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-            R_loewner = np.ones(n_tau) / n_tau
-        
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        gamma = np.zeros(n_tau)
-        
-        if len(tau_loewner) > 1:
-            idx_sorted = np.argsort(tau_loewner)
-            tau_sorted = tau_loewner[idx_sorted]
-            R_sorted = R_loewner[idx_sorted]
-            
-            interp_func = interpolate.interp1d(np.log10(tau_sorted), R_sorted, 
-                                               kind='linear', fill_value=0, bounds_error=False)
-            gamma = interp_func(np.log10(tau_grid))
-            gamma = np.maximum(gamma, 0)
-        
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma,
-            gamma_std=None,
-            method="Loewner Framework (RLF)",
-            R_inf=self.R_inf,
-            R_pol=self.R_pol,
-            metadata={'model_order': model_order}
-        )
-    
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
@@ -2015,6 +1699,7 @@ class GaussianDeconvolver:
         # Results containers
         self.components = []
         self.fit_y_norm = None
+        self.fit_y_original = None  # Added for original scale fit
         self.popt = None
         self.baseline_params = None
         self.quality_metrics = {}
@@ -2373,8 +2058,10 @@ class GaussianDeconvolver:
             if progress_callback:
                 progress_callback(0.8, "Calculating components...")
             
-            # Calculate fit
+            # Calculate fit in normalized space
             fit_y_norm = model_func(self.x, *popt)
+            # Calculate fit in original space
+            fit_y_original = fit_y_norm * self.y_max
             
             # Extract components
             components = []
@@ -2423,6 +2110,7 @@ class GaussianDeconvolver:
             self.components = components
             self.baseline_params = baseline_params
             self.fit_y_norm = fit_y_norm
+            self.fit_y_original = fit_y_original  # Store original scale fit
             self.total_area = total_area
             
             # Calculate quality metrics
@@ -2609,6 +2297,7 @@ class GaussianDeconvolver:
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
+            fit_y_original=self.fit_y_original if self.fit_y_original is not None else None,
             x=self.x,
             y_norm=self.y_norm,
             y_original=y_original_restored,
@@ -2874,6 +2563,13 @@ def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_component
     if preview_mode and preview_fit is not None:
         y_total = preview_fit * deconv_result.y_original.max()
         ax1.plot(x_dense, y_total, 'b--', linewidth=2, label='Preview (no fit)', zorder=3, alpha=0.7)
+    elif deconv_result.fit_y_original is not None:
+        # Use stored original scale fit and interpolate for smooth curve
+        from scipy.interpolate import interp1d
+        interp_func = interp1d(deconv_result.x_linear, deconv_result.fit_y_original, 
+                               kind='cubic', fill_value='extrapolate')
+        y_total_interp = interp_func(x_dense)
+        ax1.plot(x_dense, y_total_interp, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
     elif deconv_result.fit_y_norm is not None:
         n_peaks = len(deconv_result.peaks)
         peak_params = []
@@ -3183,18 +2879,12 @@ def step2_drt_analysis():
         analysis_method = st.selectbox(
             "DRT Calculation Method",
             ["Tikhonov Regularization (NNLS)",
-             "Bayesian MCMC",
-             "Maximum Entropy (auto-λ)",
-             "Finite Gaussian Process (fGP-DRT)",
-             "Loewner Framework (RLF)",
-             "Generalized DRT (with inductive loops)"]
+             "Maximum Entropy (auto-λ)"]
         )
         
         n_tau = st.slider("Number of time points", 50, 300, 150)
         
         include_inductive = False
-        if analysis_method == "Generalized DRT (with inductive loops)":
-            include_inductive = st.checkbox("Include inductive loops", value=True)
         
         # Method-specific parameters
         lambda_auto = True
@@ -3207,27 +2897,11 @@ def step2_drt_analysis():
             if not lambda_auto:
                 lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
         
-        elif analysis_method == "Bayesian MCMC":
-            if not PYMC_AVAILABLE:
-                st.warning("⚠️ PyMC not installed. Bayesian MCMC may not work.")
-            n_samples = st.slider("MCMC samples", 500, 5000, 2000)
-            n_tune = st.slider("Tuning samples", 500, 2000, 1000)
-            st.session_state.app_state.drt_parameters['n_samples'] = n_samples
-            st.session_state.app_state.drt_parameters['n_tune'] = n_tune
-        
         elif analysis_method == "Maximum Entropy (auto-λ)":
             entropy_lambda_auto = st.checkbox("Auto-select λ", value=True)
             if not entropy_lambda_auto:
                 st.session_state.app_state.drt_parameters['entropy_lambda'] = st.number_input("Entropy λ", value=0.1, format="%.2f")
             st.session_state.app_state.drt_parameters['lambda_auto'] = entropy_lambda_auto
-        
-        elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
-            n_components = st.slider("GP components", 10, 50, 30)
-            st.session_state.app_state.drt_parameters['n_components'] = n_components
-        
-        elif analysis_method == "Loewner Framework (RLF)":
-            model_order = st.number_input("Model order (0=auto)", min_value=0, max_value=100, value=0)
-            st.session_state.app_state.drt_parameters['model_order'] = model_order if model_order > 0 else None
         
         # Store parameters
         st.session_state.app_state.drt_method = analysis_method
@@ -3254,15 +2928,6 @@ def step2_drt_analysis():
                             result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_value, 
                                                         lambda_auto=lambda_auto)
                         
-                        elif analysis_method == "Bayesian MCMC":
-                            drt_solver = BayesianDRT(data, include_inductive=include_inductive)
-                            if PYMC_AVAILABLE:
-                                result = drt_solver.compute(n_tau=n_tau, 
-                                                           n_samples=st.session_state.app_state.drt_parameters.get('n_samples', 2000),
-                                                           n_tune=st.session_state.app_state.drt_parameters.get('n_tune', 1000))
-                            else:
-                                result = drt_solver.compute(n_tau=n_tau, n_samples=500)
-                        
                         elif analysis_method == "Maximum Entropy (auto-λ)":
                             drt_solver = MaxEntropyDRT(data, include_inductive=include_inductive)
                             lambda_auto_val = st.session_state.app_state.drt_parameters.get('lambda_auto', True)
@@ -3270,26 +2935,10 @@ def step2_drt_analysis():
                             result = drt_solver.compute(n_tau=n_tau, lambda_value=lambda_val, 
                                                         lambda_auto=lambda_auto_val)
                         
-                        elif analysis_method == "Finite Gaussian Process (fGP-DRT)":
-                            drt_solver = FiniteGaussianProcessDRT(data, include_inductive=include_inductive)
-                            n_comp = st.session_state.app_state.drt_parameters.get('n_components', 30)
-                            result = drt_solver.compute(n_tau=n_tau, n_components=n_comp)
-                        
-                        elif analysis_method == "Loewner Framework (RLF)":
-                            drt_solver = LoewnerFrameworkDRT(data)
-                            model_order_val = st.session_state.app_state.drt_parameters.get('model_order', None)
-                            result = drt_solver.compute(n_tau=n_tau, model_order=model_order_val)
-                        
-                        else:  # Generalized DRT
-                            drt_solver = TikhonovDRT(data, regularization_order=2, include_inductive=include_inductive)
-                            result = drt_solver.compute(n_tau=n_tau, lambda_auto=True)
-                        
                         # Store results
                         st.session_state.app_state.drt_result = result
-                        st.session_state.app_state.drt_calculated = True
-                        
-                        # Also store for reconstruction
                         st.session_state.app_state.drt_solver = drt_solver
+                        st.session_state.app_state.drt_calculated = True
                         
                         st.success("✅ DRT calculation complete!")
                         st.rerun()
@@ -3302,6 +2951,7 @@ def step2_drt_analysis():
             st.subheader("📊 DRT Results")
             
             result = st.session_state.app_state.drt_result
+            solver = st.session_state.app_state.drt_solver
             
             st.info(f"""
             **Method:** {result.method}
@@ -3313,8 +2963,100 @@ def step2_drt_analysis():
             if 'lambda' in result.metadata:
                 st.info(f"**λ:** {result.metadata['lambda']:.3e}")
             
-            peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
+            # Display integral verification
+            integral, ratio = result.verify_integral()
+            if abs(ratio - 1.0) < 0.05:
+                st.success(f"✅ DRT integral verification: {integral:.4f} Ω (ratio = {ratio:.4f})")
+            else:
+                st.warning(f"⚠️ DRT integral verification: {integral:.4f} Ω (ratio = {ratio:.4f})")
             
+            # Reconstruct impedance from DRT for validation
+            if solver is not None:
+                Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma)
+                
+                # Calculate reconstruction error
+                Z_original = data.Z
+                Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
+                error_percent = np.abs((Z_original - Z_reconstructed) / Z_original) * 100
+                mean_error = np.mean(error_percent)
+                max_error = np.max(error_percent)
+                
+                st.info(f"""
+                **Reconstruction Quality:**
+                **Mean Error:** {mean_error:.2f}%
+                **Max Error:** {max_error:.2f}%
+                """)
+                
+                # Display validation plots
+                st.markdown("---")
+                st.subheader("🔍 Validation: Original vs Reconstructed Impedance")
+                
+                # Nyquist plot
+                fig_nyq, ax_nyq = plt.subplots(figsize=(8, 6))
+                ax_nyq.plot(data.re_z, data.im_z, 'o', markersize=6, 
+                           label='Experimental', color='#1f77b4', alpha=0.7)
+                ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5, 
+                           label='Reconstructed from DRT', color='#ff7f0e')
+                ax_nyq.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+                ax_nyq.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
+                ax_nyq.set_title("Nyquist Plot: Validation", fontweight='bold')
+                ax_nyq.legend(loc='best', frameon=True)
+                ax_nyq.grid(True, alpha=0.3, linestyle='--')
+                ax_nyq.set_aspect('equal', adjustable='box')
+                st.pyplot(fig_nyq)
+                plt.close()
+                
+                # Bode plots
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
+                
+                # Magnitude plot
+                mag_exp = data.Z_mod
+                mag_rec = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
+                ax1.loglog(data.freq, mag_exp, 'o', markersize=6, 
+                          label='Experimental', color='#1f77b4', alpha=0.7)
+                ax1.loglog(data.freq, mag_rec, '-', linewidth=2.5, 
+                          label='Reconstructed', color='#ff7f0e')
+                ax1.set_xlabel("Frequency / Hz", fontweight='bold')
+                ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
+                ax1.legend(loc='best')
+                ax1.grid(True, alpha=0.3, linestyle='--')
+                
+                # Phase plot
+                phase_exp = data.phase
+                phase_rec = np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
+                ax2.semilogx(data.freq, phase_exp, 'o', markersize=6, 
+                            label='Experimental', color='#1f77b4', alpha=0.7)
+                ax2.semilogx(data.freq, phase_rec, '-', linewidth=2.5, 
+                            label='Reconstructed', color='#ff7f0e')
+                ax2.set_xlabel("Frequency / Hz", fontweight='bold')
+                ax2.set_ylabel("Phase / deg", fontweight='bold')
+                ax2.legend(loc='best')
+                ax2.grid(True, alpha=0.3, linestyle='--')
+                ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
+                
+                fig.suptitle("Bode Plot: Validation", fontweight='bold', fontsize=14)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+                
+                # Error plot
+                fig_err, ax_err = plt.subplots(figsize=(8, 5))
+                ax_err.semilogx(data.freq, error_percent, 'o-', markersize=5, 
+                               linewidth=1.5, color='#d62728')
+                ax_err.set_xlabel("Frequency / Hz", fontweight='bold')
+                ax_err.set_ylabel("Relative Error / %", fontweight='bold')
+                ax_err.set_title("Reconstruction Error vs Frequency", fontweight='bold')
+                ax_err.grid(True, alpha=0.3, linestyle='--')
+                ax_err.axhline(y=mean_error, color='gray', linestyle='--', 
+                              label=f'Mean Error: {mean_error:.2f}%')
+                ax_err.legend()
+                st.pyplot(fig_err)
+                plt.close()
+            
+            # DRT plot
+            st.markdown("---")
+            st.subheader("📈 DRT Spectrum")
+            peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
             fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
             plt.close()
@@ -3701,9 +3443,15 @@ def step4_results():
                              deconv_result.baseline_params[2] * x_dense_log**2)
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
-        # Рисуем общую сумму - используем сумму компонент
-        if deconv_result.peaks:
-            # Суммируем все компоненты
+        # Рисуем общую сумму - используем сохраненный фит в оригинальном масштабе если доступен
+        if deconv_result.fit_y_original is not None:
+            from scipy.interpolate import interp1d
+            interp_func = interp1d(deconv_result.x_linear, deconv_result.fit_y_original, 
+                                   kind='cubic', fill_value='extrapolate')
+            y_total_interp = interp_func(x_dense)
+            ax.plot(x_dense, y_total_interp, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
+        elif deconv_result.peaks:
+            # Fallback: суммируем все компоненты
             y_total = np.zeros_like(x_dense)
             for peak in deconv_result.peaks:
                 y_total += peak.amplitude * GaussianModelDeconv.gaussian(
@@ -3913,7 +3661,14 @@ def step4_results():
                 ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
         # Рисуем нормализованную общую сумму
-        if deconv_result.peaks:
+        if deconv_result.fit_y_original is not None:
+            from scipy.interpolate import interp1d
+            fit_y_original_norm = deconv_result.fit_y_original / max_amp
+            interp_func = interp1d(deconv_result.x_linear, fit_y_original_norm, 
+                                   kind='cubic', fill_value='extrapolate')
+            y_total_norm_interp = interp_func(x_dense)
+            ax.plot(x_dense, y_total_norm_interp, 'r--', linewidth=2.5, label='Total Fit (normalized)', zorder=3)
+        elif deconv_result.peaks:
             y_total_norm = np.zeros_like(x_dense)
             for peak in deconv_result.peaks:
                 y_total_norm += (peak.amplitude * GaussianModelDeconv.gaussian(
@@ -3990,32 +3745,35 @@ def step4_results():
             
             # Create fitting data DataFrame - используем оригинальные значения
             # Реконструируем fit для каждой точки
-            fit_values = np.zeros_like(deconv_result.x_linear)
-            for i, tau in enumerate(deconv_result.x_linear):
-                if deconv_result.use_log_x:
-                    log_tau = np.log10(tau)
-                else:
-                    log_tau = tau
-                
-                # Суммируем все компоненты
-                total = 0
-                for peak in deconv_result.peaks:
-                    total += peak.amplitude * GaussianModelDeconv.gaussian(
-                        log_tau, 1.0, peak.center_log, peak.sigma_log
-                    )
-                
-                # Добавляем базовую линию
-                if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
-                    if deconv_result.baseline_method == 'constant':
-                        total += deconv_result.baseline_params[0]
-                    elif deconv_result.baseline_method == 'linear':
-                        total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
-                    elif deconv_result.baseline_method == 'quadratic':
-                        total += (deconv_result.baseline_params[0] + 
-                                 deconv_result.baseline_params[1] * log_tau +
-                                 deconv_result.baseline_params[2] * log_tau**2)
-                
-                fit_values[i] = total
+            if deconv_result.fit_y_original is not None:
+                fit_values = deconv_result.fit_y_original
+            else:
+                fit_values = np.zeros_like(deconv_result.x_linear)
+                for i, tau in enumerate(deconv_result.x_linear):
+                    if deconv_result.use_log_x:
+                        log_tau = np.log10(tau)
+                    else:
+                        log_tau = tau
+                    
+                    # Суммируем все компоненты
+                    total = 0
+                    for peak in deconv_result.peaks:
+                        total += peak.amplitude * GaussianModelDeconv.gaussian(
+                            log_tau, 1.0, peak.center_log, peak.sigma_log
+                        )
+                    
+                    # Добавляем базовую линию
+                    if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
+                        if deconv_result.baseline_method == 'constant':
+                            total += deconv_result.baseline_params[0]
+                        elif deconv_result.baseline_method == 'linear':
+                            total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
+                        elif deconv_result.baseline_method == 'quadratic':
+                            total += (deconv_result.baseline_params[0] + 
+                                     deconv_result.baseline_params[1] * log_tau +
+                                     deconv_result.baseline_params[2] * log_tau**2)
+                    
+                    fit_values[i] = total
             
             residuals = deconv_result.y_original - fit_values
             
@@ -4199,7 +3957,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("⚡ **EIS-DRT Analysis Tool v4.0** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis")
+    st.markdown("⚡ **EIS-DRT Analysis Tool v4.1** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis")
 
 
 if __name__ == "__main__":
