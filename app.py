@@ -256,7 +256,7 @@ st.markdown("""
 
 @dataclass
 class DRTResult:
-    """Container for DRT calculation results with correct scaling"""
+    """Container for DRT calculation results"""
     tau_grid: np.ndarray
     gamma: np.ndarray
     gamma_std: Optional[np.ndarray] = None
@@ -268,62 +268,35 @@ class DRTResult:
     
     @property
     def log_tau(self) -> np.ndarray:
+        """Log10 of relaxation times"""
         return np.log10(self.tau_grid)
     
-    def get_integral_ln(self) -> float:
+    def get_integral(self) -> float:
         """
-        Calculate ∫ γ(τ) d(ln τ).
-        This should equal R_pol for correctly scaled DRT.
+        Calculate total polarization resistance from DRT.
+        R_pol = ∫ γ(τ) d(ln τ)
+        
+        This should equal self.R_pol (within regularization error)
         """
         return np.trapezoid(self.gamma, np.log(self.tau_grid))
     
-    def get_integral_log10(self) -> float:
+    def get_integral_linear(self) -> float:
         """
-        Calculate ∫ γ(τ) d(log₁₀ τ).
-        This equals R_pol / ln(10) ≈ R_pol / 2.3026.
+        Calculate integral over linear τ (for reference only).
+        This is NOT the correct way to get R_pol.
         """
-        return np.trapezoid(self.gamma, np.log10(self.tau_grid))
+        return np.trapezoid(self.gamma, self.tau_grid)
     
-    def get_scaled_gamma_for_deconvolution(self) -> np.ndarray:
+    def verify_integral(self) -> Tuple[float, float]:
         """
-        Return gamma scaled for deconvolution.
-        The scaling ensures that area under peaks sums to R_pol.
-        """
-        current_integral = self.get_integral_ln()
-        if current_integral > 0 and self.R_pol > 0:
-            scaling_factor = self.R_pol / current_integral
-            return self.gamma * scaling_factor
-        return self.gamma.copy()
-    
-    def get_validation_report(self) -> str:
-        """Generate validation report"""
-        if 'validation' not in self.metadata:
-            return "Validation data not available"
+        Verify that DRT integral matches R_pol.
         
-        v = self.metadata['validation']
-        report = f"""
-DRT Validation Report
-{'='*60}
-
-Original R_pol: {v['original_R_pol']:.4f} Ω
-Reconstructed R_pol: {v['reconstructed_R_pol']:.4f} Ω
-R_pol difference: {abs(v['original_R_pol'] - v['reconstructed_R_pol']):.4f} Ω ({abs(1 - v['reconstructed_R_pol']/v['original_R_pol'])*100:.2f}%)
-
-Integral ∫ γ d(ln τ): {v['integral_dln_tau']:.4f} Ω
-Expected integral: {v['original_R_pol']:.4f} Ω
-Integral ratio: {v['integral_ratio']:.4f}
-
-Reconstruction Errors:
-- Real part RMSE: {v['real_rmse']:.4e} Ω
-- Real part max error: {v['real_max_error']:.4e} Ω
-- Imag part RMSE: {v['imag_rmse']:.4e} Ω
-- Imag part max error: {v['imag_max_error']:.4e} Ω
-- Mean relative error: {v['mean_relative_error_percent']:.2f}%
-
-Validation {'PASSED ✓' if v['validation_passed'] else 'FAILED ✗'}
-{'='*60}
-"""
-        return report
+        Returns:
+            Tuple[float, float]: (integral_value, ratio_to_R_pol)
+        """
+        integral = self.get_integral()
+        ratio = integral / self.R_pol if self.R_pol > 0 else 0
+        return integral, ratio
 
 
 @dataclass
@@ -402,17 +375,37 @@ class ImpedanceData:
 class GaussianPeak:
     """Container for Gaussian peak parameters"""
     id: int
-    center: float          # Center in linear space
-    center_log: float      # Center in log space
-    amplitude: float       # Amplitude in original scale
+    center: float          # Center in linear space (τ in seconds)
+    center_log: float      # Center in log10 space
+    amplitude: float       # Amplitude in original scale (Ω)
     amplitude_norm: float  # Normalized amplitude
-    sigma_log: float       # Sigma in log space
-    fwhm: float           # Full width at half maximum
-    area: float           # Area under peak
-    fraction: float       # Fraction of total area
-    fraction_percent: float  # Percentage fraction
+    sigma_log: float       # Sigma in log10 space
+    fwhm: float           # Full width at half maximum in log10 space
+    area: float           # Area under peak (Ω) - this equals resistance contribution
+    fraction: float       # Fraction of total area (0-1)
+    fraction_percent: float  # Percentage fraction (0-100)
     source: str = 'auto'  # Source: 'auto', 'manual', 'residuals'
     y_norm: np.ndarray = None  # Normalized y values for plotting
+    
+    def get_characteristic_frequency(self) -> float:
+        """
+        Get characteristic frequency of this peak.
+        f = 1/(2πτ)
+        
+        Returns:
+            float: Characteristic frequency in Hz
+        """
+        return 1.0 / (2 * np.pi * self.center)
+    
+    def get_resistance_contribution(self) -> float:
+        """
+        Get resistance contribution of this peak.
+        This equals the area under the peak.
+        
+        Returns:
+            float: Resistance contribution in Ω
+        """
+        return self.area
 
 
 @dataclass
@@ -431,6 +424,36 @@ class DeconvolutionResult:
     baseline_method: str = 'none'
     total_area: float = 0.0
     max_amplitude: float = 0.0
+    
+    def verify_resistance_conservation(self) -> Tuple[float, float]:
+        """
+        Verify that sum of peak areas equals total DRT integral (R_pol).
+        
+        Returns:
+            Tuple[float, float]: (sum_peak_areas, ratio_to_total)
+        """
+        sum_areas = sum([p.area for p in self.peaks])
+        ratio = sum_areas / self.total_area if self.total_area > 0 else 0
+        return sum_areas, ratio
+    
+    def get_peak_resistances(self) -> List[float]:
+        """
+        Get resistance contribution of each peak in Ω.
+        
+        Returns:
+            List[float]: Peak resistances in Ω
+        """
+        return [p.area for p in self.peaks]
+    
+    def get_peak_frequencies(self) -> List[float]:
+        """
+        Get characteristic frequencies of peaks.
+        f = 1/(2πτ)
+        
+        Returns:
+            List[float]: Characteristic frequencies in Hz
+        """
+        return [1.0 / (2 * np.pi * p.center) for p in self.peaks]
 
 
 # ============================================================================
@@ -621,7 +644,7 @@ def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: n
 # ============================================================================
 
 class DRTCore:
-    """Base class for DRT inversion with correct scaling"""
+    """Base class for DRT inversion with support for inductive loops"""
     
     def __init__(self, data: ImpedanceData, include_inductive: bool = False):
         self.data = data
@@ -655,35 +678,45 @@ class DRTCore:
         else:
             self.R_inf = self.Z_real[-1] if len(self.Z_real) > 0 else 0
         
-        # Total polarization resistance
-        self.R_pol = np.max(self.Z_real) - self.R_inf if np.max(self.Z_real) > self.R_inf else 1.0
+        # Total polarization resistance (difference between low and high frequency real parts)
+        low_freq_idx = np.where(self.frequencies < 0.1 * np.max(self.frequencies))[0]
+        if len(low_freq_idx) > 3:
+            R_total = np.mean(self.Z_real[low_freq_idx[:5]])
+        else:
+            R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
+        self.R_pol = R_total - self.R_inf if R_total > self.R_inf else 1.0
     
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Build kernel matrix for given time grid with correct scaling.
-        IMPORTANT: The kernel is constructed for integration over d(ln τ)
-        which requires proper handling of the logarithmic grid.
+        Build kernel matrix for given time grid.
+        IMPORTANT: Kernels are scaled for integration over d(ln τ)
         """
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
         K_imag = np.zeros((self.N, M))
         
         omega = 2 * np.pi * self.frequencies
-        dln_tau = np.mean(np.diff(np.log(tau_grid)))  # Step size in ln τ
+        
+        # Calculate step in natural logarithm (ln) for proper integration
+        # d(ln τ) = d(log10 τ) * ln(10)
+        dln_tau = np.mean(np.diff(np.log(tau_grid)))  # This is the step in ln(τ)
         
         for i in range(self.N):
             for j in range(M):
+                # Standard DRT kernel for RC elements
                 denominator = 1 + (omega[i] * tau_grid[j])**2
-                # The kernel for integration over d(ln τ)
-                # The factor dln_tau is applied during integration, not in kernel
-                K_real[i, j] = 1.0 / denominator
-                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
+                
+                # K_real = 1 / (1 + ω²τ²) * d(ln τ)
+                K_real[i, j] = 1.0 / denominator * dln_tau
+                
+                # K_imag = -ωτ / (1 + ω²τ²) * d(ln τ)
+                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator * dln_tau
                 
                 if include_rl:
-                    # RL element for inductive loops (if needed)
+                    # For inductive loops: modify kernels
                     rl_denom = 1 + (omega[i] * tau_grid[j])**2
-                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
-                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
+                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom * dln_tau
+                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom * dln_tau
         
         return K_real, K_imag
     
@@ -707,87 +740,19 @@ class DRTCore:
             return np.argmax(curvature) + 1
         return len(residuals) // 2
     
-    def calculate_integral(self, gamma: np.ndarray, tau_grid: np.ndarray) -> float:
+    def get_drt_integral(self, gamma: np.ndarray, tau_grid: np.ndarray) -> float:
         """
-        Calculate integral ∫ γ(τ) d(ln τ) which should equal R_pol.
-        This is the correct formulation for DRT.
+        Calculate integral of DRT over ln(τ) which equals polarization resistance.
+        R_pol = ∫ γ(τ) d(ln τ)
         """
-        ln_tau = np.log(tau_grid)
-        return np.trapezoid(gamma, ln_tau)
-    
-    def calculate_integral_log10(self, gamma: np.ndarray, tau_grid: np.ndarray) -> float:
-        """
-        Calculate integral ∫ γ(τ) d(log₁₀ τ) for display purposes.
-        Note: ∫ γ d(log₁₀τ) = (∫ γ d(ln τ)) / ln(10)
-        """
-        log10_tau = np.log10(tau_grid)
-        return np.trapezoid(gamma, log10_tau)
-    
-    def reconstruct_and_validate(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Dict[str, Any]:
-        """
-        Reconstruct impedance from DRT and validate against original data.
-        Returns validation metrics.
-        """
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
-        
-        # Reconstruct impedance with correct scaling
-        Z_rec_real = self.R_inf + K_real @ gamma
-        Z_rec_imag = -K_imag @ gamma
-        Z_rec = Z_rec_real + 1j * Z_rec_imag
-        
-        # Calculate validation metrics
-        Z_orig = self.Z_real + 1j * self.Z_imag
-        
-        # Real part error
-        real_error = np.abs(Z_rec_real - self.Z_real)
-        real_rmse = np.sqrt(np.mean(real_error**2))
-        real_max_error = np.max(real_error)
-        
-        # Imaginary part error
-        imag_error = np.abs(Z_rec_imag - self.Z_imag)
-        imag_rmse = np.sqrt(np.mean(imag_error**2))
-        imag_max_error = np.max(imag_error)
-        
-        # Complex impedance relative error
-        rel_error = np.abs(Z_rec - Z_orig) / (np.abs(Z_orig) + 1e-10)
-        mean_rel_error = np.mean(rel_error) * 100  # percentage
-        
-        # Reconstructed R_pol
-        rec_R_pol = np.max(Z_rec_real) - self.R_inf
-        
-        # Check consistency
-        integral = self.calculate_integral(gamma, tau_grid)
-        integral_log10 = self.calculate_integral_log10(gamma, tau_grid)
-        
-        # Expected integral for correct scaling
-        expected_integral = self.R_pol
-        integral_ratio = integral / expected_integral if expected_integral > 0 else 1.0
-        
-        validation = {
-            'reconstructed_real': Z_rec_real,
-            'reconstructed_imag': Z_rec_imag,
-            'real_rmse': real_rmse,
-            'real_max_error': real_max_error,
-            'imag_rmse': imag_rmse,
-            'imag_max_error': imag_max_error,
-            'mean_relative_error_percent': mean_rel_error,
-            'reconstructed_R_pol': rec_R_pol,
-            'original_R_pol': self.R_pol,
-            'integral_dln_tau': integral,
-            'integral_dlog10_tau': integral_log10,
-            'integral_ratio': integral_ratio,
-            'validation_passed': abs(integral_ratio - 1.0) < 0.1 and mean_rel_error < 5.0
-        }
-        
-        return validation
-
+        return np.trapezoid(gamma, np.log(tau_grid))
 
 # ============================================================================
 # Tikhonov Regularization with NNLS (from EIS code)
 # ============================================================================
 
 class TikhonovDRT(DRTCore):
-    """Tikhonov regularization for DRT using non-negative least squares with correct scaling"""
+    """Tikhonov regularization for DRT using non-negative least squares"""
     
     def __init__(self, data: ImpedanceData, regularization_order: int = 2, include_inductive: bool = False):
         super().__init__(data, include_inductive)
@@ -814,7 +779,7 @@ class TikhonovDRT(DRTCore):
             return np.eye(M)
     
     def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Solve non-negative least squares"""
+        """Solve non-negative least squares problem"""
         from scipy.optimize import nnls
         x, resid = nnls(A, b)
         if resid > 1e-6 * np.linalg.norm(b):
@@ -825,16 +790,20 @@ class TikhonovDRT(DRTCore):
                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
         Compute DRT using Tikhonov regularization with NNLS.
-        The solution gamma(τ) represents the distribution with respect to ln τ.
+        
+        The DRT gamma(τ) satisfies:
+        Z(ω) = R∞ + ∫ γ(τ) / (1 + iωτ) d(ln τ)
+        
+        Therefore: R_pol = ∫ γ(τ) d(ln τ)
         """
         
-        # Create logarithmically spaced grid for τ
+        # Create logarithmic grid of relaxation times
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         
-        # Build kernel matrices
+        # Build kernel matrices (already scaled with d(ln τ))
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
-        # Target: real part deviation and imaginary part (with sign)
+        # Target vector: subtract ohmic resistance from real part
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
@@ -854,12 +823,13 @@ class TikhonovDRT(DRTCore):
             
             for lam in lambda_range:
                 try:
-                    # Build augmented system: [K; λL] * gamma = [Z_target; 0]
+                    # Augmented system: [K; λL] * gamma = [Z_target; 0]
                     A = np.vstack([K, lam * L])
                     b = np.concatenate([Z_target, np.zeros(L.shape[0])])
                     
                     x = self._solve_nnls(A, b)
                     
+                    # Calculate residual and solution norm
                     residual = np.linalg.norm(K @ x - Z_target)
                     sol_norm = np.linalg.norm(L @ x)
                     
@@ -885,17 +855,21 @@ class TikhonovDRT(DRTCore):
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
-        # Calculate uncertainty estimate
+        # Calculate uncertainty estimate from second derivative
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         
-        # Perform validation by reconstructing impedance
-        validation = self.reconstruct_and_validate(tau_grid, gamma)
+        # Verify integral of DRT equals R_pol
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
         
-        # Calculate integrals for reporting
-        integral_dln = self.calculate_integral(gamma, tau_grid)
-        integral_dlog10 = self.calculate_integral_log10(gamma, tau_grid)
+        # Log verification
+        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
         
-        result = DRTResult(
+        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
+            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
+        
+        return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma,
             gamma_std=gamma_std,
@@ -906,17 +880,17 @@ class TikhonovDRT(DRTCore):
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
-                'integral_dln_tau': integral_dln,
-                'integral_dlog10_tau': integral_dlog10,
-                'validation': validation,
-                'n_tau': n_tau
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol
             }
         )
-        
-        return result
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Reconstruct impedance from DRT"""
+        """
+        Reconstruct impedance from DRT.
+        
+        Z_reconstructed = R∞ + K_real @ gamma
+        """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
@@ -945,6 +919,7 @@ class BayesianDRT(DRTCore):
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
+        # Second-order regularization matrix
         L = np.zeros((n_tau-2, n_tau))
         for i in range(n_tau-2):
             L[i, i] = 1
@@ -952,23 +927,38 @@ class BayesianDRT(DRTCore):
             L[i, i+2] = 1
         
         with pm.Model() as model:
+            # Gamma is positive
             gamma_raw = pm.HalfNormal('gamma_raw', sigma=1.0, shape=n_tau)
             
+            # Smoothness prior
             smoothness = pm.HalfCauchy('smoothness', beta=0.1)
             reg_penalty = smoothness * pm.math.sum(pm.math.abs(L @ gamma_raw))
             
+            # Noise standard deviation
             sigma = pm.HalfCauchy('sigma', beta=0.1)
+            
+            # Forward model
             Z_pred = pm.math.dot(K, gamma_raw)
+            
+            # Likelihood
             likelihood = pm.Normal('likelihood', mu=Z_pred, sigma=sigma, observed=Z_target)
             
+            # Regularization potential
             pm.Potential('reg', -reg_penalty)
             
+            # Sample
             trace = pm.sample(draws=n_samples, tune=n_tune, chains=n_chains, 
                              return_inferencedata=True, progressbar=False)
         
         gamma_samples = trace.posterior['gamma_raw'].values.reshape(-1, n_tau)
         gamma_mean = np.mean(gamma_samples, axis=0)
         gamma_std = np.std(gamma_samples, axis=0)
+        
+        # Verify integral
+        drt_integral = self.get_drt_integral(gamma_mean, tau_grid)
+        print(f"Bayesian DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"Bayesian DRT - Integral: {drt_integral:.6f} Ω")
+        print(f"Bayesian DRT - Ratio: {drt_integral/self.R_pol:.4f}")
         
         r_hat = az.rhat(trace).to_array().values
         converged = np.all(r_hat < 1.05)
@@ -981,7 +971,13 @@ class BayesianDRT(DRTCore):
             R_inf=self.R_inf,
             R_pol=self.R_pol,
             convergence=converged,
-            metadata={'n_samples': n_samples, 'n_tune': n_tune, 'n_chains': n_chains}
+            metadata={
+                'n_samples': n_samples, 
+                'n_tune': n_tune, 
+                'n_chains': n_chains,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol
+            }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1075,6 +1071,12 @@ class MaxEntropyDRT(DRTCore):
             gamma = result.x
             lambda_opt = lam
         
+        # Verify integral
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+        print(f"MaxEntropy DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"MaxEntropy DRT - Integral: {drt_integral:.6f} Ω")
+        print(f"MaxEntropy DRT - Ratio: {drt_integral/self.R_pol:.4f}")
+        
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
         
         return DRTResult(
@@ -1084,7 +1086,11 @@ class MaxEntropyDRT(DRTCore):
             method="Maximum Entropy",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            metadata={'lambda': lambda_opt}
+            metadata={
+                'lambda': lambda_opt,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol
+            }
         )
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1938,33 +1944,16 @@ class DataPreprocessor:
 # Gaussian Deconvolver (from second code)
 # ============================================================================
 class GaussianDeconvolver:
-    """Main class for spectral deconvolution with correct scaling for DRT"""
+    """Main class for spectral deconvolution with baseline correction"""
     
     def __init__(self, x_linear, y_original, use_log_x=True, use_log_y=False,
                  clip_negative=True, show_warnings=True, baseline_method='none',
-                 smoothing_level='none', target_total_area=None):
-        """
-        Initialize deconvolver.
-        
-        Parameters:
-        -----------
-        x_linear : array
-            X values (τ in seconds)
-        y_original : array
-            Y values (γ(τ) in Ω)
-        use_log_x : bool
-            Whether to use log scale for X
-        use_log_y : bool
-            Whether to use log scale for Y
-        target_total_area : float, optional
-            Expected total area (R_pol) for scaling verification
-        """
-        # Store original data
+                 smoothing_level='none'):
+        # Store original data WITHOUT ANY MODIFICATIONS for display purposes
         self.x_original = np.array(x_linear).copy()
         self.y_original_raw = np.array(y_original).copy()
-        self.target_total_area = target_total_area
         
-        # Working arrays
+        # Working arrays that may be modified
         self.x_linear = np.array(x_linear)
         self.y_original = np.array(y_original)
         self.use_log_x = use_log_x
@@ -1972,12 +1961,12 @@ class GaussianDeconvolver:
         self.baseline_method = baseline_method
         self.smoothing_level = smoothing_level
         
-        # Sort by X
+        # Sort by X to ensure monotonic increasing X
         sort_idx = np.argsort(self.x_linear)
         self.x_linear = self.x_linear[sort_idx]
         self.y_original = self.y_original[sort_idx]
         
-        # Store sorted original data
+        # Store sorted original data for display
         self.x_sorted = self.x_linear.copy()
         self.y_sorted = self.y_original.copy()
         
@@ -1998,10 +1987,21 @@ class GaussianDeconvolver:
         self.clipped_points = preprocessed['clipped_points']
         self.small_values_warning = preprocessed['small_values_warning']
         
-        # Normalization - use 95th percentile
+        # Calculate the integral of DRT to verify scaling
+        if self.use_log_x:
+            # Integration over d(ln τ) - this should equal R_pol
+            self.drt_integral = np.trapezoid(self.y_original, np.log(self.x_linear))
+        else:
+            # Integration over dτ (not correct, for reference only)
+            self.drt_integral = np.trapezoid(self.y_original, self.x_linear)
+        
+        print(f"DRT integral before deconvolution: {self.drt_integral:.6f} Ω")
+        print(f"This should equal the polarization resistance R_pol from EIS")
+        
+        # Normalization - use 95th percentile instead of max for robustness
         self.y_max = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
         
-        # For fitting, normalize
+        # For fitting, we normalize but keep track for denormalization
         if self.y_max > 0:
             self.y_norm = self.y / self.y_max
         else:
@@ -2019,7 +2019,7 @@ class GaussianDeconvolver:
         # Fitter
         self.fitter = None
         
-        # For compatibility
+        # For compatibility with existing code
         self.multi_gaussian = GaussianModel.multi_gaussian
         self.gaussian = GaussianModel.gaussian
     
@@ -2040,7 +2040,7 @@ class GaussianDeconvolver:
                 baseline_init = [np.percentile(self.y_norm, 5)]
             elif self.baseline_method == 'linear':
                 baseline_init = [np.percentile(self.y_norm, 5), 0]
-            else:
+            else:  # quadratic
                 baseline_init = [np.percentile(self.y_norm, 5), 0, 0]
             params.extend(baseline_init[:n_baseline])
         return params
@@ -2060,7 +2060,7 @@ class GaussianDeconvolver:
         # Calculate derivatives
         dy, d2y, y_smooth = DerivativeAnalyzer.calculate_derivatives(self.x, y_smooth)
         
-        # Peak search
+        # Peak search with different methods
         height_threshold = sensitivity * np.max(y_smooth)
         peaks1, _ = find_peaks(y_smooth, height=height_threshold, distance=min_distance)
         peaks2 = DerivativeAnalyzer.find_peaks_by_derivatives(self.x, y_smooth, dy, d2y, sensitivity)
@@ -2082,16 +2082,17 @@ class GaussianDeconvolver:
             cen = self.x[peak_idx]
             amp = y_smooth[peak_idx]
             
-            # Estimate sigma
+            # Estimate sigma with fallback
             sigma = GaussianModel.estimate_sigma_from_peak(self.x, y_smooth, peak_idx)
             sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / max(len(filtered_peaks), 1))
             
-            # Get original Y value
+            # Get original Y value for display
             if self.use_log_x:
                 x_linear = 10**self.x[peak_idx]
             else:
                 x_linear = self.x[peak_idx]
             
+            # Find closest index in original data - always in linear space
             idx = np.argmin(np.abs(self.x_sorted - x_linear))
             y_original_value = self.y_sorted[idx]
             
@@ -2115,21 +2116,28 @@ class GaussianDeconvolver:
     
     def add_manual_peak(self, x_position_linear, amplitude=None, sigma_est=None):
         """Add a peak manually at specified linear X position"""
+        # Convert to log space if needed
         if self.use_log_x:
             x_position = np.log10(x_position_linear)
         else:
             x_position = x_position_linear
         
+        # Find index for amplitude estimation
         idx = np.argmin(np.abs(self.x_sorted - x_position_linear))
         
+        # Estimate amplitude if not provided
         if amplitude is None:
+            # Get normalized amplitude at this position
             if self.use_log_x:
+                # Find closest index in log space
                 log_idx = np.argmin(np.abs(self.x - x_position))
                 amplitude = self.y_norm[log_idx] if log_idx < len(self.y_norm) else 0.1
             else:
                 amplitude = self.y_norm[idx] if idx < len(self.y_norm) else 0.1
         
+        # Estimate sigma if not provided
         if sigma_est is None:
+            # Estimate based on distance to nearest minimum
             if self.use_log_x:
                 x_search = self.x
                 y_search = self.y_norm
@@ -2137,6 +2145,7 @@ class GaussianDeconvolver:
                 x_search = self.x_linear
                 y_search = self.y_original / self.y_max
             
+            # Find nearest minima to left and right
             left_idx = idx
             right_idx = idx
             for i in range(idx - 1, 0, -1):
@@ -2148,9 +2157,11 @@ class GaussianDeconvolver:
                     right_idx = i
                     break
             
+            # Estimate sigma
             width = (x_search[right_idx] - x_search[left_idx]) if right_idx > left_idx else 0.1
             sigma_est = max(width / 3.0, 0.01 * (np.max(x_search) - np.min(x_search)) / 20)
         
+        # Add peak info
         peak_info_entry = {
             'index': idx,
             'x': x_position,
@@ -2172,6 +2183,7 @@ class GaussianDeconvolver:
         if not peak_info:
             return [], []
         
+        # Build initial model with current peaks
         n_peaks = len(peak_info)
         if n_peaks == 0:
             return [], []
@@ -2180,11 +2192,16 @@ class GaussianDeconvolver:
         for info in peak_info:
             peak_params.extend([info['amp_est'], info['cen_est'], info['sigma_est']])
         
+        # Calculate initial fit
         y_initial_fit = GaussianModel.multi_gaussian(self.x, *peak_params)
+        
+        # Calculate residuals
         residuals = self.y_norm - y_initial_fit
         
+        # Detect peaks in residuals
         height_threshold = sensitivity * np.max(np.abs(residuals))
         
+        # Smooth residuals for better peak detection
         window_length = min(11, len(residuals) // 5 * 2 + 1)
         if window_length % 2 == 0:
             window_length += 1
@@ -2194,15 +2211,20 @@ class GaussianDeconvolver:
         else:
             residuals_smooth = residuals
         
+        # Find positive peaks (where data exceeds fit)
         positive_peaks, _ = find_peaks(residuals_smooth, height=height_threshold, distance=min_distance)
+        
+        # Find negative peaks (where fit exceeds data - potential shoulders)
         negative_peaks, _ = find_peaks(-residuals_smooth, height=height_threshold, distance=min_distance)
         
+        # Combine and filter
         all_candidate_indices = sorted(set(positive_peaks) | set(negative_peaks))
         
         missing_peaks = []
         missing_params = []
         
         for idx in all_candidate_indices:
+            # Skip if too close to existing peaks
             too_close = False
             for info in peak_info:
                 if abs(self.x[idx] - info['cen_est']) < min_distance * np.mean(np.diff(self.x)):
@@ -2217,11 +2239,13 @@ class GaussianDeconvolver:
             sigma = GaussianModel.estimate_sigma_from_peak(self.x, residuals_smooth, idx)
             sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / 20)
             
+            # Get original Y value for display
             if self.use_log_x:
                 x_linear = 10**cen
             else:
                 x_linear = cen
             
+            # Find closest index in original data
             orig_idx = np.argmin(np.abs(self.x_sorted - x_linear))
             y_original_value = self.y_sorted[orig_idx]
             
@@ -2249,17 +2273,19 @@ class GaussianDeconvolver:
         upper_bounds = []
         x_range = np.max(x) - np.min(x)
         
+        # Peak bounds
         for i in range(n_peaks):
             lower_bounds.extend([0, np.min(x), x_range * 0.001])
             upper_bounds.extend([2 * np.max(y_norm), np.max(x), x_range * 0.5])
         
-        if n_baseline >= 1:
+        # Baseline bounds
+        if n_baseline >= 1:  # constant
             lower_bounds.append(-np.max(y_norm))
             upper_bounds.append(np.max(y_norm))
-        if n_baseline >= 2:
+        if n_baseline >= 2:  # linear term
             lower_bounds.append(-x_range)
             upper_bounds.append(x_range)
-        if n_baseline >= 3:
+        if n_baseline >= 3:  # quadratic term
             lower_bounds.append(-x_range**2)
             upper_bounds.append(x_range**2)
         
@@ -2279,6 +2305,7 @@ class GaussianDeconvolver:
         n_peaks = len(initial_params) // 3
         n_baseline = self._get_n_baseline_params()
         
+        # Use last good parameters if available
         if last_popt is not None:
             expected_len = n_peaks * 3 + n_baseline
             if len(last_popt) == expected_len:
@@ -2288,8 +2315,10 @@ class GaussianDeconvolver:
         else:
             initial_params = self._prepare_initial_params(initial_params, n_baseline)
         
+        # Create bounds
         lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
         
+        # Ensure initial_params are within bounds
         for i in range(len(initial_params)):
             initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
         
@@ -2297,6 +2326,7 @@ class GaussianDeconvolver:
             if progress_callback:
                 progress_callback(0.3, "Initializing fit...")
             
+            # Define the model function for curve_fit
             def model_func(x, *params):
                 if n_baseline == 0:
                     return GaussianModel.multi_gaussian(x, *params)
@@ -2307,19 +2337,21 @@ class GaussianDeconvolver:
                         x, n_peaks, peak_params, baseline_params, self.baseline_method
                     )
             
+            # Set tolerances based on fit quality
             if fit_quality == 'fast':
                 xtol, ftol, gtol = 1e-3, 1e-3, 1e-3
                 maxfev = min(maxfev, 2000)
             elif fit_quality == 'balanced':
                 xtol, ftol, gtol = 1e-5, 1e-5, 1e-5
                 maxfev = min(maxfev, 5000)
-            else:
+            else:  # precise
                 xtol, ftol, gtol = 1e-8, 1e-8, 1e-8
                 maxfev = min(maxfev, 10000)
             
             if progress_callback:
                 progress_callback(0.5, "Running curve_fit...")
             
+            # Perform fit
             popt, pcov = curve_fit(
                 model_func,
                 self.x,
@@ -2336,8 +2368,10 @@ class GaussianDeconvolver:
             if progress_callback:
                 progress_callback(0.8, "Calculating components...")
             
+            # Calculate fit
             fit_y_norm = model_func(self.x, *popt)
             
+            # Extract components
             components = []
             peak_params = popt[:n_peaks*3]
             baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
@@ -2348,10 +2382,12 @@ class GaussianDeconvolver:
                 sigma = abs(peak_params[3*i + 2])
                 
                 amp = amp_norm * self.y_max
+                # Используем правильный метод расчета площади
                 area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
                 
                 component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
                 
+                # Calculate center in linear space
                 if self.use_log_x:
                     cen_linear = 10**cen
                 else:
@@ -2371,31 +2407,20 @@ class GaussianDeconvolver:
                     'source': 'auto'
                 })
             
+            # Calculate fractions
             total_area = sum([c['area'] for c in components])
-            
-            # Check if scaling is needed based on target total area
-            if self.target_total_area is not None and total_area > 0:
-                area_ratio = self.target_total_area / total_area
-                if abs(area_ratio - 1.0) > 0.1:
-                    # Scale all components to match target
-                    for c in components:
-                        c['amp'] = c['amp'] * area_ratio
-                        c['area'] = c['area'] * area_ratio
-                    total_area = self.target_total_area
-                    
-                    if progress_callback:
-                        progress_callback(0.9, f"Applied scaling factor {area_ratio:.3f} to match R_pol={self.target_total_area:.3f}Ω")
-            
             for c in components:
                 c['fraction'] = c['area'] / total_area if total_area > 0 else 0
                 c['fraction_percent'] = c['fraction'] * 100
             
+            # Store results
             self.popt = popt
             self.components = components
             self.baseline_params = baseline_params
             self.fit_y_norm = fit_y_norm
             self.total_area = total_area
             
+            # Calculate quality metrics
             self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
                 self.y_norm, self.fit_y_norm, len(popt)
             )
@@ -2408,7 +2433,7 @@ class GaussianDeconvolver:
         except Exception as e:
             if progress_callback:
                 progress_callback(1.0, f"Fit failed: {e}")
-            print(f"Error in fit: {e}")
+            print(f"Error in fit: {e}")  # For debugging
             return False
     
     def preview_fit(self, initial_params=None):
@@ -2422,8 +2447,10 @@ class GaussianDeconvolver:
         n_peaks = len(initial_params) // 3
         n_baseline = self._get_n_baseline_params()
         
+        # Prepare parameters with baseline
         full_params = self._prepare_initial_params(initial_params, n_baseline)
         
+        # Calculate fit
         if n_baseline == 0:
             fit_y_norm = GaussianModel.multi_gaussian(self.x, *full_params)
         else:
@@ -2436,21 +2463,26 @@ class GaussianDeconvolver:
         return fit_y_norm
     
     def remove_peak(self, peak_id):
-        """Remove a peak"""
+        """Remove a peak (does NOT perform fit, just marks for removal)"""
         if peak_id > len(self.components):
             return False
+        
+        # Store the operation
         st.session_state.app_state.pending_remove = peak_id
         return True
     
     def split_peak(self, peak_id, split_position):
-        """Split a peak into two"""
+        """Split a peak into two (does NOT perform fit, just marks for splitting)"""
         if peak_id > len(self.components):
             return False
+        
+        # Store the operation
         st.session_state.app_state.pending_split = (peak_id, split_position)
         return True
     
     def apply_pending_operations(self, fit_quality='balanced', progress_callback=None):
         """Apply all pending operations and perform fit"""
+        # Get current parameters
         if self.components:
             current_params = []
             for c in self.components:
@@ -2458,6 +2490,7 @@ class GaussianDeconvolver:
         else:
             return False
         
+        # Apply pending remove
         if st.session_state.app_state.pending_remove is not None:
             remove_id = st.session_state.app_state.pending_remove
             new_params = []
@@ -2467,6 +2500,7 @@ class GaussianDeconvolver:
             current_params = new_params
             st.session_state.app_state.pending_remove = None
         
+        # Apply pending split
         if st.session_state.app_state.pending_split is not None:
             peak_id, split_position = st.session_state.app_state.pending_split
             peak = self.components[peak_id - 1]
@@ -2494,6 +2528,7 @@ class GaussianDeconvolver:
             current_params = new_params
             st.session_state.app_state.pending_split = None
         
+        # Perform fit
         return self.fit(
             initial_params=current_params,
             method=st.session_state.app_state.fitting_method,
@@ -2504,10 +2539,11 @@ class GaussianDeconvolver:
         )
     
     def remove_peak_by_id(self, peak_id):
-        """Remove a peak by its ID"""
+        """Remove a peak by its ID from peak_info and initial_params"""
         if st.session_state.app_state.peak_info is None:
             return False
         
+        # Find the peak in peak_info
         peak_to_remove = None
         for i, info in enumerate(st.session_state.app_state.peak_info):
             if info.get('id', i+1) == peak_id or i+1 == peak_id:
@@ -2517,12 +2553,15 @@ class GaussianDeconvolver:
         if peak_to_remove is None:
             return False
         
+        # Remove from peak_info
         removed_peak = st.session_state.app_state.peak_info.pop(peak_to_remove)
         
+        # Remove from initial_params (3 parameters per peak)
         if st.session_state.app_state.initial_peak_params is not None:
             start_idx = peak_to_remove * 3
             del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
         
+        # Also remove from manual_peaks or residuals_peaks if present
         if removed_peak.get('source') == 'manual':
             st.session_state.app_state.manual_peaks = [p for p in st.session_state.app_state.manual_peaks 
                                                         if p.get('x_linear') != removed_peak.get('x_linear')]
@@ -2552,22 +2591,63 @@ class GaussianDeconvolver:
             )
             peaks.append(peak)
         
+        # Use original y_original values
+        y_original_restored = self.y_original.copy()
+        
+        # Calculate total area from components (should be close to drt_integral)
+        total_component_area = sum([c['area'] for c in self.components])
+        
+        print(f"Original DRT integral: {self.drt_integral:.6f} Ω")
+        print(f"Total area from deconvolution: {total_component_area:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {total_component_area/self.drt_integral:.4f}")
+        
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             x=self.x,
             y_norm=self.y_norm,
-            y_original=self.y_original,
+            y_original=y_original_restored,
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
             quality_metrics=self.quality_metrics,
             baseline_params=self.baseline_params,
             baseline_method=self.baseline_method,
-            total_area=self.total_area,
+            total_area=self.drt_integral,  # Use the original DRT integral as total area
             max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
         )
-
+        
+    def calculate_peak_area(self, amplitude: float, sigma: float, is_log_scale: bool = True) -> float:
+        """
+        Calculate area under Gaussian peak.
+        
+        For peaks in log space: area = amplitude * sigma * sqrt(2π)
+        This area corresponds to contribution to polarization resistance in Ω.
+        
+        Args:
+            amplitude: Peak amplitude in original units (Ω)
+            sigma: Standard deviation in log space
+            is_log_scale: Whether X is in log scale (should be True for DRT)
+            
+        Returns:
+            Area under peak (Ω)
+        """
+        if is_log_scale:
+            # For log-scale X, area = amplitude * sigma * sqrt(2π)
+            # This integrates over d(ln τ)
+            return amplitude * sigma * np.sqrt(2 * np.pi)
+        else:
+            # For linear scale (not typical for DRT)
+            return amplitude * sigma * np.sqrt(2 * np.pi)
+    
+    def get_total_resistance(self) -> float:
+        """
+        Get total polarization resistance from DRT integral.
+        
+        Returns:
+            float: Total polarization resistance in Ω
+        """
+        return self.drt_integral
 
 # ============================================================================
 # Visualization Functions (from both codes)
@@ -3071,7 +3151,7 @@ def step1_data_loading():
 # ============================================================================
 
 def step2_drt_analysis():
-    """Step 2: Select DRT method and perform analysis with validation"""
+    """Step 2: Select DRT method and perform analysis"""
     st.header("⚡ Step 2: DRT Analysis")
     
     data = st.session_state.app_state.impedance_data
@@ -3104,6 +3184,7 @@ def step2_drt_analysis():
         if analysis_method == "Generalized DRT (with inductive loops)":
             include_inductive = st.checkbox("Include inductive loops", value=True)
         
+        # Method-specific parameters
         lambda_auto = True
         lambda_value = None
         reg_order = 2
@@ -3136,6 +3217,7 @@ def step2_drt_analysis():
             model_order = st.number_input("Model order (0=auto)", min_value=0, max_value=100, value=0)
             st.session_state.app_state.drt_parameters['model_order'] = model_order if model_order > 0 else None
         
+        # Store parameters
         st.session_state.app_state.drt_method = analysis_method
         st.session_state.app_state.drt_parameters.update({
             'n_tau': n_tau,
@@ -3186,12 +3268,15 @@ def step2_drt_analysis():
                             model_order_val = st.session_state.app_state.drt_parameters.get('model_order', None)
                             result = drt_solver.compute(n_tau=n_tau, model_order=model_order_val)
                         
-                        else:
+                        else:  # Generalized DRT
                             drt_solver = TikhonovDRT(data, regularization_order=2, include_inductive=include_inductive)
                             result = drt_solver.compute(n_tau=n_tau, lambda_auto=True)
                         
+                        # Store results
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_calculated = True
+                        
+                        # Also store for reconstruction
                         st.session_state.app_state.drt_solver = drt_solver
                         
                         st.success("✅ DRT calculation complete!")
@@ -3206,82 +3291,21 @@ def step2_drt_analysis():
             
             result = st.session_state.app_state.drt_result
             
-            # Display basic info
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                st.metric("R∞", f"{result.R_inf:.4f} Ω")
-            with col_b:
-                st.metric("R_pol", f"{result.R_pol:.4f} Ω")
-            with col_c:
-                st.metric("τ range", f"{result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s")
+            st.info(f"""
+            **Method:** {result.method}
+            **R∞:** {result.R_inf:.4f} Ω
+            **Rpol:** {result.R_pol:.4f} Ω
+            **τ range:** {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
+            """)
             
-            # Display integral information
-            integral_ln = result.get_integral_ln()
-            integral_log10 = result.get_integral_log10()
-            expected_ln = result.R_pol
+            if 'lambda' in result.metadata:
+                st.info(f"**λ:** {result.metadata['lambda']:.3e}")
             
-            st.markdown("---")
-            st.subheader("📐 Integral Validation")
-            
-            col_d, col_e, col_f = st.columns(3)
-            with col_d:
-                st.metric("∫ γ d(ln τ)", f"{integral_ln:.4f} Ω")
-                st.caption(f"Expected: {expected_ln:.4f} Ω")
-            with col_e:
-                ratio = integral_ln / expected_ln if expected_ln > 0 else 0
-                st.metric("Ratio", f"{ratio:.4f}")
-                if abs(ratio - 1.0) < 0.05:
-                    st.success("✓ Correctly scaled")
-                elif abs(ratio - 1.0) < 0.1:
-                    st.warning("⚠ Acceptable deviation")
-                else:
-                    st.error("✗ Scaling issue detected")
-            with col_f:
-                st.metric("∫ γ d(log₁₀τ)", f"{integral_log10:.4f} Ω")
-                st.caption(f"= R_pol/ln(10) = {expected_ln/2.3026:.4f} Ω")
-            
-            # Display validation if available
-            if 'validation' in result.metadata:
-                st.markdown("---")
-                st.subheader("🔍 Reconstruction Validation")
-                
-                v = result.metadata['validation']
-                
-                col_g, col_h, col_i = st.columns(3)
-                with col_g:
-                    st.metric("Reconstructed R_pol", f"{v['reconstructed_R_pol']:.4f} Ω")
-                    diff = abs(v['original_R_pol'] - v['reconstructed_R_pol'])
-                    st.caption(f"Difference: {diff:.4f} Ω")
-                with col_h:
-                    st.metric("Mean Rel. Error", f"{v['mean_relative_error_percent']:.2f}%")
-                    if v['mean_relative_error_percent'] < 2:
-                        st.success("✓ Excellent")
-                    elif v['mean_relative_error_percent'] < 5:
-                        st.success("✓ Good")
-                    else:
-                        st.warning("⚠ Acceptable")
-                with col_i:
-                    st.metric("Real RMSE", f"{v['real_rmse']:.4e} Ω")
-                    st.metric("Imag RMSE", f"{v['imag_rmse']:.4e} Ω")
-                
-                if v['validation_passed']:
-                    st.success("✅ Validation PASSED - DRT correctly represents impedance data")
-                else:
-                    st.warning("⚠ Validation shows discrepancies - consider adjusting parameters")
-                
-                # Add expander for detailed validation
-                with st.expander("📋 Detailed Validation Report"):
-                    st.code(result.get_validation_report(), language='text')
-            
-            # Display peaks
             peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
             
-            # Plot DRT with correct scaling note
             fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
             plt.close()
-            
-            st.caption("Note: γ(τ) is defined per unit ln τ. Area under curve equals R_pol.")
             
             col_prev, col_next = st.columns(2)
             with col_prev:
@@ -3300,7 +3324,7 @@ def step2_drt_analysis():
 # ============================================================================
 
 def step3_gaussian_deconvolution():
-    """Step 3: Perform Gaussian deconvolution on DRT peaks with correct scaling"""
+    """Step 3: Perform Gaussian deconvolution on DRT peaks"""
     st.header("📈 Step 3: Gaussian Deconvolution of DRT Peaks")
     
     if st.session_state.app_state.drt_result is None:
@@ -3312,52 +3336,37 @@ def step3_gaussian_deconvolution():
     
     drt_result = st.session_state.app_state.drt_result
     
-    # Get correctly scaled gamma for deconvolution
-    # This ensures that total area under peaks equals R_pol
-    gamma_scaled = drt_result.get_scaled_gamma_for_deconvolution()
+    # Prepare data for deconvolution - используем оригинальные ненормированные значения
     log_tau = np.log10(drt_result.tau_grid)
+    gamma_original = drt_result.gamma  # Оригинальные ненормированные значения
     
-    # Show scaling info
-    with st.expander("ℹ️ DRT Scaling Information", expanded=False):
-        integral_ln = drt_result.get_integral_ln()
-        integral_log10 = drt_result.get_integral_log10()
-        scaling_factor = drt_result.R_pol / integral_ln if integral_ln > 0 else 1.0
-        
-        st.info(f"""
-        **DRT Scaling Details:**
-        - Original ∫ γ d(ln τ): {integral_ln:.4f} Ω
-        - Expected ∫ γ d(ln τ) (R_pol): {drt_result.R_pol:.4f} Ω
-        - Applied scaling factor: {scaling_factor:.4f}
-        
-        After scaling, the area under γ(τ) correctly represents R_pol = {drt_result.R_pol:.4f} Ω.
-        Gaussian deconvolution will use the scaled distribution.
-        """)
-    
-    # Create deconvolver with scaled gamma
-    deconvolver = GaussianDeconvolver(
-        x_linear=drt_result.tau_grid,
-        y_original=gamma_scaled,  # Use scaled gamma
-        use_log_x=True,
-        use_log_y=False,
-        clip_negative=st.session_state.app_state.clip_negative,
-        show_warnings=st.session_state.app_state.show_warnings,
-        baseline_method=st.session_state.app_state.baseline_method,
-        smoothing_level=st.session_state.app_state.smoothing_level,
-        target_total_area=drt_result.R_pol  # Pass target for verification
-    )
-    st.session_state.app_state.deconvolver = deconvolver
-    
-    # Auto-detect peaks
-    with st.spinner("Auto-detecting peaks..."):
-        peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
-            sensitivity=st.session_state.app_state.sensitivity,
-            min_distance=st.session_state.app_state.min_distance
+    # Create deconvolver if not exists
+    if st.session_state.app_state.deconvolver is None:
+        deconvolver = GaussianDeconvolver(
+            x_linear=drt_result.tau_grid,
+            y_original=gamma_original,  # Используем оригинальные ненормированные значения
+            use_log_x=True,
+            use_log_y=False,
+            clip_negative=st.session_state.app_state.clip_negative,
+            show_warnings=st.session_state.app_state.show_warnings,
+            baseline_method=st.session_state.app_state.baseline_method,
+            smoothing_level=st.session_state.app_state.smoothing_level
         )
-        st.session_state.app_state.peak_info = peak_info
-        st.session_state.app_state.derivatives = derivatives
-        st.session_state.app_state.initial_peak_params = initial_params
-        st.session_state.app_state.manual_peaks = []
-        st.session_state.app_state.residuals_peaks = []
+        st.session_state.app_state.deconvolver = deconvolver
+        
+        # Auto-detect peaks immediately on entry
+        with st.spinner("Auto-detecting peaks..."):
+            peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
+                sensitivity=st.session_state.app_state.sensitivity,
+                min_distance=st.session_state.app_state.min_distance
+            )
+            st.session_state.app_state.peak_info = peak_info
+            st.session_state.app_state.derivatives = derivatives
+            st.session_state.app_state.initial_peak_params = initial_params
+            st.session_state.app_state.manual_peaks = []
+            st.session_state.app_state.residuals_peaks = []
+    
+    deconvolver = st.session_state.app_state.deconvolver
     
     col1, col2 = st.columns([1, 1.5])
     
@@ -3373,6 +3382,7 @@ def step3_gaussian_deconvolution():
         if sensitivity != st.session_state.app_state.sensitivity or min_distance != st.session_state.app_state.min_distance:
             st.session_state.app_state.sensitivity = sensitivity
             st.session_state.app_state.min_distance = min_distance
+            # Redetect peaks
             with st.spinner("Re-detecting peaks..."):
                 peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
                     sensitivity=sensitivity, min_distance=min_distance
@@ -3387,15 +3397,23 @@ def step3_gaussian_deconvolution():
         st.markdown("---")
         st.subheader("Manual Peak Addition")
         
+        # Get number of data points for point selection
         n_points = len(deconvolver.x_linear)
+        
+        # Create slider by point index (1-based for user-friendly)
         point_index = st.slider("Select peak by point index:",
                                min_value=1,
                                max_value=n_points,
                                value=n_points // 2,
-                               step=1)
+                               step=1,
+                               help="Select point index (1 to {}) to add peak at that position".format(n_points))
         
+        # Convert index to actual τ value
         manual_position = deconvolver.x_linear[point_index - 1]
-        st.info(f"Selected position: τ = {manual_position:.3e} s")
+        
+        # Display the τ value for reference
+        st.info(f"Selected position: τ = {manual_position:.3e} s (point {point_index}/{n_points})")
+        
         st.session_state.app_state.manual_peak_position = manual_position
         
         col_add1, col_add2 = st.columns(2)
@@ -3404,6 +3422,7 @@ def step3_gaussian_deconvolution():
                 new_peak, new_params = deconvolver.add_manual_peak(manual_position)
                 if st.session_state.app_state.peak_info is None:
                     st.session_state.app_state.peak_info = []
+                # Assign ID for tracking
                 new_peak['id'] = len(st.session_state.app_state.peak_info) + 1
                 st.session_state.app_state.peak_info.append(new_peak)
                 if st.session_state.app_state.initial_peak_params is None:
@@ -3448,6 +3467,7 @@ def step3_gaussian_deconvolution():
         with col_next:
             if st.button("🎯 Perform Deconvolution", type="primary", use_container_width=True):
                 with st.spinner("Performing Gaussian deconvolution..."):
+                    # Ensure peak_info is initialized
                     if st.session_state.app_state.peak_info is None or len(st.session_state.app_state.peak_info) == 0:
                         peaks, peak_info, initial_params, _ = deconvolver.auto_detect_peaks(
                             sensitivity=sensitivity, min_distance=min_distance
@@ -3456,6 +3476,7 @@ def step3_gaussian_deconvolution():
                         st.session_state.app_state.initial_peak_params = initial_params
                         st.success(f"Auto-detected {len(peak_info)} peaks")
                     
+                    # Check if we have peaks to fit
                     if st.session_state.app_state.initial_peak_params is None or len(st.session_state.app_state.initial_peak_params) == 0:
                         st.error("No peaks detected. Please adjust sensitivity or add manual peaks.")
                     else:
@@ -3466,6 +3487,7 @@ def step3_gaussian_deconvolution():
                             progress_bar.progress(progress)
                             status_text.text(message)
                         
+                        # Ensure initial_params is a list, not None
                         initial_params = st.session_state.app_state.initial_peak_params
                         if isinstance(initial_params, np.ndarray):
                             initial_params = initial_params.tolist()
@@ -3488,17 +3510,6 @@ def step3_gaussian_deconvolution():
                             st.session_state.app_state.deconv_calculated = True
                             st.session_state.app_state.current_step = 4
                             st.success("✅ Deconvolution complete!")
-                            
-                            # Verify total area matches R_pol
-                            total_area = deconvolver.total_area
-                            expected_area = drt_result.R_pol
-                            area_ratio = total_area / expected_area if expected_area > 0 else 0
-                            
-                            if abs(area_ratio - 1.0) < 0.05:
-                                st.success(f"✓ Area verification passed: {total_area:.4f} Ω ≈ {expected_area:.4f} Ω")
-                            else:
-                                st.warning(f"⚠ Area verification: {total_area:.4f} Ω vs expected {expected_area:.4f} Ω (ratio: {area_ratio:.3f})")
-                            
                             st.rerun()
                         else:
                             st.error("Deconvolution failed. Try adjusting parameters.")
@@ -3512,23 +3523,16 @@ def step3_gaussian_deconvolution():
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
-            # Plot scaled DRT data
-            scale_factor_vis = np.log(10)  # ≈ 2.302585
-            y_original_scaled = deconvolver.y_original * scale_factor_vis
-            
-            ax.plot(deconvolver.x_linear, y_original_scaled, 
+            # Отображаем оригинальные ненормированные значения DRT
+            ax.plot(deconvolver.x_linear, deconvolver.y_original, 
                    'o-', markersize=3, linewidth=1, alpha=0.7, 
-                   label='Scaled DRT Data', color='black', zorder=1)
-            
-            # Add reference line for expected total area
-            expected_area = drt_result.R_pol
-            ax.axhline(y=expected_area / (np.max(deconvolver.x_linear) - np.min(deconvolver.x_linear)) * 0.1,
-                      color='gray', linestyle=':', alpha=0.5, label=f'Expected R_pol = {expected_area:.3f} Ω')
+                   label='DRT Data (original scale)', color='black', zorder=1)
             
             source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
             for idx, info in enumerate(st.session_state.app_state.peak_info):
                 source = info.get('source', 'auto')
                 color = source_colors.get(source, '#2ca02c')
+                # Используем y_original для отображения
                 ax.plot(info['x_linear'], info.get('y_original', info.get('y', 0)), 'o', 
                        markersize=8, markeredgecolor='darkred', 
                        markerfacecolor=color, zorder=3)
@@ -3545,15 +3549,15 @@ def step3_gaussian_deconvolution():
                        'ro', markersize=10)
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')
-            ax.set_title(f'Detected Peaks on Scaled DRT ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
-            ax.legend(loc='upper left')
+            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')  # Изменено с (norm.) на (Ω)
+            ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
+            ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')  # Изменено loc на upper left
             ax.grid(True, alpha=0.3, linestyle='--')
             
             st.pyplot(fig)
             plt.close()
             
-            # Peak info table
+            # Peak info table with delete buttons
             if st.session_state.app_state.peak_info:
                 st.subheader("Peak List")
                 
@@ -3569,6 +3573,7 @@ def step3_gaussian_deconvolution():
                     with col_c:
                         st.write(f"τ = {info['x_linear']:.4e} s")
                     with col_d:
+                        # Отображаем оригинальное значение y
                         y_value = info.get('y_original', info.get('y', 0))
                         st.write(f"γ = {y_value:.4e} Ω")
                     with col_e:
@@ -3579,6 +3584,7 @@ def step3_gaussian_deconvolution():
                 
                 st.markdown("---")
                 
+                # Additional statistics
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     auto_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', 'auto') == 'auto')
@@ -3589,6 +3595,13 @@ def step3_gaussian_deconvolution():
                 with col3:
                     residual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'residuals')
                     st.metric("From residuals", residual_count)
+        
+        elif st.session_state.app_state.deconv_calculated and st.session_state.app_state.deconv_result:
+            st.success("✅ Deconvolution completed!")
+            result = st.session_state.app_state.deconv_result
+            st.metric("R²", f"{result.quality_metrics.get('R²', 0):.4f}")
+            st.metric("Number of Peaks", len(result.peaks))
+            st.metric("Total Area", f"{result.total_area:.4e}")
 
 
 # ============================================================================
@@ -3630,11 +3643,9 @@ def step4_results():
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        scale_factor_vis = np.log(10)  # ≈ 2.302585
-        y_original_scaled = deconv_result.y_original * scale_factor_vis
-        
-        ax.scatter(deconv_result.x_linear, y_original_scaled, 
-                   s=15, alpha=0.5, color='black', label='Original DRT Data (scaled)', zorder=1)
+        # Оригинальные данные - они уже в правильном масштабе (7 Ом)
+        ax.scatter(deconv_result.x_linear, deconv_result.y_original, 
+                   s=15, alpha=0.5, color='black', label='Original DRT Data', zorder=1)
         
         # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
@@ -3841,13 +3852,10 @@ def step4_results():
         max_amp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
         
         # Нормализованные оригинальные данные
-        scale_factor_vis = np.log(10)  # ≈ 2.302585
-        y_original_scaled = deconv_result.y_original * scale_factor_vis
-        max_amp_scaled = max(y_original_scaled) if len(y_original_scaled) > 0 else 1.0
-        y_original_norm = y_original_scaled / max_amp_scaled
+        y_original_norm = deconv_result.y_original / max_amp
         
         ax.scatter(deconv_result.x_linear, y_original_norm, 
-                   s=15, alpha=0.5, color='black', label='Original DRT Data (normalized, scaled)', zorder=1)
+                   s=15, alpha=0.5, color='black', label='Original DRT Data (normalized)', zorder=1)
         
         # Создаем плотную сетку для плавных кривых
         if deconv_result.use_log_x:
@@ -3997,19 +4005,13 @@ def step4_results():
                 
                 fit_values[i] = total
             
-            residuals_original = deconv_result.y_original - fit_values  # исходные residuals
-            residuals_scaled = (deconv_result.y_original * scale_factor_vis) - fit_values  # масштабированные
-            
-            scale_factor_vis = np.log(10)
-            gamma_scaled = deconv_result.y_original * scale_factor_vis
+            residuals = deconv_result.y_original - fit_values
             
             fit_data = pd.DataFrame({
                 'tau_s': deconv_result.x_linear,
                 'gamma_tau_Ohm': deconv_result.y_original,
-                'gamma_tau_Ohm_scaled_for_plot': gamma_scaled,  # для визуализации
                 'gamma_fit_Ohm': fit_values,
-                'Residuals_Ohm': residuals,
-                'Residuals_Ohm_scaled': fit_values - gamma_scaled  # скорректированные residuals
+                'Residuals_Ohm': residuals
             })
             
             csv_fit = fit_data.to_csv(index=False)
