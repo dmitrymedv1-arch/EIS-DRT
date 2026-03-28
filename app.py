@@ -3961,13 +3961,14 @@ def step4_results():
             if st.button("📥 Export to Excel", type="primary", use_container_width=True):
                 try:
                     with st.spinner("Generating Excel file..."):
-                        # Create a Pandas Excel writer
+                        # Create a Pandas Excel writer - ensure at least one sheet is created
                         output = io.BytesIO()
                         
+                        # CRITICAL FIX: Always create at least one sheet
                         with pd.ExcelWriter(output, engine='openpyxl') as writer:
                             
                             # ============================================================
-                            # Sheet 1: Original & Reconstructed Impedance
+                            # Sheet 1: Original & Reconstructed Impedance (ALWAYS CREATED)
                             # ============================================================
                             sheet1_data = {}
                             
@@ -4013,13 +4014,13 @@ def step4_results():
                                 
                                 # Calculate relative error
                                 rel_error = np.abs((data.Z - (Z_rec_real_interp + 1j * Z_rec_imag_interp)) / data.Z) * 100
-                                sheet1_data['Relative_Error (%)'] = rel_error
+                                sheet1_data['Relative_Error (%)]'] = rel_error
                             else:
                                 sheet1_data['Re(Z)_rec (Ω)'] = np.nan * data.freq
                                 sheet1_data['-Im(Z)_rec (Ω)'] = np.nan * data.freq
                                 sheet1_data['|Z|_rec (Ω)'] = np.nan * data.freq
                                 sheet1_data['Phase_rec (deg)'] = np.nan * data.freq
-                                sheet1_data['Relative_Error (%)'] = np.nan * data.freq
+                                sheet1_data['Relative_Error (%)]'] = np.nan * data.freq
                             
                             # ALWAYS create at least one sheet - this is the critical fix
                             df_sheet1 = pd.DataFrame(sheet1_data)
@@ -4366,7 +4367,6 @@ def step4_results():
         if st.button("🔄 New Analysis", use_container_width=True):
             st.session_state.app_state = AppState()
             st.rerun()
-
 
 def create_export_excel(data: ImpedanceData, drt_result: DRTResult, 
                         deconv_result: DeconvolutionResult, 
