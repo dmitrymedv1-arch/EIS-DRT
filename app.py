@@ -43,9 +43,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Tuple
-
 
 # PyMC for Bayesian MCMC
 try:
@@ -257,6 +254,7 @@ st.markdown("""
 # Data Classes for Results Storage
 # ============================================================================
 
+@dataclass
 class DRTResult:
     """Container for DRT calculation results"""
     tau_grid: np.ndarray
@@ -268,48 +266,13 @@ class DRTResult:
     convergence: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
     
-    def __post_init__(self):
-        """Validate and prepare data after initialization"""
-        # Ensure arrays are numpy arrays
-        if not isinstance(self.tau_grid, np.ndarray):
-            self.tau_grid = np.array(self.tau_grid)
-        if not isinstance(self.gamma, np.ndarray):
-            self.gamma = np.array(self.gamma)
-        if self.gamma_std is not None and not isinstance(self.gamma_std, np.ndarray):
-            self.gamma_std = np.array(self.gamma_std)
-    
     @property
     def log_tau(self) -> np.ndarray:
         return np.log10(self.tau_grid)
     
-    def get_integral_over_log10(self) -> float:
-        """Calculate ∫ γ(τ) d(log₁₀τ) - should equal R_pol"""
-        if 'd_log10_tau' in self.metadata and self.metadata['d_log10_tau'] is not None:
-            return float(np.sum(self.gamma * self.metadata['d_log10_tau']))
-        else:
-            # Fallback using trapezoidal rule
-            return float(np.trapezoid(self.gamma, np.log10(self.tau_grid)))
-    
-    def get_integral_over_ln(self) -> float:
-        """Calculate ∫ γ(τ) d(ln τ) = R_pol / ln(10)"""
-        return self.get_integral_over_log10() * np.log(10)
-    
     def get_integral(self) -> float:
-        """Alias for get_integral_over_ln() for compatibility"""
-        return self.get_integral_over_ln()
-    
-    def get_polarization_resistance(self) -> float:
-        """Get polarization resistance from DRT (should equal R_pol)"""
-        return self.get_integral_over_log10()
-    
-    def check_consistency(self) -> Tuple[bool, float]:
-        """Check if DRT integral matches R_pol"""
-        integral = self.get_integral_over_log10()
-        if self.R_pol > 0:
-            relative_error = abs(integral - self.R_pol) / self.R_pol
-            is_consistent = relative_error < 0.05
-            return is_consistent, relative_error
-        return False, 1.0
+        return np.trapezoid(self.gamma, np.log(self.tau_grid))
+
 
 @dataclass
 class ImpedanceData:
@@ -642,49 +605,25 @@ class DRTCore:
         
         # Total polarization resistance
         self.R_pol = np.max(self.Z_real) - self.R_inf if np.max(self.Z_real) > self.R_inf else 1.0
-        
-        # Store d_log_tau for integration scaling
-        self.d_log_tau = None
     
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Build kernel matrix for given time grid, properly scaled with Δ(log τ)"""
+        """Build kernel matrix for given time grid, optionally including RL elements"""
         M = len(tau_grid)
         K_real = np.zeros((self.N, M))
         K_imag = np.zeros((self.N, M))
         
         omega = 2 * np.pi * self.frequencies
         
-        # Calculate Δ(log₁₀τ) for proper scaling
-        log10_tau = np.log10(tau_grid)
-        d_log10_tau = np.zeros(M)
-        
-        # Handle edges properly
-        if M > 1:
-            d_log10_tau[0] = log10_tau[1] - log10_tau[0]
-            d_log10_tau[-1] = log10_tau[-1] - log10_tau[-2]
-            for j in range(1, M-1):
-                d_log10_tau[j] = (log10_tau[j+1] - log10_tau[j-1]) / 2
-        
-        # Also calculate d(ln τ) = d(log₁₀τ) * ln(10)
-        d_ln_tau = d_log10_tau * np.log(10)
-        
-        # Store for later use
-        self.d_log10_tau = d_log10_tau
-        self.d_ln_tau = d_ln_tau
-        self.tau_grid = tau_grid
-        
         for i in range(self.N):
             for j in range(M):
                 denominator = 1 + (omega[i] * tau_grid[j])**2
-                # CRITICAL: Multiply by Δ(log₁₀τ) for proper scaling
-                # This ensures that ∫ γ d(log₁₀τ) = R_pol
-                K_real[i, j] = (1.0 / denominator) * d_log10_tau[j]
-                K_imag[i, j] = (-omega[i] * tau_grid[j] / denominator) * d_log10_tau[j]
+                K_real[i, j] = 1.0 / denominator
+                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator
                 
                 if include_rl:
                     rl_denom = 1 + (omega[i] * tau_grid[j])**2
-                    K_real[i, j] += ((omega[i] * tau_grid[j])**2 / rl_denom) * d_log10_tau[j]
-                    K_imag[i, j] += (omega[i] * tau_grid[j] / rl_denom) * d_log10_tau[j]
+                    K_real[i, j] += (omega[i] * tau_grid[j])**2 / rl_denom
+                    K_imag[i, j] += omega[i] * tau_grid[j] / rl_denom
         
         return K_real, K_imag
     
@@ -707,18 +646,6 @@ class DRTCore:
         if len(curvature) > 0:
             return np.argmax(curvature) + 1
         return len(residuals) // 2
-    
-    def calculate_integral(self, gamma: np.ndarray) -> float:
-        """Calculate correct integral ∫ γ(τ) d(ln τ)"""
-        if hasattr(self, 'd_ln_tau'):
-            return np.sum(gamma * self.d_ln_tau)
-        else:
-            log_tau = np.log(self.tau_grid) if hasattr(self, 'tau_grid') else np.log(gamma)
-            return np.trapezoid(gamma, log_tau)
-    
-    def calculate_polarization_resistance(self, gamma: np.ndarray) -> float:
-        """Calculate polarization resistance from DRT (should equal R_pol)"""
-        return self.calculate_integral(gamma)
 
 
 # ============================================================================
@@ -758,17 +685,14 @@ class TikhonovDRT(DRTCore):
         if resid > 1e-6 * np.linalg.norm(b):
             logging.warning(f"NNLS residual: {resid}")
         return x
-     
+    
     def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """Compute DRT using Tikhonov regularization with NNLS"""
         
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        
-        # Build kernel with proper Δ(log τ) scaling
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=self.include_inductive)
         
-        # Build target vector
         Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
         
@@ -816,43 +740,21 @@ class TikhonovDRT(DRTCore):
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
-        # Calculate uncertainty
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         
-        # Store tau_grid for integration methods
-        self.tau_grid = tau_grid
-        
-        # Prepare metadata
-        metadata = {
-            'lambda': lambda_opt,
-            'order': self.regularization_order,
-            'lambda_auto': lambda_auto,
-        }
-        
-        # Add d_log10_tau and d_ln_tau if available
-        if hasattr(self, 'd_log10_tau'):
-            metadata['d_log10_tau'] = self.d_log10_tau
-        if hasattr(self, 'd_ln_tau'):
-            metadata['d_ln_tau'] = self.d_ln_tau
-        
-        # Create result with explicit keyword arguments
-        result = DRTResult(
+        return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma,
             gamma_std=gamma_std,
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            convergence=True,
-            metadata=metadata
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto
+            }
         )
-        
-        # Verify consistency (optional)
-        if hasattr(self, 'd_log10_tau'):
-            integral = result.get_integral_over_log10()
-            logging.info(f"DRT integral over d(log₁₀τ): {integral:.4f} Ω, Target R_pol: {self.R_pol:.4f} Ω")
-        
-        return result
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
@@ -860,185 +762,7 @@ class TikhonovDRT(DRTCore):
         Z_rec_real = self.R_inf + K_real @ gamma
         Z_rec_imag = -K_imag @ gamma
         return Z_rec_real, Z_rec_imag
-    
-    def calculate_reconstruction_error(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Dict[str, float]:
-        """Calculate various error metrics between original and reconstructed impedance"""
-        Z_rec_real, Z_rec_imag = self.reconstruct_impedance(tau_grid, gamma)
-        
-        # Real part errors
-        real_abs_error = np.abs(self.Z_real - Z_rec_real)
-        real_rel_error = real_abs_error / (np.abs(self.Z_real) + 1e-10)
-        
-        # Imaginary part errors
-        imag_abs_error = np.abs(self.Z_imag - Z_rec_imag)
-        imag_rel_error = imag_abs_error / (np.abs(self.Z_imag) + 1e-10)
-        
-        # Complex error
-        Z_orig = self.Z_real + 1j * self.Z_imag
-        Z_rec = Z_rec_real + 1j * Z_rec_imag
-        complex_abs_error = np.abs(Z_orig - Z_rec)
-        complex_rel_error = complex_abs_error / (np.abs(Z_orig) + 1e-10)
-        
-        # RMSE and MAE
-        rmse_real = np.sqrt(np.mean(real_abs_error**2))
-        rmse_imag = np.sqrt(np.mean(imag_abs_error**2))
-        rmse_complex = np.sqrt(np.mean(complex_abs_error**2))
-        
-        mae_real = np.mean(real_abs_error)
-        mae_imag = np.mean(imag_abs_error)
-        mae_complex = np.mean(complex_abs_error)
-        
-        # R² for real and imaginary parts
-        ss_res_real = np.sum((self.Z_real - Z_rec_real)**2)
-        ss_tot_real = np.sum((self.Z_real - np.mean(self.Z_real))**2)
-        r2_real = 1 - (ss_res_real / ss_tot_real) if ss_tot_real > 0 else 0
-        
-        ss_res_imag = np.sum((self.Z_imag - Z_rec_imag)**2)
-        ss_tot_imag = np.sum((self.Z_imag - np.mean(self.Z_imag))**2)
-        r2_imag = 1 - (ss_res_imag / ss_tot_imag) if ss_tot_imag > 0 else 0
-        
-        # DRT integral check
-        drt_integral = self.calculate_integral(gamma)
-        r_pol_error = np.abs(self.R_pol - drt_integral) / self.R_pol if self.R_pol > 0 else 0
-        
-        return {
-            'real_rmse': rmse_real,
-            'real_mae': mae_real,
-            'real_r2': r2_real,
-            'real_max_abs_error': np.max(real_abs_error),
-            'real_max_rel_error': np.max(real_rel_error),
-            
-            'imag_rmse': rmse_imag,
-            'imag_mae': mae_imag,
-            'imag_r2': r2_imag,
-            'imag_max_abs_error': np.max(imag_abs_error),
-            'imag_max_rel_error': np.max(imag_rel_error),
-            
-            'complex_rmse': rmse_complex,
-            'complex_mae': mae_complex,
-            'complex_max_abs_error': np.max(complex_abs_error),
-            'complex_max_rel_error': np.max(complex_rel_error),
-            
-            'drt_integral': drt_integral,
-            'r_pol_error': r_pol_error,
-            'r_pol_target': self.R_pol
-        }
 
-def plot_impedance_comparison(data: ImpedanceData, Z_rec_real: np.ndarray, Z_rec_imag: np.ndarray,
-                              errors: Dict[str, float], title: str = "Impedance Comparison") -> plt.Figure:
-    """Create comprehensive impedance comparison plot with error metrics"""
-    
-    fig = plt.figure(figsize=(16, 10))
-    
-    # Create subplot grid
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
-    
-    # 1. Nyquist plot
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(data.re_z, data.im_z, 'o-', markersize=4, linewidth=1.5, 
-             label='Original', color='#1f77b4', alpha=0.7)
-    ax1.plot(Z_rec_real, Z_rec_imag, 's-', markersize=3, linewidth=1.2,
-             label='Reconstructed', color='#ff7f0e', alpha=0.8)
-    ax1.set_xlabel("Re(Z) / Ω", fontweight='bold')
-    ax1.set_ylabel("-Im(Z) / Ω", fontweight='bold')
-    ax1.set_title("Nyquist Plot", fontweight='bold')
-    ax1.legend(loc='best', fontsize=10)
-    ax1.grid(True, alpha=0.3, linestyle='--')
-    ax1.set_aspect('equal', adjustable='box')
-    
-    # 2. Real part comparison
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.semilogx(data.freq, data.re_z, 'o-', markersize=4, linewidth=1.5,
-                 label='Original', color='#1f77b4', alpha=0.7)
-    ax2.semilogx(data.freq, Z_rec_real, 's-', markersize=3, linewidth=1.2,
-                 label='Reconstructed', color='#ff7f0e', alpha=0.8)
-    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax2.set_ylabel("Re(Z) / Ω", fontweight='bold')
-    ax2.set_title(f"Real Part (R² = {errors['real_r2']:.6f})", fontweight='bold')
-    ax2.legend(loc='best', fontsize=10)
-    ax2.grid(True, alpha=0.3, linestyle='--')
-    
-    # 3. Imaginary part comparison
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax3.semilogx(data.freq, -data.im_z, 'o-', markersize=4, linewidth=1.5,
-                 label='Original', color='#1f77b4', alpha=0.7)
-    ax3.semilogx(data.freq, -Z_rec_imag, 's-', markersize=3, linewidth=1.2,
-                 label='Reconstructed', color='#ff7f0e', alpha=0.8)
-    ax3.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax3.set_ylabel("-Im(Z) / Ω", fontweight='bold')
-    ax3.set_title(f"Imaginary Part (R² = {errors['imag_r2']:.6f})", fontweight='bold')
-    ax3.legend(loc='best', fontsize=10)
-    ax3.grid(True, alpha=0.3, linestyle='--')
-    
-    # 4. Relative errors
-    ax4 = fig.add_subplot(gs[1, 0])
-    real_rel_error = np.abs(data.re_z - Z_rec_real) / (np.abs(data.re_z) + 1e-10)
-    imag_rel_error = np.abs(data.im_z - Z_rec_imag) / (np.abs(data.im_z) + 1e-10)
-    ax4.semilogx(data.freq, real_rel_error * 100, 'o-', markersize=4, linewidth=1.2,
-                 label='Real part', color='#1f77b4', alpha=0.7)
-    ax4.semilogx(data.freq, imag_rel_error * 100, 's-', markersize=3, linewidth=1.2,
-                 label='Imag part', color='#ff7f0e', alpha=0.8)
-    ax4.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax4.set_ylabel("Relative Error / %", fontweight='bold')
-    ax4.set_title("Relative Errors", fontweight='bold')
-    ax4.legend(loc='best', fontsize=10)
-    ax4.grid(True, alpha=0.3, linestyle='--')
-    ax4.set_yscale('log')
-    
-    # 5. Absolute errors
-    ax5 = fig.add_subplot(gs[1, 1])
-    real_abs_error = np.abs(data.re_z - Z_rec_real)
-    imag_abs_error = np.abs(data.im_z - Z_rec_imag)
-    ax5.semilogx(data.freq, real_abs_error, 'o-', markersize=4, linewidth=1.2,
-                 label='Real part', color='#1f77b4', alpha=0.7)
-    ax5.semilogx(data.freq, imag_abs_error, 's-', markersize=3, linewidth=1.2,
-                 label='Imag part', color='#ff7f0e', alpha=0.8)
-    ax5.set_xlabel("Frequency / Hz", fontweight='bold')
-    ax5.set_ylabel("Absolute Error / Ω", fontweight='bold')
-    ax5.set_title("Absolute Errors", fontweight='bold')
-    ax5.legend(loc='best', fontsize=10)
-    ax5.grid(True, alpha=0.3, linestyle='--')
-    ax5.set_yscale('log')
-    
-    # 6. Error metrics table
-    ax6 = fig.add_subplot(gs[1, 2])
-    ax6.axis('off')
-    
-    metrics_text = f"""
-    IMPEDANCE RECONSTRUCTION METRICS
-    {'='*40}
-    
-    REAL PART:
-    • RMSE: {errors['real_rmse']:.4e} Ω
-    • MAE: {errors['real_mae']:.4e} Ω
-    • R²: {errors['real_r2']:.6f}
-    • Max Rel. Error: {errors['real_max_rel_error']*100:.2f}%
-    
-    IMAGINARY PART:
-    • RMSE: {errors['imag_rmse']:.4e} Ω
-    • MAE: {errors['imag_mae']:.4e} Ω
-    • R²: {errors['imag_r2']:.6f}
-    • Max Rel. Error: {errors['imag_max_rel_error']*100:.2f}%
-    
-    COMPLEX:
-    • RMSE: {errors['complex_rmse']:.4e} Ω
-    • MAE: {errors['complex_mae']:.4e} Ω
-    • Max Rel. Error: {errors['complex_max_rel_error']*100:.2f}%
-    
-    DRT CONSISTENCY:
-    • R_pol (target): {errors['r_pol_target']:.4f} Ω
-    • ∫γ d(ln τ): {errors['drt_integral']:.4f} Ω
-    • Error: {errors['r_pol_error']*100:.2f}%
-    """
-    
-    ax6.text(0.05, 0.95, metrics_text, transform=ax6.transAxes,
-             fontsize=10, verticalalignment='top', fontfamily='monospace',
-             bbox=dict(boxstyle="round,pad=0.5", facecolor='lightgray', alpha=0.5))
-    
-    fig.suptitle(title, fontweight='bold', fontsize=14)
-    plt.tight_layout()
-    
-    return fig
 
 # ============================================================================
 # Bayesian DRT with MCMC (from EIS code)
@@ -3214,7 +2938,7 @@ def step1_data_loading():
 # ============================================================================
 
 def step2_drt_analysis():
-    """Step 2: Select DRT method and perform analysis with impedance reconstruction check"""
+    """Step 2: Select DRT method and perform analysis"""
     st.header("⚡ Step 2: DRT Analysis")
     
     data = st.session_state.app_state.impedance_data
@@ -3339,18 +3063,8 @@ def step2_drt_analysis():
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_calculated = True
                         
-                        # Store solver for reconstruction
+                        # Also store for reconstruction
                         st.session_state.app_state.drt_solver = drt_solver
-                        
-                        # Calculate reconstruction if solver has the method
-                        if hasattr(drt_solver, 'reconstruct_impedance'):
-                            Z_rec_real, Z_rec_imag = drt_solver.reconstruct_impedance(result.tau_grid, result.gamma)
-                            st.session_state.app_state.reconstructed_Z = (Z_rec_real, Z_rec_imag)
-                            
-                            # Calculate error metrics
-                            if hasattr(drt_solver, 'calculate_reconstruction_error'):
-                                errors = drt_solver.calculate_reconstruction_error(result.tau_grid, result.gamma)
-                                st.session_state.app_state.reconstruction_errors = errors
                         
                         st.success("✅ DRT calculation complete!")
                         st.rerun()
@@ -3364,94 +3078,22 @@ def step2_drt_analysis():
             
             result = st.session_state.app_state.drt_result
             
-            # Calculate DRT integral correctly
-            if hasattr(st.session_state.app_state.drt_solver, 'calculate_integral'):
-                drt_integral = st.session_state.app_state.drt_solver.calculate_integral(result.gamma)
-            else:
-                log_tau = np.log(result.tau_grid)
-                drt_integral = np.trapezoid(result.gamma, log_tau)
-            
-            col_metrics1, col_metrics2, col_metrics3 = st.columns(3)
-            with col_metrics1:
-                st.metric("R∞", f"{result.R_inf:.4f} Ω")
-            with col_metrics2:
-                st.metric("Rpol (target)", f"{result.R_pol:.4f} Ω")
-            with col_metrics3:
-                st.metric("∫γ d(ln τ)", f"{drt_integral:.4f} Ω")
-            
-            # Show consistency check
-            if abs(drt_integral - result.R_pol) / result.R_pol > 0.05:
-                st.warning(f"⚠️ DRT integral ({drt_integral:.4f} Ω) differs from R_pol ({result.R_pol:.4f} Ω) by {abs(drt_integral - result.R_pol)/result.R_pol*100:.1f}%")
-            else:
-                st.success(f"✅ DRT integral matches R_pol (error: {abs(drt_integral - result.R_pol)/result.R_pol*100:.2f}%)")
-            
             st.info(f"""
             **Method:** {result.method}
+            **R∞:** {result.R_inf:.4f} Ω
+            **Rpol:** {result.R_pol:.4f} Ω
             **τ range:** {result.tau_grid.min():.2e} - {result.tau_grid.max():.2e} s
             """)
             
             if 'lambda' in result.metadata:
                 st.info(f"**λ:** {result.metadata['lambda']:.3e}")
             
-            # Display DRT plot
             peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
+            
             fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
             plt.close()
             
-            # Display impedance reconstruction comparison
-            st.markdown("---")
-            st.subheader("🔍 Impedance Reconstruction Check")
-            
-            if hasattr(st.session_state.app_state, 'reconstructed_Z') and st.session_state.app_state.reconstructed_Z:
-                Z_rec_real, Z_rec_imag = st.session_state.app_state.reconstructed_Z
-                
-                if hasattr(st.session_state.app_state, 'reconstruction_errors'):
-                    errors = st.session_state.app_state.reconstruction_errors
-                    
-                    # Display error summary
-                    col_err1, col_err2, col_err3 = st.columns(3)
-                    with col_err1:
-                        st.metric("Real R²", f"{errors['real_r2']:.6f}")
-                    with col_err2:
-                        st.metric("Imag R²", f"{errors['imag_r2']:.6f}")
-                    with col_err3:
-                        st.metric("Complex RMSE", f"{errors['complex_rmse']:.4e} Ω")
-                    
-                    # Create comparison plot
-                    fig_compare = plot_impedance_comparison(
-                        data, Z_rec_real, Z_rec_imag, errors,
-                        title=f"Impedance Reconstruction: {result.method}"
-                    )
-                    st.pyplot(fig_compare)
-                    plt.close()
-                else:
-                    # Simple plot without error metrics
-                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-                    
-                    ax1.plot(data.re_z, data.im_z, 'o-', markersize=4, label='Original')
-                    ax1.plot(Z_rec_real, Z_rec_imag, 's-', markersize=3, label='Reconstructed')
-                    ax1.set_xlabel("Re(Z) / Ω")
-                    ax1.set_ylabel("-Im(Z) / Ω")
-                    ax1.set_title("Nyquist Plot")
-                    ax1.legend()
-                    ax1.grid(True, alpha=0.3)
-                    
-                    ax2.semilogx(data.freq, data.re_z, 'o-', markersize=4, label='Original Re(Z)')
-                    ax2.semilogx(data.freq, Z_rec_real, 's-', markersize=3, label='Reconstructed Re(Z)')
-                    ax2.semilogx(data.freq, -data.im_z, 'o-', markersize=4, label='Original -Im(Z)')
-                    ax2.semilogx(data.freq, -Z_rec_imag, 's-', markersize=3, label='Reconstructed -Im(Z)')
-                    ax2.set_xlabel("Frequency / Hz")
-                    ax2.set_ylabel("Impedance / Ω")
-                    ax2.set_title("Bode Plot")
-                    ax2.legend()
-                    ax2.grid(True, alpha=0.3)
-                    
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    plt.close()
-            
-            # Navigation buttons
             col_prev, col_next = st.columns(2)
             with col_prev:
                 if st.button("⬅️ Back to Parameters", use_container_width=True):
