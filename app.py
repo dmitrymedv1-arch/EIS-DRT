@@ -43,6 +43,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 import time
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Tuple
+
 
 # PyMC for Bayesian MCMC
 try:
@@ -265,6 +268,16 @@ class DRTResult:
     convergence: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
     
+    def __post_init__(self):
+        """Validate and prepare data after initialization"""
+        # Ensure arrays are numpy arrays
+        if not isinstance(self.tau_grid, np.ndarray):
+            self.tau_grid = np.array(self.tau_grid)
+        if not isinstance(self.gamma, np.ndarray):
+            self.gamma = np.array(self.gamma)
+        if self.gamma_std is not None and not isinstance(self.gamma_std, np.ndarray):
+            self.gamma_std = np.array(self.gamma_std)
+    
     @property
     def log_tau(self) -> np.ndarray:
         return np.log10(self.tau_grid)
@@ -272,10 +285,10 @@ class DRTResult:
     def get_integral_over_log10(self) -> float:
         """Calculate ∫ γ(τ) d(log₁₀τ) - should equal R_pol"""
         if 'd_log10_tau' in self.metadata and self.metadata['d_log10_tau'] is not None:
-            return np.sum(self.gamma * self.metadata['d_log10_tau'])
+            return float(np.sum(self.gamma * self.metadata['d_log10_tau']))
         else:
             # Fallback using trapezoidal rule
-            return np.trapezoid(self.gamma, np.log10(self.tau_grid))
+            return float(np.trapezoid(self.gamma, np.log10(self.tau_grid)))
     
     def get_integral_over_ln(self) -> float:
         """Calculate ∫ γ(τ) d(ln τ) = R_pol / ln(10)"""
@@ -745,7 +758,7 @@ class TikhonovDRT(DRTCore):
         if resid > 1e-6 * np.linalg.norm(b):
             logging.warning(f"NNLS residual: {resid}")
         return x
-    
+     
     def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """Compute DRT using Tikhonov regularization with NNLS"""
@@ -803,43 +816,43 @@ class TikhonovDRT(DRTCore):
             b = np.concatenate([Z_target, np.zeros(L.shape[0])])
             gamma = self._solve_nnls(A, b)
         
-        # CRITICAL: gamma now has units of [Ω / Δ(log₁₀τ)]
-        # To get γ(τ) per unit d(log₁₀τ), we need to divide by Δ(log₁₀τ)
-        # But since we already multiplied kernel by Δ(log₁₀τ), 
-        # gamma is already correctly scaled as γ(τ) * Δ(log₁₀τ)
-        # Therefore, for plotting and integration, we need to keep gamma as is
-        # and use d_log10_tau for integration
-        
         # Calculate uncertainty
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         
         # Store tau_grid for integration methods
         self.tau_grid = tau_grid
         
-        # Verify consistency
-        if hasattr(self, 'd_log10_tau'):
-            integral_log10 = np.sum(gamma * self.d_log10_tau)  # This should equal R_pol
-            integral_ln = integral_log10 * np.log(10)
-            
-            logging.info(f"DRT integral over d(log₁₀τ): {integral_log10:.4f} Ω")
-            logging.info(f"DRT integral over d(ln τ): {integral_ln:.4f} Ω")
-            logging.info(f"Target R_pol: {self.R_pol:.4f} Ω")
+        # Prepare metadata
+        metadata = {
+            'lambda': lambda_opt,
+            'order': self.regularization_order,
+            'lambda_auto': lambda_auto,
+        }
         
-        return DRTResult(
+        # Add d_log10_tau and d_ln_tau if available
+        if hasattr(self, 'd_log10_tau'):
+            metadata['d_log10_tau'] = self.d_log10_tau
+        if hasattr(self, 'd_ln_tau'):
+            metadata['d_ln_tau'] = self.d_ln_tau
+        
+        # Create result with explicit keyword arguments
+        result = DRTResult(
             tau_grid=tau_grid,
             gamma=gamma,
             gamma_std=gamma_std,
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            metadata={
-                'lambda': lambda_opt,
-                'order': self.regularization_order,
-                'lambda_auto': lambda_auto,
-                'd_log10_tau': self.d_log10_tau if hasattr(self, 'd_log10_tau') else None,
-                'd_ln_tau': self.d_ln_tau if hasattr(self, 'd_ln_tau') else None
-            }
+            convergence=True,
+            metadata=metadata
         )
+        
+        # Verify consistency (optional)
+        if hasattr(self, 'd_log10_tau'):
+            integral = result.get_integral_over_log10()
+            logging.info(f"DRT integral over d(log₁₀τ): {integral:.4f} Ω, Target R_pol: {self.R_pol:.4f} Ω")
+        
+        return result
     
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Reconstruct impedance from DRT"""
