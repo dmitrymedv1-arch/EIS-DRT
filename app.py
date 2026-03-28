@@ -869,10 +869,15 @@ class TikhonovDRT(DRTCore):
         if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
             warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
         
+        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
+        
+        # Пересчитываем интеграл с corrected gamma
+        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
+        
         return DRTResult(
             tau_grid=tau_grid,
-            gamma=gamma,
-            gamma_std=gamma_std,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
@@ -880,8 +885,8 @@ class TikhonovDRT(DRTCore):
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
-                'drt_integral': drt_integral,
-                'integral_ratio': drt_integral / self.R_pol
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol
             }
         )
     
