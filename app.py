@@ -3863,11 +3863,15 @@ def step3_gaussian_deconvolution():
         if st.session_state.app_state.peak_info is not None:
             fig, ax = plt.subplots(figsize=(10, 6))
             
-            if deconvolver.use_log_x:
-                ax.set_xscale('log')
+            frequencies = 1 / (2 * np.pi * deconvolver.x_linear)
+            sort_idx = np.argsort(frequencies)[::-1]
+            freq_sorted = frequencies[sort_idx]
+            y_sorted = deconvolver.y_original[sort_idx]
             
-            # Отображаем оригинальные ненормированные значения DRT
-            ax.plot(deconvolver.x_linear, deconvolver.y_original, 
+            ax.set_xscale('log')
+            ax.set_xlim(freq_sorted[0], freq_sorted[-1])  # высокие частоты слева, низкие справа
+            
+            ax.plot(freq_sorted, y_sorted, 
                    'o-', markersize=3, linewidth=1, alpha=0.7, 
                    label='DRT Data (original scale)', color='black', zorder=1)
             
@@ -3875,27 +3879,22 @@ def step3_gaussian_deconvolution():
             for idx, info in enumerate(st.session_state.app_state.peak_info):
                 source = info.get('source', 'auto')
                 color = source_colors.get(source, '#2ca02c')
-                # Используем y_original для отображения
-                ax.plot(info['x_linear'], info.get('y_original', info.get('y', 0)), 'o', 
+                # Конвертируем τ в частоту для отображения
+                freq_point = 1 / (2 * np.pi * info['x_linear'])
+                ax.plot(freq_point, info.get('y_original', info.get('y', 0)), 'o', 
                        markersize=8, markeredgecolor='darkred', 
                        markerfacecolor=color, zorder=3)
-                ax.text(info['x_linear'], info.get('y_original', info.get('y', 0)) * 1.05, 
-                       f'τ={info["x_linear"]:.2e}s', ha='center', 
+                ax.text(freq_point, info.get('y_original', info.get('y', 0)) * 1.05, 
+                       f'f={freq_point:.2e}Hz', ha='center', 
                        fontsize=8, rotation=45)
             
-            if st.session_state.app_state.manual_peak_position is not None:
-                idx = np.argmin(np.abs(deconvolver.x_linear - st.session_state.app_state.manual_peak_position))
-                y_at_position = deconvolver.y_original[idx]
-                ax.axvline(x=st.session_state.app_state.manual_peak_position, 
-                          color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-                ax.plot(st.session_state.app_state.manual_peak_position, y_at_position, 
-                       'ro', markersize=10)
-            
-            ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')  # Изменено с (norm.) на (Ω)
+            ax.set_xlabel('Frequency (Hz)', fontweight='bold')
+            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')
             ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
-            ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')  # Изменено loc на upper left
+            ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')
             ax.grid(True, alpha=0.3, linestyle='--')
+
+            ax.invert_xaxis()
             
             st.pyplot(fig)
             plt.close()
@@ -4158,10 +4157,12 @@ def step4_results():
         # Create detailed table
         data = []
         for peak in deconv_result.peaks:
+            freq_char = peak.get_characteristic_frequency()
             data.append({
                 'Peak ID': peak.id,
                 'Center (τ, s)': f"{peak.center:.4e}",
                 'Center (log τ)': f"{peak.center_log:.4f}",
+                'Frequency (Hz)': f"{freq_char:.4e}",  # ДОБАВЛЕНА новая колонка
                 'Amplitude (Ω)': f"{peak.amplitude:.4e}",
                 'Amplitude (norm)': f"{peak.amplitude_norm:.4f}",
                 'Sigma (log)': f"{peak.sigma_log:.4f}",
