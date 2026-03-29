@@ -538,7 +538,7 @@ def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Opt
             if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
                 freq = df[freq_col].values.astype(float)
                 re_z = df[re_col].values.astype(float)
-                im_z = np.abs(df[im_col].values.astype(float))
+                im_z = df[im_col].values.astype(float)  # Убрали np.abs() - сохраняем исходный знак
                 return freq, re_z, im_z
         except Exception as e:
             st.error(f"Error loading file: {e}")
@@ -581,7 +581,7 @@ def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Opt
                     try:
                         freq_val = float(parts[0])
                         re_val = float(parts[1])
-                        im_val = abs(float(parts[2]))
+                        im_val = float(parts[2])  # Убрали abs() - сохраняем исходный знак
                         rows.append([freq_val, re_val, im_val])
                     except ValueError:
                         st.warning(f"Пропущена некорректная строка: {line}")
