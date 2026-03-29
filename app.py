@@ -3175,11 +3175,13 @@ def calculate_peak_characteristics(peak: GaussianPeak) -> Dict[str, float]:
 
 def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str = "Original Impedance Spectrum") -> plt.Figure:
     """
-    Plot original Nyquist spectrum with positive imaginary part (inductive behavior preserved).
+    Plot original Nyquist spectrum with proper sign handling:
+    - Capacitive loops appear ABOVE the x-axis (positive -Im(Z))
+    - Inductive loops appear BELOW the x-axis (negative -Im(Z))
     Highlight extreme points and decade frequency points with formatted labels.
     
     Args:
-        data: ImpedanceData object (uses original data with positive -Im(Z) for inductance)
+        data: ImpedanceData object (uses original data with proper sign for -Im(Z))
         title: Plot title
     
     Returns:
@@ -3187,12 +3189,12 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     """
     fig, ax = plt.subplots(figsize=(9, 8))
     
-    # Use original data (preserving inductive behavior)
-    # Note: data.original_im_z may have positive values for inductance
-    # If original data not available, use current data but keep sign
+    # Use original data (preserving the sign of -Im(Z))
+    # Negative values indicate inductive behavior (below x-axis)
+    # Positive values indicate capacitive behavior (above x-axis)
     if data.original_im_z is not None:
         re_z_plot = data.original_re_z
-        im_z_plot = data.original_im_z
+        im_z_plot = data.original_im_z  # This already has correct sign
         freq_plot = data.original_freq
     else:
         # Use current data (might have been cropped but preserve sign)
@@ -3239,34 +3241,68 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
             if dec_freq >= 10:
                 exponent = int(np.floor(np.log10(dec_freq)))
                 mantissa = dec_freq / (10 ** exponent)
-                label = f'{mantissa:.1f}·10^{exponent}'
+                # Format mantissa to 1 decimal place
+                if abs(mantissa - round(mantissa)) < 0.05:
+                    label = f'{int(round(mantissa))}·10^{exponent}'
+                else:
+                    label = f'{mantissa:.1f}·10^{exponent}'
             else:
-                label = f'{dec_freq:.1f}'
+                if abs(dec_freq - round(dec_freq)) < 0.05:
+                    label = f'{int(round(dec_freq))}'
+                else:
+                    label = f'{dec_freq:.1f}'
         else:
             exponent = int(np.floor(np.log10(dec_freq)))
             mantissa = dec_freq / (10 ** exponent)
-            label = f'{mantissa:.1f}·10^{exponent}'
+            if abs(mantissa - round(mantissa)) < 0.05:
+                label = f'{int(round(mantissa))}·10^{exponent}'
+            else:
+                label = f'{mantissa:.1f}·10^{exponent}'
         
         # Offset label position to avoid overlap
-        offset_x = (np.max(re_z_plot) - np.min(re_z_plot)) * 0.02
-        offset_y = (np.max(im_z_plot) - np.min(im_z_plot)) * 0.02
+        x_range = np.max(re_z_plot) - np.min(re_z_plot)
+        y_range = np.max(im_z_plot) - np.min(im_z_plot)
+        offset_x = x_range * 0.02
+        offset_y = y_range * 0.02
+        
+        # Adjust label position based on sign of imaginary part
+        if im_z_plot[idx] >= 0:
+            # Above the curve - label above point
+            text_y_offset = offset_y
+        else:
+            # Below the curve - label below point
+            text_y_offset = -offset_y * 1.5
+        
         ax.annotate(label, 
                    xy=(re_z_plot[idx], im_z_plot[idx]),
-                   xytext=(offset_x, offset_y),
+                   xytext=(offset_x, text_y_offset),
                    textcoords='offset points',
                    fontsize=8,
                    bbox=dict(boxstyle="round,pad=0.2", facecolor='yellow', alpha=0.7))
     
+    # Add horizontal line at y=0 for reference
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
+    
+    # Add shading for inductive region (below x-axis)
+    y_min, y_max = ax.get_ylim()
+    if y_min < 0:
+        ax.fill_between([np.min(re_z_plot), np.max(re_z_plot)], y_min, 0,
+                        alpha=0.1, color='red', label='Inductive region (L)')
+    
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12)
     ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=12)
     ax.set_title(title, fontweight='bold', fontsize=14)
-    ax.legend(loc='best', fontsize=10, frameon=True, edgecolor='black')
+    ax.legend(loc='best', fontsize=9, frameon=True, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
+    # Ensure inductive region is visible
+    if y_min < 0:
+        ax.set_ylim(y_min * 1.1, y_max * 1.1)
+    
     plt.tight_layout()
     return fig
-
+    
 def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_result: DRTResult = None,
                                       title: str = "Gaussian Deconvolution vs Frequency") -> plt.Figure:
     """
@@ -3419,6 +3455,8 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     Elements are connected in series: R∞ → RC₁ → RC₂ → ... → RCₙ
     Inductance L is added in series before R∞ if present.
     
+    IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
+    
     Args:
         deconv_result: DeconvolutionResult from Gaussian deconvolution
         drt_result: DRTResult with R_inf, R_pol, and L
@@ -3430,10 +3468,10 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     """
     fig, ax = plt.subplots(figsize=(10, 8))
     
-    # Use original data (preserving inductive behavior)
+    # Use original data (preserving sign of -Im(Z))
     if data.original_im_z is not None:
         re_exp = data.original_re_z
-        im_exp = data.original_im_z
+        im_exp = data.original_im_z  # Positive = capacitive, Negative = inductive
         freq_exp = data.original_freq
     else:
         re_exp = data.re_z
@@ -3460,10 +3498,14 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     omega = 2 * np.pi * freq_exp_sorted
     
     # Start with R∞ and inductance
-    R_total_series = np.zeros_like(omega, dtype=complex)
-    R_total_series += drt_result.R_inf  # R∞
+    Z_total = np.zeros_like(omega, dtype=complex)
+    Z_total += drt_result.R_inf  # R∞
+    
+    # Inductance contribution: Z_L = iωL
+    # This adds to -Im(Z): -Im(Z_L) = -ωL (negative for inductive behavior)
     if drt_result.L > 0:
-        R_total_series += 1j * omega * drt_result.L  # iωL
+        Z_total += 1j * omega * drt_result.L
+        # This will appear BELOW the x-axis because -Im(Z) = -ωL is negative
     
     # Store cumulative resistance for plotting individual RC elements
     cumulative_R = drt_result.R_inf
@@ -3475,16 +3517,13 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         tau_i = peak.center
         # RC element: Z_i = R_i / (1 + iωτ_i)
         Z_i = R_i / (1 + 1j * omega * tau_i)
-        R_total_series += Z_i
+        Z_total += Z_i
         
         # Store for individual curve plotting
-        # For plotting individual semicircle, we need the cumulative impedance
-        # up to this point, and then add this RC element
         cumulative_R_prev = cumulative_R
         cumulative_R += R_i
         
         # The individual RC element contribution as a separate curve
-        # Start from previous cumulative point, then add RC element
         Z_individual = cumulative_R_prev + Z_i
         rc_curves.append({
             'id': peak.id,
@@ -3496,10 +3535,9 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
             'end_R': cumulative_R
         })
     
-    # Calculate total model impedance
-    Z_model = R_total_series
-    re_model = np.real(Z_model)
-    im_model = -np.imag(Z_model)  # -Im(Z) for plotting
+    # Calculate total model impedance (real and -imag)
+    re_model = np.real(Z_total)
+    im_model = -np.imag(Z_total)  # -Im(Z) for plotting (positive = capacitive, negative = inductive)
     
     # Plot total model
     ax.plot(re_model, im_model, 'r--', linewidth=2.5,
@@ -3509,7 +3547,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     colors = plt.cm.Set3(np.linspace(0, 1, len(rc_curves)))
     for curve, color in zip(rc_curves, colors):
         re_curve = np.real(curve['Z'])
-        im_curve = -np.imag(curve['Z'])
+        im_curve = -np.imag(curve['Z'])  # -Im(Z) for plotting
         ax.plot(re_curve, im_curve, '-', linewidth=2, color=color,
                label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω, f={curve["f_char"]:.2e} Hz',
                zorder=2)
@@ -3529,12 +3567,15 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         # Find high frequency region for inductance annotation
         high_freq_mask = freq_exp_sorted > 0.1 * np.max(freq_exp_sorted)
         if np.any(high_freq_mask):
-            re_high = re_exp_sorted[high_freq_mask]
-            im_high = im_exp_sorted[high_freq_mask]
-            if len(re_high) > 0:
-                ax.annotate(f'L = {drt_result.L:.3e} H',
-                           xy=(re_high[0], im_high[0]),
-                           xytext=(re_high[0] * 1.1, im_high[0] * 1.5),
+            # Find points with negative -Im(Z) (inductive behavior)
+            inductive_mask = im_exp_sorted < 0
+            if np.any(inductive_mask):
+                # Find the most negative point for annotation
+                most_negative_idx = np.argmin(im_exp_sorted)
+                ax.annotate(f'L = {drt_result.L:.3e} H\n(inductive loop)',
+                           xy=(re_exp_sorted[most_negative_idx], im_exp_sorted[most_negative_idx]),
+                           xytext=(re_exp_sorted[most_negative_idx] * 0.95, 
+                                  im_exp_sorted[most_negative_idx] * 1.5),
                            fontsize=9,
                            bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
                            arrowprops=dict(arrowstyle='->', color='gray'))
@@ -3544,12 +3585,25 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.plot(total_R, 0, 'd', color='darkred', markersize=10,
            markeredgecolor='black', markeredgewidth=1, label=f'Total R = {total_R:.4f} Ω')
     
+    # Add horizontal line at y=0 for reference
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
+    
+    # Add shading for inductive region (below x-axis)
+    y_min, y_max = ax.get_ylim()
+    if y_min < 0:
+        ax.fill_between([np.min(re_exp_sorted), np.max(re_exp_sorted)], y_min, 0,
+                        alpha=0.1, color='red', label='Inductive region')
+    
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12)
     ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=12)
     ax.set_title(title, fontweight='bold', fontsize=14)
     ax.legend(loc='best', fontsize=8, frameon=True, edgecolor='black', ncol=1)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
+    
+    # Ensure inductive region is visible
+    if y_min < 0:
+        ax.set_ylim(y_min * 1.1, y_max * 1.1)
     
     plt.tight_layout()
     return fig
