@@ -3740,21 +3740,23 @@ def step3_gaussian_deconvolution():
         st.subheader("Manual Peak Addition")
         
         # Get number of data points for point selection
+
         n_points = len(deconvolver.x_linear)
         
-        # Create slider by point index (1-based for user-friendly)
-        point_index = st.slider("Select peak by point index:",
+        frequencies_for_slider = 1 / (2 * np.pi * deconvolver.x_linear)
+        freq_sorted_for_slider = np.sort(frequencies_for_slider)[::-1]
+        
+        point_index = st.slider("Select peak by frequency point index:",
                                min_value=1,
                                max_value=n_points,
                                value=n_points // 2,
                                step=1,
                                help="Select point index (1 to {}) to add peak at that position".format(n_points))
         
-        # Convert index to actual τ value
-        manual_position = deconvolver.x_linear[point_index - 1]
+        selected_freq = freq_sorted_for_slider[point_index - 1]
+        manual_position = 1 / (2 * np.pi * selected_freq)
         
-        # Display the τ value for reference
-        st.info(f"Selected position: τ = {manual_position:.3e} s (point {point_index}/{n_points})")
+        st.info(f"Selected position: f = {selected_freq:.3e} Hz (τ = {manual_position:.3e} s) [point {point_index}/{n_points}]")
         
         st.session_state.app_state.manual_peak_position = manual_position
         
@@ -3864,6 +3866,7 @@ def step3_gaussian_deconvolution():
             fig, ax = plt.subplots(figsize=(10, 6))
             
             frequencies = 1 / (2 * np.pi * deconvolver.x_linear)
+
             sort_idx = np.argsort(frequencies)[::-1]
             freq_sorted = frequencies[sort_idx]
             y_sorted = deconvolver.y_original[sort_idx]
@@ -3888,10 +3891,25 @@ def step3_gaussian_deconvolution():
                        f'f={freq_point:.2e}Hz', ha='center', 
                        fontsize=8, rotation=45)
             
+            if st.session_state.app_state.manual_peak_position is not None:
+
+                manual_freq = 1 / (2 * np.pi * st.session_state.app_state.manual_peak_position)
+
+                idx = np.argmin(np.abs(freq_sorted - manual_freq))
+                y_at_position = y_sorted[idx]
+                ax.axvline(x=manual_freq, 
+                          color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax.plot(manual_freq, y_at_position, 
+                       'ro', markersize=10, label='Selected position')
+                # Добавляем подпись к точке
+                ax.text(manual_freq, y_at_position * 1.1, 
+                       f'f={manual_freq:.2e}Hz\nτ={st.session_state.app_state.manual_peak_position:.2e}s', 
+                       ha='center', fontsize=8, bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
+            
             ax.set_xlabel('Frequency (Hz)', fontweight='bold')
             ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')
             ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
-            ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')
+            ax.legend(['DRT Data (original scale)', 'Detected Peaks', 'Selected position'], loc='upper left')
             ax.grid(True, alpha=0.3, linestyle='--')
 
             ax.invert_xaxis()
