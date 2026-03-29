@@ -2949,7 +2949,7 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     if result.gamma_std is not None:
         ax1.fill_between(result.tau_grid, result.gamma - 2*result.gamma_std, 
                         result.gamma + 2*result.gamma_std,
-                        alpha=0.3, color='gray', label='±2σ uncertainty')
+                        alpha=0.3, color='gray')  # Убран параметр label
     ax1.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
     
     if peaks and len(peaks) > 0:
@@ -2981,7 +2981,7 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
         gamma_std_sorted = result.gamma_std[sort_idx]
         ax2.fill_between(freqs_sorted, gamma_sorted - 2*gamma_std_sorted, 
                         gamma_sorted + 2*gamma_std_sorted,
-                        alpha=0.3, color='gray', label='±2σ uncertainty')
+                        alpha=0.3, color='gray')  # Убран параметр label
     ax2.semilogx(freqs_sorted, gamma_sorted, '-', linewidth=2, color='#2ca02c', label='DRT')
     
     if peaks and len(peaks) > 0:
