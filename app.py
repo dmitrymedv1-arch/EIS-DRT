@@ -3284,9 +3284,29 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     
     # Adjust y-axis to show negative values properly
     if np.any(im_z_plot < 0):
-        y_min_data = np.min(im_z_plot)
+        # Find inductive tail points (negative -Im(Z) values)
+        inductive_mask = im_z_plot < 0
+        if np.any(inductive_mask):
+            # Get the last 2-3 points of the inductive tail (most negative)
+            inductive_indices = np.where(inductive_mask)[0]
+            if len(inductive_indices) > 0:
+                # Take the most negative 2-3 points (end of tail)
+                tail_indices = inductive_indices[-min(3, len(inductive_indices)):]
+                y_min_tail = np.min(im_z_plot[tail_indices])
+                # Use tail minimum with small margin, but not too extreme
+                y_min_data = y_min_tail * 1.2  # 20% margin for tail
+                # But ensure we don't cut off points that are even more negative
+                y_min_absolute = np.min(im_z_plot)
+                y_min_data = max(y_min_data, y_min_absolute * 0.95)
+            else:
+                y_min_data = np.min(im_z_plot)
+                y_min_data = y_min_data * 1.1
+        else:
+            y_min_data = np.min(im_z_plot)
+            y_min_data = y_min_data * 1.1
+        
         y_max_data = np.max(im_z_plot)
-        ax.set_ylim(y_min_data * 1.1, y_max_data * 1.1)
+        ax.set_ylim(y_min_data, y_max_data * 1.1)
     
     plt.tight_layout()
     return fig
@@ -3586,7 +3606,26 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     
     # Ensure inductive region is visible
     if y_min < 0:
-        ax.set_ylim(y_min * 1.1, y_max * 1.1)
+        # Find inductive tail in experimental data (points with negative -Im(Z))
+        inductive_mask = im_exp_sorted < 0
+        if np.any(inductive_mask):
+            # Get the last 2-3 points of the inductive tail (most negative)
+            inductive_indices = np.where(inductive_mask)[0]
+            if len(inductive_indices) > 0:
+                # Take the most negative 2-3 points (end of tail)
+                tail_indices = inductive_indices[-min(3, len(inductive_indices)):]
+                y_min_tail = np.min(im_exp_sorted[tail_indices])
+                # Use tail minimum with small margin
+                y_min_new = y_min_tail * 1.2  # 20% margin for tail
+                # But ensure we don't cut off points that are even more negative
+                y_min_absolute = np.min(im_exp_sorted)
+                y_min_new = max(y_min_new, y_min_absolute * 0.95)
+            else:
+                y_min_new = y_min * 1.1
+        else:
+            y_min_new = y_min * 1.1
+        
+        ax.set_ylim(y_min_new, y_max * 1.1)
     
     plt.tight_layout()
     return fig
