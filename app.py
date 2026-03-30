@@ -3181,7 +3181,7 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     - Capacitive loops appear ABOVE the x-axis (positive -Im(Z))
     - Inductive loops appear BELOW the x-axis (negative -Im(Z))
     """
-    fig, ax = plt.subplots(figsize=(6, 8))
+    fig, ax = plt.subplots(figsize=(9, 12))
     
     # Используем текущие данные (уже инвертированы в __post_init__)
     re_z_plot = data.re_z
