@@ -3282,31 +3282,69 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
-    # Adjust y-axis to show negative values properly
+    # Intelligent y-axis scaling to show inductive tail details
     if np.any(im_z_plot < 0):
-        # Find inductive tail points (negative -Im(Z) values)
-        inductive_mask = im_z_plot < 0
-        if np.any(inductive_mask):
-            # Get the last 2-3 points of the inductive tail (most negative)
-            inductive_indices = np.where(inductive_mask)[0]
-            if len(inductive_indices) > 0:
-                # Take the most negative 2-3 points (end of tail)
-                tail_indices = inductive_indices[-min(3, len(inductive_indices)):]
-                y_min_tail = np.min(im_z_plot[tail_indices])
-                # Use tail minimum with small margin, but not too extreme
-                y_min_data = y_min_tail * 1.2  # 20% margin for tail
-                # But ensure we don't cut off points that are even more negative
-                y_min_absolute = np.min(im_z_plot)
-                y_min_data = max(y_min_data, y_min_absolute * 0.95)
-            else:
-                y_min_data = np.min(im_z_plot)
-                y_min_data = y_min_data * 1.1
-        else:
-            y_min_data = np.min(im_z_plot)
-            y_min_data = y_min_data * 1.1
+        # Find the transition from positive to negative -Im(Z)
+        positive_mask = im_z_plot >= 0
+        negative_mask = im_z_plot < 0
         
-        y_max_data = np.max(im_z_plot)
-        ax.set_ylim(y_min_data, y_max_data * 1.1)
+        if np.any(positive_mask) and np.any(negative_mask):
+            # Find the last positive point (transition point)
+            last_positive_idx = np.max(np.where(positive_mask)[0])
+            first_negative_idx = np.min(np.where(negative_mask)[0])
+            
+            # Get the range of the inductive tail (all negative points)
+            inductive_tail = im_z_plot[negative_mask]
+            
+            # Calculate y-axis limits:
+            # Upper limit: 20% above the maximum positive value (for capacitive loops)
+            y_max_data = np.max(im_z_plot[positive_mask]) * 1.2 if np.any(positive_mask) else np.max(im_z_plot)
+            
+            # Lower limit: 20% below the most negative point (to show inductive tail clearly)
+            y_min_data = np.min(inductive_tail) * 1.2
+            
+            # Also ensure the transition region (around zero) is visible
+            # If the positive values are much larger than negative, we need to adjust
+            positive_max = np.max(im_z_plot[positive_mask]) if np.any(positive_mask) else 0
+            negative_min = np.min(inductive_tail)
+            
+            # If positive values are more than 10x larger than negative values,
+            # we focus on the inductive region by setting a reasonable y-limit
+            if positive_max > abs(negative_min) * 10:
+                # Show only up to 2-3 times the maximum of the inductive tail
+                # This makes the inductive details visible
+                y_max_data = abs(negative_min) * 3
+                # But don't cut off the transition points if they're important
+                transition_points = im_z_plot[last_positive_idx:first_negative_idx+1]
+                if np.any(transition_points > y_max_data):
+                    y_max_data = np.max(transition_points) * 1.2
+            
+            # Also consider the first few negative points to ensure smooth transition
+            first_negative_points = im_z_plot[first_negative_idx:min(first_negative_idx+5, len(im_z_plot))]
+            y_min_data = min(y_min_data, np.min(first_negative_points) * 1.1)
+            
+            # Set the limits
+            ax.set_ylim(y_min_data, y_max_data)
+            
+            # Add annotation about focused view on inductive tail
+            if y_max_data < np.max(im_z_plot) * 0.5:
+                ax.annotate('Focused view on inductive tail\n(Capacitive loop cropped for clarity)',
+                           xy=(np.min(re_z_plot), y_min_data * 0.9),
+                           xytext=(np.min(re_z_plot) + (np.max(re_z_plot)-np.min(re_z_plot))*0.05, 
+                                  y_min_data * 0.5),
+                           fontsize=8,
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6))
+        else:
+            # Only negative or only positive data
+            y_min_data = np.min(im_z_plot) * 1.2 if np.any(negative_mask) else -1
+            y_max_data = np.max(im_z_plot) * 1.2 if np.any(positive_mask) else 1
+            ax.set_ylim(y_min_data, y_max_data)
+    else:
+        # No inductive behavior, standard scaling
+        y_min_data = np.min(im_z_plot) * 0.9 if np.min(im_z_plot) > 0 else np.min(im_z_plot) * 1.1
+        y_max_data = np.max(im_z_plot) * 1.1
+        ax.set_ylim(y_min_data, y_max_data)
     
     plt.tight_layout()
     return fig
@@ -3503,12 +3541,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     # Start with R∞ and inductance
     Z_total = np.zeros_like(omega, dtype=complex)
     Z_total += drt_result.R_inf  # R∞
-    
-    # Inductance contribution: Z_L = iωL
-    # This adds to -Im(Z): -Im(Z_L) = -ωL (negative for inductive behavior)
-    if drt_result.L > 0:
-        Z_total += 1j * omega * drt_result.L
-        # This will appear BELOW the x-axis because -Im(Z) = -ωL is negative
+    Z_total += 1j * omega * drt_result.L  # Inductance contribution
     
     # Store cumulative resistance for plotting individual RC elements
     cumulative_R = drt_result.R_inf
@@ -3592,9 +3625,9 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
     
     # Add shading for inductive region (below x-axis)
-    y_min, y_max = ax.get_ylim()
-    if y_min < 0:
-        ax.fill_between([np.min(re_exp_sorted), np.max(re_exp_sorted)], y_min, 0,
+    y_min_current, y_max_current = ax.get_ylim()
+    if y_min_current < 0:
+        ax.fill_between([np.min(re_exp_sorted), np.max(re_exp_sorted)], y_min_current, 0,
                         alpha=0.1, color='red', label='Inductive region')
     
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12)
@@ -3604,28 +3637,65 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
-    # Ensure inductive region is visible
-    if y_min < 0:
-        # Find inductive tail in experimental data (points with negative -Im(Z))
-        inductive_mask = im_exp_sorted < 0
-        if np.any(inductive_mask):
-            # Get the last 2-3 points of the inductive tail (most negative)
-            inductive_indices = np.where(inductive_mask)[0]
-            if len(inductive_indices) > 0:
-                # Take the most negative 2-3 points (end of tail)
-                tail_indices = inductive_indices[-min(3, len(inductive_indices)):]
-                y_min_tail = np.min(im_exp_sorted[tail_indices])
-                # Use tail minimum with small margin
-                y_min_new = y_min_tail * 1.2  # 20% margin for tail
-                # But ensure we don't cut off points that are even more negative
-                y_min_absolute = np.min(im_exp_sorted)
-                y_min_new = max(y_min_new, y_min_absolute * 0.95)
-            else:
-                y_min_new = y_min * 1.1
-        else:
-            y_min_new = y_min * 1.1
+    # Intelligent y-axis scaling for sequential RC model
+    if np.any(im_exp_sorted < 0):
+        # Find the transition from positive to negative -Im(Z)
+        positive_mask = im_exp_sorted >= 0
+        negative_mask = im_exp_sorted < 0
         
-        ax.set_ylim(y_min_new, y_max * 1.1)
+        if np.any(positive_mask) and np.any(negative_mask):
+            # Find the last positive point (transition point)
+            last_positive_idx = np.max(np.where(positive_mask)[0])
+            first_negative_idx = np.min(np.where(negative_mask)[0])
+            
+            # Get the range of the inductive tail (all negative points)
+            inductive_tail = im_exp_sorted[negative_mask]
+            
+            # Calculate y-axis limits:
+            # Upper limit: 20% above the maximum positive value (for capacitive loops)
+            y_max_data = np.max(im_exp_sorted[positive_mask]) * 1.2 if np.any(positive_mask) else np.max(im_exp_sorted)
+            
+            # Lower limit: 20% below the most negative point (to show inductive tail clearly)
+            y_min_data = np.min(inductive_tail) * 1.2
+            
+            # If positive values are much larger than negative, focus on inductive region
+            positive_max = np.max(im_exp_sorted[positive_mask]) if np.any(positive_mask) else 0
+            negative_min = np.min(inductive_tail)
+            
+            if positive_max > abs(negative_min) * 10:
+                # Show only up to 3 times the maximum of the inductive tail
+                y_max_data = abs(negative_min) * 3
+                # But ensure transition points are visible if they're within this range
+                transition_points = im_exp_sorted[last_positive_idx:first_negative_idx+1]
+                if np.any(transition_points > y_max_data):
+                    y_max_data = np.max(transition_points) * 1.2
+            
+            # Also consider the first few negative points to ensure smooth transition
+            first_negative_points = im_exp_sorted[first_negative_idx:min(first_negative_idx+5, len(im_exp_sorted))]
+            y_min_data = min(y_min_data, np.min(first_negative_points) * 1.1)
+            
+            # Set the limits
+            ax.set_ylim(y_min_data, y_max_data)
+            
+            # Add annotation about focused view
+            if y_max_data < np.max(im_exp_sorted) * 0.5:
+                ax.annotate('Focused view on inductive tail\n(Capacitive loop cropped for clarity)',
+                           xy=(np.min(re_exp_sorted), y_min_data * 0.9),
+                           xytext=(np.min(re_exp_sorted) + (np.max(re_exp_sorted)-np.min(re_exp_sorted))*0.05, 
+                                  y_min_data * 0.5),
+                           fontsize=8,
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6))
+        else:
+            # Only negative or only positive data
+            y_min_data = np.min(im_exp_sorted) * 1.2 if np.any(negative_mask) else np.min(im_exp_sorted) * 0.9
+            y_max_data = np.max(im_exp_sorted) * 1.2 if np.any(positive_mask) else np.max(im_exp_sorted) * 1.1
+            ax.set_ylim(y_min_data, y_max_data)
+    else:
+        # No inductive behavior
+        y_min_data = np.min(im_exp_sorted) * 0.9 if np.min(im_exp_sorted) > 0 else np.min(im_exp_sorted) * 1.1
+        y_max_data = np.max(im_exp_sorted) * 1.1
+        ax.set_ylim(y_min_data, y_max_data)
     
     plt.tight_layout()
     return fig
