@@ -5000,6 +5000,14 @@ Number of Peaks: {len(deconv_result.peaks)}
 
 def show_step_indicator():
     """Display step indicator in sidebar"""
+    # Add logo at the top of sidebar
+    try:
+        from PIL import Image
+        logo = Image.open("logo.png")
+        st.sidebar.image(logo, use_container_width=True)
+    except Exception as e:
+        st.sidebar.warning(f"Logo not found: {e}")
+    
     st.sidebar.markdown("### 📍 Analysis Steps")
     
     steps = {
