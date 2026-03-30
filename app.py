@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-EIS-DRT Analysis Tool v5.0
-Updated with proper inductance handling based on DRTtools implementation
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
