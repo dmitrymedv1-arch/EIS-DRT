@@ -3180,7 +3180,6 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     Plot original Nyquist spectrum with proper sign handling:
     - Capacitive loops appear ABOVE the x-axis (positive -Im(Z))
     - Inductive loops appear BELOW the x-axis (negative -Im(Z))
-    Only first 3 inductive points are shown, others are clipped to keep focus on main spectrum.
     """
     fig, ax = plt.subplots(figsize=(9, 8))
     
@@ -3189,30 +3188,8 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     im_z_plot = data.im_z  # Уже инвертированы, емкостные процессы положительны
     freq_plot = data.freq
     
-    # Create a copy for plotting with inductive tail clipping
-    re_z_clipped = re_z_plot.copy()
-    im_z_clipped = im_z_plot.copy()
-    
-    # Find inductive points (negative -Im(Z))
-    inductive_mask = im_z_plot < 0
-    inductive_indices = np.where(inductive_mask)[0]
-    
-    # Keep only first 3 inductive points (the ones closest to x-axis)
-    if len(inductive_indices) > 3:
-        # Sort inductive indices by frequency (highest frequency first)
-        freq_inductive = freq_plot[inductive_mask]
-        sorted_inductive_indices = inductive_indices[np.argsort(freq_inductive)[::-1]]
-        
-        # Keep first 3 points, set others to NaN (they won't be plotted)
-        keep_indices = sorted_inductive_indices[:3]
-        remove_indices = sorted_inductive_indices[3:]
-        
-        for idx in remove_indices:
-            re_z_clipped[idx] = np.nan
-            im_z_clipped[idx] = np.nan
-    
-    # Plot spectrum with clipped inductive tail
-    ax.plot(re_z_clipped, im_z_clipped, 'o-', markersize=5, linewidth=1.8,
+    # Plot full spectrum
+    ax.plot(re_z_plot, im_z_plot, 'o-', markersize=5, linewidth=1.8,
             label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
     
     # Find extreme points
@@ -3467,7 +3444,6 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     Inductance L is added in series before R∞ if present.
     
     IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
-    Only first 3 inductive points are shown, others are clipped to keep focus on main spectrum.
     
     Args:
         deconv_result: DeconvolutionResult from Gaussian deconvolution
@@ -3491,30 +3467,8 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     im_exp_sorted = im_exp[sort_idx_exp]
     freq_exp_sorted = freq_exp[sort_idx_exp]
     
-    # Create a copy for plotting with inductive tail clipping
-    re_exp_clipped = re_exp_sorted.copy()
-    im_exp_clipped = im_exp_sorted.copy()
-    
-    # Find inductive points (negative -Im(Z))
-    inductive_mask = im_exp_sorted < 0
-    inductive_indices = np.where(inductive_mask)[0]
-    
-    # Keep only first 3 inductive points (the ones closest to x-axis)
-    if len(inductive_indices) > 3:
-        # Sort inductive indices by frequency (highest frequency first)
-        freq_inductive = freq_exp_sorted[inductive_mask]
-        sorted_inductive_indices = inductive_indices[np.argsort(freq_inductive)[::-1]]
-        
-        # Keep first 3 points, set others to NaN (they won't be plotted)
-        keep_indices = sorted_inductive_indices[:3]
-        remove_indices = sorted_inductive_indices[3:]
-        
-        for idx in remove_indices:
-            re_exp_clipped[idx] = np.nan
-            im_exp_clipped[idx] = np.nan
-    
-    # Plot experimental data with clipped inductive tail
-    ax.plot(re_exp_clipped, im_exp_clipped, 'o-', markersize=4, linewidth=1.5,
+    # Plot experimental data
+    ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=4, linewidth=1.5,
             color='#1f77b4', alpha=0.7, label='Experimental', zorder=1)
     
     # Get peaks sorted by characteristic frequency (high to low)
@@ -3599,25 +3553,15 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
             # Find points with negative -Im(Z) (inductive behavior)
             inductive_mask = im_exp_sorted < 0
             if np.any(inductive_mask):
-                # Get only the first 3 inductive points for annotation
-                inductive_indices = np.where(inductive_mask)[0]
-                freq_inductive = freq_exp_sorted[inductive_mask]
-                sorted_inductive_indices = inductive_indices[np.argsort(freq_inductive)[::-1]]
-                keep_indices = sorted_inductive_indices[:3]
-                
-                if len(keep_indices) > 0:
-                    # Find the most negative point among kept points for annotation
-                    im_kept = im_exp_sorted[keep_indices]
-                    most_negative_local_idx = np.argmin(im_kept)
-                    most_negative_idx = keep_indices[most_negative_local_idx]
-                    
-                    ax.annotate(f'L = {drt_result.L:.3e} H\n(inductive loop)',
-                               xy=(re_exp_sorted[most_negative_idx], im_exp_sorted[most_negative_idx]),
-                               xytext=(re_exp_sorted[most_negative_idx] * 0.95, 
-                                      im_exp_sorted[most_negative_idx] * 1.5),
-                               fontsize=9,
-                               bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
-                               arrowprops=dict(arrowstyle='->', color='gray'))
+                # Find the most negative point for annotation
+                most_negative_idx = np.argmin(im_exp_sorted)
+                ax.annotate(f'L = {drt_result.L:.3e} H\n(inductive loop)',
+                           xy=(re_exp_sorted[most_negative_idx], im_exp_sorted[most_negative_idx]),
+                           xytext=(re_exp_sorted[most_negative_idx] * 0.95, 
+                                  im_exp_sorted[most_negative_idx] * 1.5),
+                           fontsize=9,
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', color='gray'))
     
     # Mark final total resistance
     total_R = drt_result.R_inf + drt_result.R_pol
