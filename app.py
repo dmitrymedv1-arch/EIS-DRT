@@ -3201,7 +3201,7 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     if len(inductive_indices) > 3:
         # Sort inductive indices by frequency (highest frequency first)
         freq_inductive = freq_plot[inductive_mask]
-        sorted_inductive_indices = inductive_indices[np.argsort(freq_induductive)[::-1]]
+        sorted_inductive_indices = inductive_indices[np.argsort(freq_inductive)[::-1]]
         
         # Keep first 3 points, set others to NaN (they won't be plotted)
         keep_indices = sorted_inductive_indices[:3]
@@ -3214,6 +3214,11 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     # Plot spectrum with clipped inductive tail
     ax.plot(re_z_clipped, im_z_clipped, 'o-', markersize=5, linewidth=1.8,
             label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
+    
+    if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
+        ax.plot(data.re_z[highlight_idx], data.im_z[highlight_idx], 'ro', 
+                markersize=12, markeredgecolor='red', markerfacecolor='none', linewidth=2.5,
+                label='Selected Point')
     
     # Find extreme points
     min_freq_idx = np.argmin(freq_plot)
