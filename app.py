@@ -3692,8 +3692,8 @@ def step1_data_loading():
                     st.session_state.freq_range_idx = (f_min_idx, f_max_idx)
                 
                 # Display actual frequency values
-                f_min_actual = data.freq[f_min_idx]
-                f_max_actual = data.freq[f_max_idx]
+                f_min_actual = data.freq[min(f_min_idx, data.n_points - 1)]
+                f_max_actual = data.freq[min(f_max_idx, data.n_points - 1)]
                 st.caption(f"Range: {f_min_actual:.2e} Hz - {f_max_actual:.2e} Hz")
             
             with col_b:
@@ -3710,8 +3710,9 @@ def step1_data_loading():
                 
                 # Display point info
                 if point_idx < data.n_points:
-                    st.caption(f"f = {data.freq[point_idx]:.2e} Hz")
-                    st.caption(f"Z = {data.Z_mod[point_idx]:.2e} Ω")
+                    safe_idx = min(point_idx, data.n_points - 1)
+                    st.caption(f"f = {data.freq[safe_idx]:.2e} Hz")
+                    st.caption(f"Z = {data.Z_mod[safe_idx]:.2e} Ω")
             
             with col_c:
                 st.write("")
@@ -3721,9 +3722,16 @@ def step1_data_loading():
                         data.remove_point(point_idx)
                         # Adjust indices after removal
                         new_max = data.n_points - 1
+                        # Update selected point index
                         st.session_state.selected_point_idx = min(point_idx, new_max)
-                        st.session_state.freq_range_idx = (min(st.session_state.freq_range_idx[0], new_max),
-                                                           min(st.session_state.freq_range_idx[1], new_max))
+                        # Update frequency range indices
+                        current_min_idx, current_max_idx = st.session_state.freq_range_idx
+                        new_min_idx = min(current_min_idx, new_max)
+                        new_max_idx = min(current_max_idx, new_max)
+                        # Ensure min <= max
+                        if new_min_idx > new_max_idx:
+                            new_min_idx = new_max_idx
+                        st.session_state.freq_range_idx = (new_min_idx, new_max_idx)
                         st.success(f"Removed point {point_idx}")
                         st.rerun()
                 
