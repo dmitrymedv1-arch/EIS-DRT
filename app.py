@@ -439,17 +439,6 @@ class GaussianPeak:
             'C_eff': C_eff,
             'f_char': f_char
         }
-    
-    def to_rq_process(self) -> 'RQProcess':
-        """Convert to RQProcess object for modeling"""
-        params = self.get_rq_parameters()
-        return RQProcess(
-            id=self.id,
-            R=params['R'],
-            tau=params['tau'],
-            alpha=params['alpha'],
-            f_char=params['f_char']
-        )
 
 @dataclass
 class RQProcess:
