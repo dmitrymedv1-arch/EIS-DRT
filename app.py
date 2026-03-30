@@ -272,7 +272,6 @@ class DRTResult:
         ratio = integral / self.R_pol if self.R_pol > 0 else 0
         return integral, ratio
 
-
 @dataclass
 class ImpedanceData:
     """Container for impedance data with preprocessing"""
@@ -286,9 +285,15 @@ class ImpedanceData:
     frequency_range: Tuple[float, float] = (None, None)
     
     def __post_init__(self):
+        # Инвертируем знак для -Im(Z) в соответствии с электрохимической конвенцией
+        # В EIS обычно: -Im(Z) положительна для емкостных процессов
+        # Если данные пришли с отрицательным знаком, инвертируем их
         self.original_freq = self.freq.copy()
         self.original_re_z = self.re_z.copy()
-        self.original_im_z = self.im_z.copy()
+        # Инвертируем im_z, чтобы емкостные процессы были сверху (положительные)
+        self.original_im_z = -self.im_z.copy()
+        # Обновляем self.im_z
+        self.im_z = -self.im_z
         self._sort_by_frequency()
     
     def _sort_by_frequency(self):
@@ -532,8 +537,7 @@ def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Opt
             if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
                 freq = df[freq_col].values.astype(float)
                 re_z = df[re_col].values.astype(float)
-                # НЕ используем abs() - сохраняем оригинальный знак!
-                # Для индуктивности -Im(Z) будет отрицательным
+                # Загружаем как есть - инверсия будет в ImpedanceData.__post_init__
                 im_z = df[im_col].values.astype(float)
                 return freq, re_z, im_z
         except Exception as e:
@@ -3179,15 +3183,10 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     """
     fig, ax = plt.subplots(figsize=(9, 8))
     
-    # Use original data (preserving the sign of -Im(Z))
-    if data.original_im_z is not None:
-        re_z_plot = data.original_re_z
-        im_z_plot = data.original_im_z  # Сохраняем знак!
-        freq_plot = data.original_freq
-    else:
-        re_z_plot = data.re_z
-        im_z_plot = data.im_z  # Сохраняем знак!
-        freq_plot = data.freq
+    # Используем текущие данные (уже инвертированы в __post_init__)
+    re_z_plot = data.re_z
+    im_z_plot = data.im_z  # Уже инвертированы, емкостные процессы положительны
+    freq_plot = data.freq
     
     # Plot full spectrum
     ax.plot(re_z_plot, im_z_plot, 'o-', markersize=5, linewidth=1.8,
@@ -3270,7 +3269,6 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
     
     # Add shading for inductive region (below x-axis) - only if there are negative values
-    y_min, y_max = ax.get_ylim()
     if np.any(im_z_plot < 0):
         # Find the actual minimum of the data (not the axis limit)
         data_y_min = np.min(im_z_plot)
@@ -3459,14 +3457,9 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     fig, ax = plt.subplots(figsize=(10, 8))
     
     # Use original data (preserving sign of -Im(Z))
-    if data.original_im_z is not None:
-        re_exp = data.original_re_z
-        im_exp = data.original_im_z  # Positive = capacitive, Negative = inductive
-        freq_exp = data.original_freq
-    else:
-        re_exp = data.re_z
-        im_exp = data.im_z
-        freq_exp = data.freq
+    re_exp = data.re_z
+    im_exp = data.im_z
+    freq_exp = data.freq
     
     # Sort by frequency for consistent ordering
     sort_idx_exp = np.argsort(freq_exp)
