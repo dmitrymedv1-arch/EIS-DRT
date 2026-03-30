@@ -2845,23 +2845,25 @@ class GaussianDeconvolver:
 # ============================================================================
 # Visualization Functions (from both codes)
 # ============================================================================
-
 def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
                            im_rec: Optional[np.ndarray] = None, title: str = "Nyquist Plot",
                            highlight_idx: Optional[int] = None) -> plt.Figure:
     """Create publication-quality Nyquist plot"""
     fig, ax = plt.subplots(figsize=(9, 7))
     
-    ax.plot(data.re_z, data.im_z, 'o-', markersize=5, linewidth=1.8, 
+    # Отражаем относительно оси X для Nyquist plot
+    # Умножаем на -1, чтобы полуокружности были в верхней полуплоскости
+    ax.plot(data.re_z, -data.im_z, 'o-', markersize=5, linewidth=1.8, 
             label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
     
     if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
-        ax.plot(data.re_z[highlight_idx], data.im_z[highlight_idx], 'ro', 
+        ax.plot(data.re_z[highlight_idx], -data.im_z[highlight_idx], 'ro', 
                 markersize=12, markeredgecolor='red', markerfacecolor='none', linewidth=2.5,
                 label='Selected Point')
     
     if re_rec is not None and im_rec is not None:
-        ax.plot(re_rec, im_rec, 's-', markersize=4, linewidth=1.2,
+        # Для реконструированных данных тоже отражаем
+        ax.plot(re_rec, -im_rec, 's-', markersize=4, linewidth=1.2,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=14)
