@@ -349,24 +349,24 @@ class ImpedanceData:
     def detect_inductive_behavior(self) -> bool:
         """
         Automatically detect if the spectrum shows inductive behavior.
-        Inductive behavior is indicated by positive -Im(Z) at high frequencies
-        or increasing trend in -Im(Z) towards high frequencies.
+        Inductive behavior is indicated by NEGATIVE -Im(Z) at high frequencies
+        or decreasing trend in -Im(Z) towards high frequencies.
         
         Returns:
             bool: True if inductive behavior is detected
         """
-        # Check for positive -Im(Z) at high frequencies
+        # Check for negative -Im(Z) at high frequencies (inductive behavior)
         high_freq_mask = self.freq > 0.1 * np.max(self.freq)
         if np.any(high_freq_mask):
-            high_imag = -self.im_z[high_freq_mask]  # -Im(Z)
-            if np.any(high_imag > 0):
+            # Inductive behavior: -Im(Z) is negative (below x-axis)
+            if np.any(self.im_z[high_freq_mask] < 0):
                 return True
         
-        # Check for increasing trend in -Im(Z) at high frequencies
+        # Check for decreasing trend in -Im(Z) at high frequencies (going more negative)
         if len(self.freq) > 10:
             high_idx = np.argsort(self.freq)[-10:]  # Top 10 highest frequencies
-            imag_high = -self.im_z[high_idx]
-            if len(imag_high) > 2 and np.all(np.diff(imag_high) > 0):
+            imag_high = self.im_z[high_idx]
+            if len(imag_high) > 2 and np.all(np.diff(imag_high) < 0):
                 return True
         
         return False
@@ -538,7 +538,9 @@ def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Opt
             if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
                 freq = df[freq_col].values.astype(float)
                 re_z = df[re_col].values.astype(float)
-                im_z = np.abs(df[im_col].values.astype(float))
+                # НЕ используем abs() - сохраняем оригинальный знак!
+                # Для индуктивности -Im(Z) будет отрицательным
+                im_z = df[im_col].values.astype(float)
                 return freq, re_z, im_z
         except Exception as e:
             st.error(f"Error loading file: {e}")
@@ -581,7 +583,9 @@ def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Opt
                     try:
                         freq_val = float(parts[0])
                         re_val = float(parts[1])
-                        im_val = abs(float(parts[2]))
+                        # НЕ используем abs() - сохраняем знак!
+                        # Отрицательное значение = индуктивное поведение
+                        im_val = float(parts[2])
                         rows.append([freq_val, re_val, im_val])
                     except ValueError:
                         st.warning(f"Пропущена некорректная строка: {line}")
@@ -3178,28 +3182,17 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     Plot original Nyquist spectrum with proper sign handling:
     - Capacitive loops appear ABOVE the x-axis (positive -Im(Z))
     - Inductive loops appear BELOW the x-axis (negative -Im(Z))
-    Highlight extreme points and decade frequency points with formatted labels.
-    
-    Args:
-        data: ImpedanceData object (uses original data with proper sign for -Im(Z))
-        title: Plot title
-    
-    Returns:
-        matplotlib Figure object
     """
     fig, ax = plt.subplots(figsize=(9, 8))
     
     # Use original data (preserving the sign of -Im(Z))
-    # Negative values indicate inductive behavior (below x-axis)
-    # Positive values indicate capacitive behavior (above x-axis)
     if data.original_im_z is not None:
         re_z_plot = data.original_re_z
-        im_z_plot = data.original_im_z  # This already has correct sign
+        im_z_plot = data.original_im_z  # Сохраняем знак!
         freq_plot = data.original_freq
     else:
-        # Use current data (might have been cropped but preserve sign)
         re_z_plot = data.re_z
-        im_z_plot = data.im_z
+        im_z_plot = data.im_z  # Сохраняем знак!
         freq_plot = data.freq
     
     # Plot full spectrum
@@ -3236,12 +3229,11 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
         ax.plot(re_z_plot[idx], im_z_plot[idx], 'mo', markersize=8,
                 markeredgecolor='purple', markerfacecolor='magenta', alpha=0.7)
         
-        # Format frequency label: X.Y·10^Z
+        # Format frequency label
         if dec_freq >= 1:
             if dec_freq >= 10:
                 exponent = int(np.floor(np.log10(dec_freq)))
                 mantissa = dec_freq / (10 ** exponent)
-                # Format mantissa to 1 decimal place
                 if abs(mantissa - round(mantissa)) < 0.05:
                     label = f'{int(round(mantissa))}·10^{exponent}'
                 else:
@@ -3259,7 +3251,7 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
             else:
                 label = f'{mantissa:.1f}·10^{exponent}'
         
-        # Offset label position to avoid overlap
+        # Offset label position
         x_range = np.max(re_z_plot) - np.min(re_z_plot)
         y_range = np.max(im_z_plot) - np.min(im_z_plot)
         offset_x = x_range * 0.02
@@ -3283,10 +3275,12 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     # Add horizontal line at y=0 for reference
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
     
-    # Add shading for inductive region (below x-axis)
+    # Add shading for inductive region (below x-axis) - only if there are negative values
     y_min, y_max = ax.get_ylim()
-    if y_min < 0:
-        ax.fill_between([np.min(re_z_plot), np.max(re_z_plot)], y_min, 0,
+    if np.any(im_z_plot < 0):
+        # Find the actual minimum of the data (not the axis limit)
+        data_y_min = np.min(im_z_plot)
+        ax.fill_between([np.min(re_z_plot), np.max(re_z_plot)], data_y_min, 0,
                         alpha=0.1, color='red', label='Inductive region (L)')
     
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12)
@@ -3296,9 +3290,11 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
-    # Ensure inductive region is visible
-    if y_min < 0:
-        ax.set_ylim(y_min * 1.1, y_max * 1.1)
+    # Adjust y-axis to show negative values properly
+    if np.any(im_z_plot < 0):
+        y_min_data = np.min(im_z_plot)
+        y_max_data = np.max(im_z_plot)
+        ax.set_ylim(y_min_data * 1.1, y_max_data * 1.1)
     
     plt.tight_layout()
     return fig
