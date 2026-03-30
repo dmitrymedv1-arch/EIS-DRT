@@ -474,6 +474,7 @@ class AppState:
     # Step 1: Data loading
     impedance_data: Optional[ImpedanceData] = None
     data_loaded: bool = False
+    discarded_points: Optional[np.ndarray] = None
     
     # Step 2: DRT calculation
     drt_result: Optional[DRTResult] = None
@@ -3877,12 +3878,16 @@ def step2_drt_analysis():
                 with st.spinner("Calculating DRT..."):
                     try:
                         # Handle data discarding if needed
+                        discarded_points = None
                         if induct_mode == "Discard Inductive Data":
-                            # Discard points with positive -Im(Z)
-                            mask = -data.im_z > 0  # -Im(Z) > 0 indicates inductive behavior
+                            # Discard points with negative -Im(Z) (inductive behavior)
+                            # После инверсии в __post_init__, индуктивность имеет отрицательные значения
+                            mask = data.im_z < 0  # Отрицательные значения = индуктивность
                             n_discarded = np.sum(mask)
                             if n_discarded > 0:
                                 st.info(f"Discarding {n_discarded} inductive data points")
+                                # Сохраняем маску для последующего использования
+                                discarded_points = mask
                                 # Create temporary data object with discarded points
                                 temp_data = ImpedanceData(
                                     data.freq[~mask],
@@ -3941,6 +3946,8 @@ def step2_drt_analysis():
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_solver = drt_solver
                         st.session_state.app_state.drt_calculated = True
+                        # Store discarded points info for later use
+                        st.session_state.app_state.discarded_points = discarded_points
                         
                         # Display summary
                         st.success("✅ DRT calculation complete!")
@@ -3988,17 +3995,32 @@ def step2_drt_analysis():
                 Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
                 
                 # Calculate reconstruction error
-                Z_original = data.Z
-                Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
-                error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
-                mean_error = np.mean(error_percent)
-                max_error = np.max(error_percent)
+                # Используем данные, которые использовались для реконструкции (temp_data)
+                # Если были отброшены точки, используем их маску
+                if hasattr(st.session_state.app_state, 'discarded_points') and st.session_state.app_state.discarded_points is not None:
+                    # Используем только те точки, которые были в temp_data
+                    Z_original_used = data.Z[~st.session_state.app_state.discarded_points]
+                else:
+                    Z_original_used = data.Z
                 
-                st.info(f"""
-                **Reconstruction Quality:**
-                **Mean Error:** {mean_error:.2f}%
-                **Max Error:** {max_error:.2f}%
-                """)
+                Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
+                
+                # Проверяем совпадение размерностей
+                if len(Z_original_used) == len(Z_reconstructed):
+                    error_percent = np.abs((Z_original_used - Z_reconstructed) / (Z_original_used + 1e-10)) * 100
+                    mean_error = np.mean(error_percent)
+                    max_error = np.max(error_percent)
+                    
+                    st.info(f"""
+                    **Reconstruction Quality:**
+                    **Mean Error:** {mean_error:.2f}%
+                    **Max Error:** {max_error:.2f}%
+                    """)
+                else:
+                    st.warning(f"Cannot calculate reconstruction error: data size mismatch ({len(Z_original_used)} vs {len(Z_reconstructed)})")
+                
+                # Для отображения графиков используем данные, на которых проводилась реконструкция
+                display_data = temp_data if 'temp_data' in locals() else data
                 
                 # Display validation plots
                 st.markdown("---")
@@ -4006,9 +4028,9 @@ def step2_drt_analysis():
                 
                 # Nyquist plot
                 fig_nyq, ax_nyq = plt.subplots(figsize=(8, 6))
-                ax_nyq.plot(data.re_z, data.im_z, 'o', markersize=6, 
-                           label='Experimental', color='#1f77b4', alpha=0.7)
-                ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5, 
+                ax_nyq.plot(display_data.re_z, -display_data.im_z, 'o', markersize=6, 
+                           label='Experimental (used for fitting)', color='#1f77b4', alpha=0.7)
+                ax_nyq.plot(Z_rec_real, -Z_rec_imag, '-', linewidth=2.5, 
                            label='Reconstructed from DRT', color='#ff7f0e')
                 ax_nyq.set_xlabel("Re(Z) / Ohm", fontweight='bold')
                 ax_nyq.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
@@ -4023,11 +4045,11 @@ def step2_drt_analysis():
                 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
                 
                 # Magnitude plot
-                mag_exp = data.Z_mod
+                mag_exp = np.sqrt(display_data.re_z**2 + display_data.im_z**2)
                 mag_rec = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
-                ax1.loglog(data.freq, mag_exp, 'o', markersize=6, 
-                          label='Experimental', color='#1f77b4', alpha=0.7)
-                ax1.loglog(data.freq, mag_rec, '-', linewidth=2.5, 
+                ax1.loglog(display_data.freq, mag_exp, 'o', markersize=6, 
+                          label='Experimental (used for fitting)', color='#1f77b4', alpha=0.7)
+                ax1.loglog(display_data.freq, mag_rec, '-', linewidth=2.5, 
                           label='Reconstructed', color='#ff7f0e')
                 ax1.set_xlabel("Frequency / Hz", fontweight='bold')
                 ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
@@ -4035,11 +4057,11 @@ def step2_drt_analysis():
                 ax1.grid(True, alpha=0.3, linestyle='--')
                 
                 # Phase plot
-                phase_exp = data.phase
+                phase_exp = np.arctan2(display_data.im_z, display_data.re_z) * 180 / np.pi
                 phase_rec = np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
-                ax2.semilogx(data.freq, phase_exp, 'o', markersize=6, 
-                            label='Experimental', color='#1f77b4', alpha=0.7)
-                ax2.semilogx(data.freq, phase_rec, '-', linewidth=2.5, 
+                ax2.semilogx(display_data.freq, phase_exp, 'o', markersize=6, 
+                            label='Experimental (used for fitting)', color='#1f77b4', alpha=0.7)
+                ax2.semilogx(display_data.freq, phase_rec, '-', linewidth=2.5, 
                             label='Reconstructed', color='#ff7f0e')
                 ax2.set_xlabel("Frequency / Hz", fontweight='bold')
                 ax2.set_ylabel("Phase / deg", fontweight='bold')
@@ -4052,19 +4074,36 @@ def step2_drt_analysis():
                 st.pyplot(fig)
                 plt.close()
                 
-                # Error plot
-                fig_err, ax_err = plt.subplots(figsize=(8, 5))
-                ax_err.semilogx(data.freq, error_percent, 'o-', markersize=5, 
-                               linewidth=1.5, color='#d62728')
-                ax_err.set_xlabel("Frequency / Hz", fontweight='bold')
-                ax_err.set_ylabel("Relative Error / %", fontweight='bold')
-                ax_err.set_title("Reconstruction Error vs Frequency", fontweight='bold')
-                ax_err.grid(True, alpha=0.3, linestyle='--')
-                ax_err.axhline(y=mean_error, color='gray', linestyle='--', 
-                              label=f'Mean Error: {mean_error:.2f}%')
-                ax_err.legend()
-                st.pyplot(fig_err)
-                plt.close()
+                # Если были отброшены точки, покажем дополнительную информацию
+                if hasattr(st.session_state.app_state, 'discarded_points') and st.session_state.app_state.discarded_points is not None:
+                    n_discarded = np.sum(st.session_state.app_state.discarded_points)
+                    if n_discarded > 0:
+                        st.info(f"ℹ️ {n_discarded} inductive data points were excluded from DRT fitting")
+                        
+                        # Отобразим отброшенные точки на отдельном графике
+                        fig_disc, ax_disc = plt.subplots(figsize=(8, 6))
+                        # Используем оригинальные данные
+                        ax_disc.plot(data.re_z, -data.im_z, 'o-', markersize=4, linewidth=1,
+                                   label='All data', color='gray', alpha=0.5)
+                        # Отброшенные точки
+                        discarded_re = data.re_z[st.session_state.app_state.discarded_points]
+                        discarded_im = data.im_z[st.session_state.app_state.discarded_points]
+                        ax_disc.plot(discarded_re, -discarded_im, 'rx', markersize=8, 
+                                   label=f'Discarded ({n_discarded} points)', linewidth=0)
+                        # Использованные точки
+                        used_re = data.re_z[~st.session_state.app_state.discarded_points]
+                        used_im = data.im_z[~st.session_state.app_state.discarded_points]
+                        ax_disc.plot(used_re, -used_im, 'bo', markersize=6, 
+                                   label=f'Used for DRT ({len(used_re)} points)', alpha=0.7)
+                        
+                        ax_disc.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+                        ax_disc.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
+                        ax_disc.set_title("Data Points Used for DRT Analysis", fontweight='bold')
+                        ax_disc.legend(loc='best')
+                        ax_disc.grid(True, alpha=0.3, linestyle='--')
+                        ax_disc.set_aspect('equal', adjustable='box')
+                        st.pyplot(fig_disc)
+                        plt.close()
                 
                 # If inductance was fitted, show its contribution
                 if result.L > 0:
