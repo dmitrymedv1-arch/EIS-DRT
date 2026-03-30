@@ -385,6 +385,12 @@ class GaussianPeak:
     fraction_percent: float  # Percentage fraction (0-100)
     source: str = 'auto'  # Source: 'auto', 'manual', 'residuals'
     y_norm: np.ndarray = None  # Normalized y values for plotting
+    alpha: float = 0.85   # CPE exponent (default 0.85 for typical electrodes)
+    
+    def __post_init__(self):
+        """Auto-calculate alpha from FWHM if not manually set"""
+        if self.alpha == 0.85:  # Default placeholder
+            self.alpha = calculate_alpha_from_fwhm(self.fwhm)
     
     def get_characteristic_frequency(self) -> float:
         """
@@ -405,7 +411,255 @@ class GaussianPeak:
             float: Resistance contribution in Ω
         """
         return self.area
+    
+    def get_rq_parameters(self) -> Dict[str, float]:
+        """
+        Get RQ element parameters.
+        
+        Returns:
+            Dictionary with 'R', 'tau', 'alpha', 'Q', 'C_eff', 'f_char'
+        """
+        # R = area (resistance contribution)
+        R = self.area
+        tau = self.center
+        alpha = self.alpha
+        f_char = self.get_characteristic_frequency()
+        
+        # Q = τ^α / R
+        Q = (tau ** alpha) / R if R > 0 else 0
+        
+        # Effective capacitance C_eff = τ / R
+        C_eff = tau / R if R > 0 else 0
+        
+        return {
+            'R': R,
+            'tau': tau,
+            'alpha': alpha,
+            'Q': Q,
+            'C_eff': C_eff,
+            'f_char': f_char
+        }
+    
+    def to_rq_process(self) -> 'RQProcess':
+        """Convert to RQProcess object for modeling"""
+        params = self.get_rq_parameters()
+        return RQProcess(
+            id=self.id,
+            R=params['R'],
+            tau=params['tau'],
+            alpha=params['alpha'],
+            f_char=params['f_char']
+        )
 
+@dataclass
+class RQProcess:
+    """Container for RQ process parameters (CPE-based process)"""
+    id: int
+    R: float                    # Resistance contribution (Ω) = area under peak
+    tau: float                  # Characteristic time constant (s)
+    alpha: float                # CPE exponent (0 < α ≤ 1)
+    f_char: float               # Characteristic frequency (Hz)
+    
+    @property
+    def Q(self) -> float:
+        """CPE parameter Q (F·s^(α-1) or F·s^α depending on convention)
+        τ = (R·Q)^(1/α) => Q = τ^α / R
+        """
+        return (self.tau ** self.alpha) / self.R if self.R > 0 else 0
+    
+    @property
+    def effective_capacitance(self) -> float:
+        """Effective capacitance for RQ element
+        C_eff = Q^(1/α) * R^(1/α - 1) = τ / R
+        Note: For α=1, this equals C = τ/R
+        """
+        return self.tau / self.R if self.R > 0 else 0
+    
+    def impedance(self, omega: np.ndarray) -> np.ndarray:
+        """Calculate impedance of RQ element at given angular frequencies
+        Z_RQ = R / (1 + (iωτ)^α)
+        """
+        return self.R / (1 + (1j * omega * self.tau) ** self.alpha)
+    
+    def get_center_coordinates(self) -> Tuple[float, float]:
+        """Get center coordinates of Nyquist semicircle
+        For RQ element: center is below x-axis
+        x_center = R/2
+        y_center = -R/(2·tan(π·α/2))
+        radius = R/(2·sin(π·α/2))
+        """
+        x_center = self.R / 2
+        if self.alpha == 1.0:
+            y_center = 0.0
+            radius = self.R / 2
+        else:
+            angle_rad = np.pi * self.alpha / 2
+            y_center = -self.R / (2 * np.tan(angle_rad))
+            radius = self.R / (2 * np.sin(angle_rad))
+        return x_center, y_center, radius
+    
+    def get_points_on_semicircle(self, n_points: int = 100) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate points on the RQ semicircle for plotting
+        Returns x (Re) and y (-Im) coordinates
+        """
+        x_center, y_center, radius = self.get_center_coordinates()
+        
+        # Angle range: from 0 to π (full semicircle)
+        # For RQ, the angle is not exactly π, but we use π for visualization
+        theta = np.linspace(0, np.pi, n_points)
+        
+        # Parametric equation for circle
+        x = x_center + radius * np.cos(theta)
+        y = y_center + radius * np.sin(theta)
+        
+        # Ensure y is negative (below x-axis) for RQ with α < 1
+        # y should be negative for all points (center below axis)
+        return x, -np.abs(y)  # -Im(Z) should be positive for capacitive loops
+
+def find_high_frequency_start_point(data: ImpedanceData) -> Tuple[float, int]:
+    """
+    Find the high-frequency starting point for sequential RC/RQ model.
+    For spectra with inductive behavior, this is the point where inductive loop ends
+    and capacitive behavior begins (where -Im(Z) becomes non-negative).
+    
+    Args:
+        data: ImpedanceData object with original data
+    
+    Returns:
+        Tuple of (starting_re_z, start_index)
+    """
+    # Use original data with proper sign for -Im(Z)
+    if data.original_im_z is not None:
+        re_z = data.original_re_z
+        im_z = data.original_im_z
+        freq = data.original_freq
+    else:
+        re_z = data.re_z
+        im_z = data.im_z
+        freq = data.freq
+    
+    # Sort by frequency descending (high to low)
+    sort_idx = np.argsort(freq)[::-1]
+    re_z_sorted = re_z[sort_idx]
+    im_z_sorted = im_z[sort_idx]
+    
+    # Find indices where -Im(Z) is negative (inductive region)
+    negative_mask = im_z_sorted < 0
+    
+    if not np.any(negative_mask):
+        # No inductive behavior - start from highest frequency point
+        start_idx = 0
+        start_re = re_z_sorted[0]
+        return start_re, start_idx
+    
+    # Find the last negative point (transition to non-negative)
+    # Search from high frequency to low
+    transition_idx = None
+    for i in range(len(im_z_sorted)):
+        if im_z_sorted[i] >= 0:
+            transition_idx = i
+            break
+    
+    if transition_idx is None:
+        # All points are negative - use point with minimum -Im(Z) (most negative)
+        min_im_idx = np.argmin(im_z_sorted)
+        start_idx = min_im_idx
+        start_re = re_z_sorted[start_idx]
+    else:
+        # Transition found - use the first non-negative point
+        start_idx = transition_idx
+        start_re = re_z_sorted[start_idx]
+    
+    # Return to original (unsorted) indices if needed
+    return start_re, sort_idx[start_idx]
+
+
+def get_high_frequency_r_inf(data: ImpedanceData) -> float:
+    """
+    Get the high-frequency resistance (R∞) that should be used for model plotting.
+    For spectra with inductance, this is the Re(Z) at the start of capacitive region.
+    For spectra without inductance, this is the standard R∞.
+    
+    Args:
+        data: ImpedanceData object
+    
+    Returns:
+        R∞ value for model starting point
+    """
+    start_re, _ = find_high_frequency_start_point(data)
+    return start_re
+
+def calculate_alpha_from_fwhm(fwhm: float, method: str = 'empirical') -> float:
+    """
+    Calculate CPE exponent α from FWHM (Full Width at Half Maximum) in log10 space.
+    
+    Empirical relationships:
+    - For ideal RC (α=1): FWHM ≈ 2.5 decades
+    - For α=0.8: FWHM ≈ 3.0 decades
+    - For α=0.6: FWHM ≈ 3.5 decades
+    - For α=0.4: FWHM ≈ 4.0 decades
+    
+    Args:
+        fwhm: Full Width at Half Maximum in log10 space (decades)
+        method: 'empirical' or 'gaussian'
+    
+    Returns:
+        α value between 0.3 and 1.0
+    """
+    if method == 'gaussian':
+        # For a Gaussian peak, FWHM = 2.3548 * σ
+        # Relationship: wider peak = lower α
+        # Empirical: α = 1 / (1 + (FWHM - 2.5)/2.0)
+        pass
+    
+    # Empirical relationship (default)
+    # α decreases as FWHM increases from 2.5 decades
+    if fwhm <= 2.5:
+        alpha = 1.0
+    else:
+        # α = 1 / (1 + (FWHM - 2.5) / 2.5)
+        # This gives: FWHM=2.5→α=1.0, FWHM=3.0→α=0.83, FWHM=3.5→α=0.71, FWHM=4.0→α=0.62
+        alpha = 1.0 / (1.0 + (fwhm - 2.5) / 2.5)
+    
+    # Clamp to reasonable range (0.3 to 1.0)
+    alpha = max(0.3, min(1.0, alpha))
+    return alpha
+
+
+def estimate_alpha_from_phase_angle(freq: np.ndarray, phase: np.ndarray, 
+                                     f_char: float, window_half: float = 0.5) -> float:
+    """
+    Estimate α from phase angle at characteristic frequency.
+    For RQ element: φ = α·90° at f = f_char
+    
+    Args:
+        freq: Frequency array
+        phase: Phase angle array (in degrees)
+        f_char: Characteristic frequency of the peak
+        window_half: Half-width of frequency window in decades
+    
+    Returns:
+        Estimated α value
+    """
+    # Find indices around characteristic frequency
+    log_f = np.log10(freq)
+    log_f_char = np.log10(f_char)
+    
+    # Get indices within ±window_half decades
+    mask = (log_f >= log_f_char - window_half) & (log_f <= log_f_char + window_half)
+    
+    if np.sum(mask) == 0:
+        return 0.8  # Default value
+    
+    # Average phase angle in this region
+    avg_phase = np.mean(np.abs(phase[mask]))
+    
+    # α = φ / 90°
+    alpha = avg_phase / 90.0
+    
+    # Clamp to reasonable range
+    alpha = max(0.3, min(1.0, alpha))
+    return alpha
 
 @dataclass
 class DeconvolutionResult:
@@ -2677,6 +2931,16 @@ class GaussianDeconvolver:
             cen = peak_params[3*i + 1]
             sigma = abs(peak_params[3*i + 2])
             
+            # Calculate FWHM for alpha estimation
+            fwhm = GaussianModel.calculate_fwhm(sigma)
+            
+            # Calculate alpha from FWHM
+            alpha = calculate_alpha_from_fwhm(fwhm)
+            
+            # Try to refine alpha using phase angle if data available
+            # This is optional and requires original EIS data
+            # For now, use FWHM-based alpha
+            
             amp = amp_norm * self.y_max
             area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
             
@@ -2695,11 +2959,12 @@ class GaussianDeconvolver:
                 'cen_log': cen,
                 'cen_linear': cen_linear,
                 'sigma_log': sigma,
-                'fwhm': GaussianModel.calculate_fwhm(sigma),
+                'fwhm': fwhm,
                 'area': area,
                 'fraction': 0,
                 'y_norm': component_y_norm,
-                'source': 'auto'
+                'source': 'auto',
+                'alpha': alpha  # NEW: store alpha
             })
         
         # Calculate fractions
@@ -3385,7 +3650,7 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
                                               title: str = "Peak Area Distribution") -> plt.Figure:
     """
     Plot bar chart with peak areas (absolute values) and percentages in parentheses.
-    Legend shows total DRT resistance (Rpol).
+    Shows both resistance contribution and CPE exponent α.
     
     Args:
         deconv_result: DeconvolutionResult from Gaussian deconvolution
@@ -3395,25 +3660,34 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
     Returns:
         matplotlib Figure object
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(12, 6))
     
     if not deconv_result.peaks:
         ax.text(0.5, 0.5, "No peaks to display", ha='center', va='center', fontsize=14)
         return fig
     
+    # Prepare data
     peaks_ids = [f'Process {p.id}' for p in deconv_result.peaks]
     areas = [p.area for p in deconv_result.peaks]
     fractions_percent = [p.fraction_percent for p in deconv_result.peaks]
+    alphas = [p.alpha for p in deconv_result.peaks]
+    
+    # Get RQ parameters
+    rq_params = [p.get_rq_parameters() for p in deconv_result.peaks]
+    q_values = [params['Q'] for params in rq_params]
+    c_eff_values = [params['C_eff'] for params in rq_params]
+    
     colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
     
+    # Create bar chart
     bars = ax.bar(peaks_ids, areas, color=colors, edgecolor='black', alpha=0.7)
     
-    # Add labels with absolute value and percentage
-    for bar, area, frac in zip(bars, areas, fractions_percent):
+    # Add labels with absolute value, percentage, and α
+    for bar, area, frac, alpha in zip(bars, areas, fractions_percent, alphas):
         height = bar.get_height()
-        label = f'{area:.3e} Ω\n({frac:.1f}%)'
+        label = f'{area:.3e} Ω\n({frac:.1f}%)\nα={alpha:.3f}'
         ax.text(bar.get_x() + bar.get_width()/2., height,
-                label, ha='center', va='bottom', fontsize=9, fontweight='bold')
+                label, ha='center', va='bottom', fontsize=8, fontweight='bold')
     
     # Get total resistance
     if drt_result is not None:
@@ -3436,6 +3710,14 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
     # Format y-axis with scientific notation
     ax.ticklabel_format(style='scientific', axis='y', scilimits=(-2, 2))
     
+    # Add second y-axis for α values (optional)
+    ax2 = ax.twinx()
+    ax2.plot(peaks_ids, alphas, 'o-', color='darkorange', linewidth=2, markersize=8, label='α (CPE exponent)')
+    ax2.set_ylabel('α (CPE exponent)', fontweight='bold', fontsize=11, color='darkorange')
+    ax2.tick_params(axis='y', labelcolor='darkorange')
+    ax2.set_ylim(0, 1.05)
+    ax2.grid(False)
+    
     plt.tight_layout()
     return fig
 
@@ -3444,12 +3726,12 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                               data: ImpedanceData,
                               title: str = "Experimental vs Sequential RC Model") -> plt.Figure:
     """
-    Plot experimental impedance spectrum with sequential RC model.
-    Each Gaussian peak corresponds to one RC element.
-    Elements are connected in series: R∞ → RC₁ → RC₂ → ... → RCₙ
-    Inductance L is added in series before R∞ if present.
+    Plot experimental impedance spectrum with sequential RQ model.
+    Each Gaussian peak corresponds to one RQ element (CPE-based).
+    Elements are connected in series: R_start → RQ₁ → RQ₂ → ... → RQₙ
     
     IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
+    For RQ elements with α < 1, semicircles have centers below the x-axis.
     
     Args:
         deconv_result: DeconvolutionResult from Gaussian deconvolution
@@ -3487,43 +3769,51 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                           key=lambda p: p.get_characteristic_frequency(), 
                           reverse=True)
     
-    # Calculate RC model
-    # Sequential RC model: Z = R∞ + iωL + Σ [R_i / (1 + iωτ_i)]
+    # Find high-frequency start point (not necessarily R∞ for inductive spectra)
+    start_R = get_high_frequency_r_inf(data)
+    
+    # Mark starting point on plot
+    ax.plot(start_R, 0, '^', color='darkred', markersize=12,
+           markeredgecolor='black', markeredgewidth=1, 
+           label=f'Starting Point: Re(Z) = {start_R:.4f} Ω')
+    
+    # Calculate RQ model
     omega = 2 * np.pi * freq_exp_sorted
     
-    # Start with R∞ and inductance
+    # Start with the high-frequency starting resistance
     Z_total = np.zeros_like(omega, dtype=complex)
-    Z_total += drt_result.R_inf  # R∞
+    Z_total += start_R
     
-    # Inductance contribution: Z_L = iωL
-    # This adds to -Im(Z): -Im(Z_L) = -ωL (negative for inductive behavior)
-    if drt_result.L > 0:
-        Z_total += 1j * omega * drt_result.L
-        # This will appear BELOW the x-axis because -Im(Z) = -ωL is negative
+    # Store cumulative resistance for plotting individual RQ elements
+    cumulative_R = start_R
+    rq_curves = []
     
-    # Store cumulative resistance for plotting individual RC elements
-    cumulative_R = drt_result.R_inf
-    rc_curves = []
-    
-    # Add each RC element
+    # Convert each Gaussian peak to RQ process and add
     for i, peak in enumerate(peaks_sorted):
-        R_i = peak.area
-        tau_i = peak.center
-        # RC element: Z_i = R_i / (1 + iωτ_i)
-        Z_i = R_i / (1 + 1j * omega * tau_i)
+        # Get RQ parameters
+        rq_params = peak.get_rq_parameters()
+        R_i = rq_params['R']
+        tau_i = rq_params['tau']
+        alpha_i = rq_params['alpha']
+        
+        # RQ element: Z_i = R_i / (1 + (iωτ)^α)
+        Z_i = R_i / (1 + (1j * omega * tau_i) ** alpha_i)
         Z_total += Z_i
         
         # Store for individual curve plotting
         cumulative_R_prev = cumulative_R
         cumulative_R += R_i
         
-        # The individual RC element contribution as a separate curve
+        # The individual RQ element contribution as a separate curve
         Z_individual = cumulative_R_prev + Z_i
-        rc_curves.append({
+        rq_curves.append({
             'id': peak.id,
             'R': R_i,
             'tau': tau_i,
+            'alpha': alpha_i,
             'f_char': peak.get_characteristic_frequency(),
+            'Q': rq_params['Q'],
+            'C_eff': rq_params['C_eff'],
             'Z': Z_individual,
             'start_R': cumulative_R_prev,
             'end_R': cumulative_R
@@ -3531,19 +3821,34 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     
     # Calculate total model impedance (real and -imag)
     re_model = np.real(Z_total)
-    im_model = -np.imag(Z_total)  # -Im(Z) for plotting (positive = capacitive, negative = inductive)
+    im_model = -np.imag(Z_total)  # -Im(Z) for plotting (positive = capacitive)
     
     # Plot total model
     ax.plot(re_model, im_model, 'r--', linewidth=2.5,
-            label='Total Model', zorder=3)
+            label='Total Model (RQ)', zorder=3)
     
-    # Plot individual RC element curves (sequential semicircles)
-    colors = plt.cm.Set3(np.linspace(0, 1, len(rc_curves)))
-    for curve, color in zip(rc_curves, colors):
-        re_curve = np.real(curve['Z'])
-        im_curve = -np.imag(curve['Z'])  # -Im(Z) for plotting
-        ax.plot(re_curve, im_curve, '-', linewidth=2, color=color,
-               label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω, f={curve["f_char"]:.2e} Hz',
+    # Plot individual RQ element curves (semicircles with centers below x-axis)
+    colors = plt.cm.Set3(np.linspace(0, 1, len(rq_curves)))
+    
+    for curve, color in zip(rq_curves, colors):
+        # Generate points on the RQ semicircle
+        rq_process = RQProcess(
+            id=curve['id'],
+            R=curve['R'],
+            tau=curve['tau'],
+            alpha=curve['alpha'],
+            f_char=curve['f_char']
+        )
+        
+        # Get semicircle points
+        x_circle, y_circle = rq_process.get_points_on_semicircle(n_points=200)
+        
+        # Shift to correct position in series (add cumulative resistance before this element)
+        x_circle_shifted = x_circle + curve['start_R']
+        
+        # Plot the semicircle
+        ax.plot(x_circle_shifted, y_circle, '-', linewidth=2.5, color=color,
+               label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω, α={curve["alpha"]:.3f}, f={curve["f_char"]:.2e} Hz',
                zorder=2)
         
         # Mark start and end points of each semicircle
@@ -3551,13 +3856,23 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                markeredgecolor='black', markeredgewidth=0.5)
         ax.plot(curve['end_R'], 0, 'o', color=color, markersize=6,
                markeredgecolor='black', markeredgewidth=0.5)
+        
+        # Mark the center of the semicircle (below x-axis)
+        if curve['alpha'] < 1.0:
+            x_center, y_center, radius = rq_process.get_center_coordinates()
+            x_center_shifted = x_center + curve['start_R']
+            ax.plot(x_center_shifted, y_center, 'x', color=color, markersize=8,
+                   markeredgecolor=color, linewidth=1.5,
+                   label=f'Center {curve["id"]}: y={y_center:.3e}')
     
-    # Mark R∞ point
-    ax.plot(drt_result.R_inf, 0, '^', color='red', markersize=10,
-           markeredgecolor='black', markeredgewidth=1, label=f'R∞ = {drt_result.R_inf:.4f} Ω')
+    # Mark total resistance at low frequency
+    total_R = cumulative_R
+    ax.plot(total_R, 0, 'd', color='darkgreen', markersize=10,
+           markeredgecolor='black', markeredgewidth=1, 
+           label=f'Total R = {total_R:.4f} Ω')
     
     # Add inductance annotation if present
-    if drt_result.L > 0:
+    if drt_result is not None and drt_result.L > 0:
         # Find high frequency region for inductance annotation
         high_freq_mask = freq_exp_sorted > 0.1 * np.max(freq_exp_sorted)
         if np.any(high_freq_mask):
@@ -3574,11 +3889,6 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                            bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
                            arrowprops=dict(arrowstyle='->', color='gray'))
     
-    # Mark final total resistance
-    total_R = drt_result.R_inf + drt_result.R_pol
-    ax.plot(total_R, 0, 'd', color='darkred', markersize=10,
-           markeredgecolor='black', markeredgewidth=1, label=f'Total R = {total_R:.4f} Ω')
-    
     # Add horizontal line at y=0 for reference
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
     
@@ -3591,7 +3901,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12)
     ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=12)
     ax.set_title(title, fontweight='bold', fontsize=14)
-    ax.legend(loc='best', fontsize=8, frameon=True, edgecolor='black', ncol=1)
+    ax.legend(loc='best', fontsize=7, frameon=True, edgecolor='black', ncol=1)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
@@ -4594,12 +4904,16 @@ def step4_results():
         data_rows = []
         for peak in deconv_result.peaks:
             char = calculate_peak_characteristics(peak)
+            rq_params = peak.get_rq_parameters()
             data_rows.append({
                 'Peak ID': peak.id,
                 'Center (τ, s)': f"{peak.center:.4e}",
                 'Center (log τ)': f"{peak.center_log:.4f}",
                 'Fmax (Hz)': f"{char['fmax_hz']:.4e}",
                 'C (F)': f"{char['c_farad']:.4e}",
+                'α (CPE)': f"{rq_params['alpha']:.4f}",                    # NEW
+                'Q (F·s^(α-1))': f"{rq_params['Q']:.4e}",                  # NEW
+                'C_eff (F)': f"{rq_params['C_eff']:.4e}",                  # NEW
                 'Amplitude (Ω)': f"{peak.amplitude:.4e}",
                 'Amplitude (norm)': f"{peak.amplitude_norm:.4f}",
                 'Sigma (log)': f"{peak.sigma_log:.4f}",
@@ -4846,12 +5160,16 @@ def step4_results():
             peaks_data = []
             for p in deconv_result.peaks:
                 char = calculate_peak_characteristics(p)
+                rq_params = p.get_rq_parameters()
                 peaks_data.append({
                     'Peak_ID': p.id,
                     'Center_tau_s': p.center,
                     'Center_log_tau': p.center_log,
                     'Fmax_Hz': char['fmax_hz'],
                     'C_Farad': char['c_farad'],
+                    'Alpha_CPE': rq_params['alpha'],           # NEW: CPE exponent
+                    'Q_CPE_F_s^(alpha-1)': rq_params['Q'],     # NEW: CPE parameter Q
+                    'C_eff_Farad': rq_params['C_eff'],         # NEW: Effective capacitance
                     'Amplitude_Ohm': p.amplitude,
                     'Amplitude_Normalized': p.amplitude_norm,
                     'Sigma_log': p.sigma_log,
