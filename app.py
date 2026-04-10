@@ -241,11 +241,6 @@ class DRTResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     @property
-    def R_total(self) -> float:
-        """Total resistance at low frequency limit (f -> 0)"""
-        return self.R_inf + self.R_pol
-    
-    @property
     def log_tau(self) -> np.ndarray:
         """Log10 of relaxation times"""
         return np.log10(self.tau_grid)
@@ -694,16 +689,13 @@ class DRTCore:
         # Robust estimation of ohmic resistance
         self.R_inf = self._estimate_R_inf_robust()
         
-        # Total resistance at low frequency limit (f -> 0)
+        # Total polarization resistance (difference between low and high frequency real parts)
         low_freq_idx = np.where(self.frequencies < 0.1 * np.max(self.frequencies))[0]
         if len(low_freq_idx) > 3:
-            self.R_total = np.mean(self.Z_real[low_freq_idx[:5]])
+            R_total = np.mean(self.Z_real[low_freq_idx[:5]])
         else:
-            self.R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
-        
-        # Polarization resistance will be set later from DRT integral
-        # Initialize with placeholder, will be updated after DRT calculation
-        self.R_pol = 1.0  # Temporary value
+            R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
+        self.R_pol = R_total - self.R_inf if R_total > self.R_inf else 1.0
     
     def _estimate_R_inf_robust(self) -> float:
         """
@@ -1001,16 +993,14 @@ class TikhonovDRT(DRTCore):
         
         # Пересчитываем интеграл с corrected gamma
         drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-
-        true_R_pol = drt_integral_corrected
         
         return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma_corrected,
-            gamma_std=gamma_std * np.log(10),
+            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
-            R_pol=true_R_pol,  # Use integral from DRT
+            R_pol=self.R_pol,
             L=0.0,
             lambda_opt=lambda_opt,
             metadata={
@@ -1018,9 +1008,7 @@ class TikhonovDRT(DRTCore):
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
                 'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / true_R_pol,
-                'R_total': self.R_total,
-                'R_total_from_sum': self.R_inf + true_R_pol  # Verify
+                'integral_ratio': drt_integral_corrected / self.R_pol
             }
         )
     
@@ -1126,15 +1114,13 @@ class TikhonovDRT(DRTCore):
         # Recalculate integral with corrected gamma
         drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
         
-        true_R_pol = drt_integral_corrected
-        
         return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma_corrected,
             gamma_std=gamma_std * np.log(10),
             method="Tikhonov Regularization with Inductance",
             R_inf=self.R_inf,
-            R_pol=true_R_pol,  # Use integral from DRT
+            R_pol=self.R_pol,
             L=L_value,
             lambda_opt=lambda_opt,
             metadata={
@@ -1142,10 +1128,8 @@ class TikhonovDRT(DRTCore):
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
                 'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / true_R_pol,
-                'inductance': L_value,
-                'R_total': self.R_total,
-                'R_total_from_sum': self.R_inf + true_R_pol  # Verify
+                'integral_ratio': drt_integral_corrected / self.R_pol,
+                'inductance': L_value
             }
         )
     
@@ -1264,22 +1248,19 @@ class MaxEntropyDRT(DRTCore):
         print(f"MaxEntropy DRT - Integral (after correction): {drt_integral_corrected:.6f} Ω")
         print(f"MaxEntropy DRT - Ratio (after correction): {drt_integral_corrected/self.R_pol:.4f}")
         
-        true_R_pol = drt_integral_corrected
-        
         return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma_corrected,
-            gamma_std=gamma_std * np.log(10),
+            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
             method="Maximum Entropy",
             R_inf=self.R_inf,
-            R_pol=true_R_pol,  # Use integral from DRT
+            R_pol=self.R_pol,
             L=0.0,
             lambda_opt=lambda_opt,
             metadata={
                 'lambda': lambda_opt,
                 'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / true_R_pol,
-                'R_total': self.R_total
+                'integral_ratio': drt_integral_corrected / self.R_pol
             }
         )
     
