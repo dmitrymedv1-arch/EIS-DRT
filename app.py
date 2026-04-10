@@ -5024,125 +5024,131 @@ def step2_drt_analysis():
             
             # Reconstruct impedance from DRT for validation
             if solver is not None:
-                # Check if solver is RQDRTCore for proper reconstruction
-                if isinstance(solver, RQDRTCore):
-                    n_val = result.metadata.get('cpe_n', 0.85)
-                    Z_rec_real, Z_rec_imag = solver.reconstruct_impedance_rq(result.tau_grid, result.gamma, n_val, result.L)
-                else:
-                    Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
-                
-                # Calculate reconstruction error
-                Z_original = data.Z
-                Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
-                error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
-                mean_error = np.mean(error_percent)
-                max_error = np.max(error_percent)
-                
-                st.info(f"""
-                **Reconstruction Quality:**
-                **Mean Error:** {mean_error:.2f}%
-                **Max Error:** {max_error:.2f}%
-                """)
-                
-                # Display validation plots
-                st.markdown("---")
-                st.subheader("🔍 Validation: Original vs Reconstructed Impedance")
-                
-                # Nyquist plot
-                fig_nyq, ax_nyq = plt.subplots(figsize=(8, 6))
-                # Make axis tick labels black
-                ax_nyq.tick_params(axis='both', colors='black')
-                ax_nyq.xaxis.label.set_color('black')
-                ax_nyq.yaxis.label.set_color('black')
-                ax_nyq.plot(data.re_z, data.im_z, 'o', markersize=6, 
-                           label='Experimental', color='#1f77b4', alpha=0.7)
-                ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5, 
-                           label='Reconstructed from DRT', color='#ff7f0e')
-                ax_nyq.set_xlabel("Re(Z) / Ohm", fontweight='bold')
-                ax_nyq.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
-                # No title - removed as requested
-                ax_nyq.legend(loc='best', frameon=True)
-                ax_nyq.grid(True, alpha=0.3, linestyle='--')
-                ax_nyq.set_aspect('equal', adjustable='box')
-                st.pyplot(fig_nyq)
-                plt.close()
-                
-                # Bode plots
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
-                # Make axis tick labels black
-                ax1.tick_params(axis='both', colors='black')
-                ax2.tick_params(axis='both', colors='black')
-                ax1.xaxis.label.set_color('black')
-                ax1.yaxis.label.set_color('black')
-                ax2.xaxis.label.set_color('black')
-                ax2.yaxis.label.set_color('black')
-                
-                # Magnitude plot
-                mag_exp = data.Z_mod
-                mag_rec = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
-                ax1.loglog(data.freq, mag_exp, 'o', markersize=6, 
-                          label='Experimental', color='#1f77b4', alpha=0.7)
-                ax1.loglog(data.freq, mag_rec, '-', linewidth=2.5, 
-                          label='Reconstructed', color='#ff7f0e')
-                ax1.set_xlabel("Frequency / Hz", fontweight='bold')
-                ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
-                ax1.legend(loc='best')
-                ax1.grid(True, alpha=0.3, linestyle='--')
-                
-                # Phase plot
-                phase_exp = data.phase
-                phase_rec = np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
-                ax2.semilogx(data.freq, phase_exp, 'o', markersize=6, 
-                            label='Experimental', color='#1f77b4', alpha=0.7)
-                ax2.semilogx(data.freq, phase_rec, '-', linewidth=2.5, 
-                            label='Reconstructed', color='#ff7f0e')
-                ax2.set_xlabel("Frequency / Hz", fontweight='bold')
-                ax2.set_ylabel("Phase / deg", fontweight='bold')
-                ax2.legend(loc='best')
-                ax2.grid(True, alpha=0.3, linestyle='--')
-                ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
-                
-                # No overall figure title - removed as requested
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
-                
-                # Error plot
-                fig_err, ax_err = plt.subplots(figsize=(8, 5))
-                ax_err.tick_params(axis='both', colors='black')
-                ax_err.xaxis.label.set_color('black')
-                ax_err.yaxis.label.set_color('black')
-                ax_err.semilogx(data.freq, error_percent, 'o-', markersize=5, 
-                               linewidth=1.5, color='#d62728')
-                ax_err.set_xlabel("Frequency / Hz", fontweight='bold')
-                ax_err.set_ylabel("Relative Error / %", fontweight='bold')
-                # No title - removed as requested
-                ax_err.grid(True, alpha=0.3, linestyle='--')
-                ax_err.axhline(y=mean_error, color='gray', linestyle='--', 
-                              label=f'Mean Error: {mean_error:.2f}%')
-                ax_err.legend()
-                st.pyplot(fig_err)
-                plt.close()
-                
-                # If inductance was fitted, show its contribution
-                if result.L > 0:
-                    st.markdown("---")
-                    st.subheader("🔌 Inductance Contribution")
+                # CORRECTED BLOCK: Properly handle different solver types
+                try:
+                    # Check if solver is RQDRTCore for proper reconstruction
+                    if isinstance(solver, RQDRTCore):
+                        n_val = result.metadata.get('cpe_n', 0.85)
+                        Z_rec_real, Z_rec_imag = solver.reconstruct_impedance_rq(
+                            result.tau_grid, result.gamma, n_val, result.L
+                        )
+                    else:
+                        # For TikhonovDRT and MaxEntropyDRT
+                        Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(
+                            result.tau_grid, result.gamma, result.L
+                        )
                     
-                    fig_L, ax_L = plt.subplots(figsize=(8, 5))
-                    ax_L.tick_params(axis='both', colors='black')
-                    ax_L.xaxis.label.set_color('black')
-                    ax_L.yaxis.label.set_color('black')
-                    omega = 2 * np.pi * data.freq
-                    L_contribution = omega * result.L
-                    ax_L.loglog(data.freq, L_contribution, '-', linewidth=2, color='#9467bd', label='L contribution to -Im(Z)')
-                    ax_L.set_xlabel("Frequency / Hz", fontweight='bold')
-                    ax_L.set_ylabel("-ωL / Ohm", fontweight='bold')
-                    # No title - removed as requested
-                    ax_L.grid(True, alpha=0.3, linestyle='--')
-                    ax_L.legend()
-                    st.pyplot(fig_L)
+                    # Calculate reconstruction error
+                    Z_original = data.Z
+                    Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
+                    error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
+                    mean_error = np.mean(error_percent)
+                    max_error = np.max(error_percent)
+                    
+                    st.info(f"""
+                    **Reconstruction Quality:**
+                    **Mean Error:** {mean_error:.2f}%
+                    **Max Error:** {max_error:.2f}%
+                    """)
+                    
+                    # Display validation plots
+                    st.markdown("---")
+                    st.subheader("🔍 Validation: Original vs Reconstructed Impedance")
+                    
+                    # Nyquist plot
+                    fig_nyq, ax_nyq = plt.subplots(figsize=(8, 6))
+                    ax_nyq.tick_params(axis='both', colors='black')
+                    ax_nyq.xaxis.label.set_color('black')
+                    ax_nyq.yaxis.label.set_color('black')
+                    ax_nyq.plot(data.re_z, data.im_z, 'o', markersize=6, 
+                               label='Experimental', color='#1f77b4', alpha=0.7)
+                    ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5, 
+                               label='Reconstructed from DRT', color='#ff7f0e')
+                    ax_nyq.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+                    ax_nyq.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
+                    ax_nyq.legend(loc='best', frameon=True)
+                    ax_nyq.grid(True, alpha=0.3, linestyle='--')
+                    ax_nyq.set_aspect('equal', adjustable='box')
+                    st.pyplot(fig_nyq)
                     plt.close()
+                    
+                    # Bode plots
+                    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
+                    ax1.tick_params(axis='both', colors='black')
+                    ax2.tick_params(axis='both', colors='black')
+                    ax1.xaxis.label.set_color('black')
+                    ax1.yaxis.label.set_color('black')
+                    ax2.xaxis.label.set_color('black')
+                    ax2.yaxis.label.set_color('black')
+                    
+                    # Magnitude plot
+                    mag_exp = data.Z_mod
+                    mag_rec = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
+                    ax1.loglog(data.freq, mag_exp, 'o', markersize=6, 
+                              label='Experimental', color='#1f77b4', alpha=0.7)
+                    ax1.loglog(data.freq, mag_rec, '-', linewidth=2.5, 
+                              label='Reconstructed', color='#ff7f0e')
+                    ax1.set_xlabel("Frequency / Hz", fontweight='bold')
+                    ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
+                    ax1.legend(loc='best')
+                    ax1.grid(True, alpha=0.3, linestyle='--')
+                    
+                    # Phase plot
+                    phase_exp = data.phase
+                    phase_rec = np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
+                    ax2.semilogx(data.freq, phase_exp, 'o', markersize=6, 
+                                label='Experimental', color='#1f77b4', alpha=0.7)
+                    ax2.semilogx(data.freq, phase_rec, '-', linewidth=2.5, 
+                                label='Reconstructed', color='#ff7f0e')
+                    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
+                    ax2.set_ylabel("Phase / deg", fontweight='bold')
+                    ax2.legend(loc='best')
+                    ax2.grid(True, alpha=0.3, linestyle='--')
+                    ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
+                    
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close()
+                    
+                    # Error plot
+                    fig_err, ax_err = plt.subplots(figsize=(8, 5))
+                    ax_err.tick_params(axis='both', colors='black')
+                    ax_err.xaxis.label.set_color('black')
+                    ax_err.yaxis.label.set_color('black')
+                    ax_err.semilogx(data.freq, error_percent, 'o-', markersize=5, 
+                                   linewidth=1.5, color='#d62728')
+                    ax_err.set_xlabel("Frequency / Hz", fontweight='bold')
+                    ax_err.set_ylabel("Relative Error / %", fontweight='bold')
+                    ax_err.grid(True, alpha=0.3, linestyle='--')
+                    ax_err.axhline(y=mean_error, color='gray', linestyle='--', 
+                                  label=f'Mean Error: {mean_error:.2f}%')
+                    ax_err.legend()
+                    st.pyplot(fig_err)
+                    plt.close()
+                    
+                    # If inductance was fitted, show its contribution
+                    if result.L > 0:
+                        st.markdown("---")
+                        st.subheader("🔌 Inductance Contribution")
+                        
+                        fig_L, ax_L = plt.subplots(figsize=(8, 5))
+                        ax_L.tick_params(axis='both', colors='black')
+                        ax_L.xaxis.label.set_color('black')
+                        ax_L.yaxis.label.set_color('black')
+                        omega = 2 * np.pi * data.freq
+                        L_contribution = omega * result.L
+                        ax_L.loglog(data.freq, L_contribution, '-', linewidth=2, color='#9467bd', label='L contribution to -Im(Z)')
+                        ax_L.set_xlabel("Frequency / Hz", fontweight='bold')
+                        ax_L.set_ylabel("-ωL / Ohm", fontweight='bold')
+                        ax_L.grid(True, alpha=0.3, linestyle='--')
+                        ax_L.legend()
+                        st.pyplot(fig_L)
+                        plt.close()
+                        
+                except Exception as e:
+                    st.error(f"Reconstruction failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
             
             # DRT plot
             st.markdown("---")
