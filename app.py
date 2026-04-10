@@ -418,6 +418,46 @@ class GaussianPeak:
 
 
 @dataclass
+class RQPeak(GaussianPeak):
+    """Extended GaussianPeak with CPE parameters for RQ element analysis"""
+    n: float = 1.0                    # CPE exponent (0 < n ≤ 1)
+    Q: float = 0.0                    # CPE parameter (F·s^(n-1) or S·s^n)
+    effective_capacitance: float = 0.0  # Effective capacitance from Brug's formula (F)
+    
+    def __post_init__(self):
+        """Override post_init to use RQ-specific characteristic frequency calculation"""
+        if self.characteristic_frequency is None:
+            if self.n < 0.99:
+                # For CPE: f_max = (1/(2πτ)) * [sin(nπ/2)]^(1/n)
+                sin_term = np.sin(self.n * np.pi / 2)
+                if sin_term > 0:
+                    self.characteristic_frequency = (1.0 / (2 * np.pi * self.center)) * (sin_term ** (1.0 / self.n))
+                else:
+                    self.characteristic_frequency = 1.0 / (2 * np.pi * self.center)
+            else:
+                self.characteristic_frequency = 1.0 / (2 * np.pi * self.center)
+        
+        if self.effective_capacitance == 0.0 and self.n < 1.0 and self.Q > 0 and self.area > 0:
+            # Calculate effective capacitance using Brug's formula
+            self.effective_capacitance = (self.Q ** (1.0 / self.n)) * (self.area ** ((1.0 - self.n) / self.n))
+        elif self.effective_capacitance == 0.0 and self.n >= 0.99:
+            # For ideal RC: C = τ/R
+            self.effective_capacitance = self.center / self.area if self.area > 0 else 0.0
+    
+    def get_cpe_parameters(self) -> Tuple[float, float]:
+        """Return (Q, n) for the CPE"""
+        return self.Q, self.n
+    
+    def get_capacitance_equivalent(self) -> float:
+        """
+        Calculate equivalent capacitance for RQ element.
+        For n=1: C = τ/R
+        For n<1: Effective capacitance using Brug's formula: C_eff = Q^(1/n) * R^(1-n)/n
+        """
+        return self.effective_capacitance
+
+
+@dataclass
 class DeconvolutionResult:
     """Container for Gaussian deconvolution results"""
     peaks: List[GaussianPeak]
@@ -434,6 +474,8 @@ class DeconvolutionResult:
     baseline_method: str = 'none'
     total_area: float = 0.0
     max_amplitude: float = 0.0
+    use_rq_analysis: bool = False  # Flag to indicate if RQ analysis was performed
+    rq_peaks: Optional[List[RQPeak]] = None  # RQ peaks with CPE parameters
     
     def verify_resistance_conservation(self) -> Tuple[float, float]:
         """
@@ -464,6 +506,30 @@ class DeconvolutionResult:
             List[float]: Characteristic frequencies in Hz
         """
         return [p.get_characteristic_frequency() for p in self.peaks]
+    
+    def get_rq_parameters(self) -> List[Dict[str, float]]:
+        """
+        Get RQ parameters (n, Q, C_eff) for each peak if RQ analysis is enabled.
+        
+        Returns:
+            List of dictionaries with keys: 'peak_id', 'n', 'Q', 'C_eff', 'R', 'tau', 'f_max'
+        """
+        if not self.use_rq_analysis or not self.rq_peaks:
+            return []
+        
+        params = []
+        for rq_peak in self.rq_peaks:
+            params.append({
+                'peak_id': rq_peak.id,
+                'n': rq_peak.n,
+                'Q_F_s_n_minus_1': rq_peak.Q,
+                'C_eff_F': rq_peak.effective_capacitance,
+                'R_Ohm': rq_peak.area,
+                'tau_s': rq_peak.center,
+                'f_max_Hz': rq_peak.characteristic_frequency
+            })
+        
+        return params
 
 
 # ============================================================================
@@ -519,6 +585,9 @@ class AppState:
     # Peak detection settings
     sensitivity: float = 0.03
     min_distance: int = 5
+    
+    # RQ analysis settings
+    use_rq_analysis: bool = False  # Enable RQ (CPE) analysis for peaks
     
     # Temporary storage for preview
     preview_fit: Optional[np.ndarray] = None
@@ -651,6 +720,167 @@ def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: n
     except Exception as e:
         logging.warning(f"KK Hilbert transform failed: {e}")
         return False, 1.0, None, None
+
+
+# ============================================================================
+# RQ Peak Analyzer (NEW - for CPE parameter determination)
+# ============================================================================
+
+class RQPeakAnalyzer:
+    """Analyze DRT peaks and determine CPE parameters (n, Q) for each peak"""
+    
+    @staticmethod
+    def estimate_n_from_peak_width(sigma_log: float) -> float:
+        """
+        Estimate CPE exponent n from Gaussian peak width in log10 space.
+        
+        Relationship derived from DRT kernel for CPE:
+        For RC (n=1): typical σ ≈ 0.2-0.4
+        For CPE (n=0.8): typical σ ≈ 0.5-0.7
+        For CPE (n=0.6): typical σ ≈ 0.8-1.0
+        
+        Empirical formula: n = 1 / (1 + 2.2 * σ_log)
+        
+        Args:
+            sigma_log: Standard deviation of Gaussian peak in log10 space
+        
+        Returns:
+            n: CPE exponent (0 < n ≤ 1)
+        """
+        # Clamp sigma to reasonable range
+        sigma_clamped = np.clip(sigma_log, 0.05, 1.5)
+        
+        # Formula based on numerical simulations
+        # For σ=0.2 → n≈0.95, σ=0.5 → n≈0.8, σ=0.8 → n≈0.65
+        n = 1.0 / (1.0 + 2.2 * sigma_clamped)
+        
+        # Ensure bounds
+        return np.clip(n, 0.5, 1.0)
+    
+    @staticmethod
+    def calculate_q_from_tau_and_r(tau: float, R: float, n: float) -> float:
+        """
+        Calculate CPE parameter Q from τ, R, and n.
+        
+        Formula: τ^n = R * Q
+        Therefore: Q = τ^n / R
+        
+        Args:
+            tau: Characteristic time constant (seconds)
+            R: Resistance (Ohms)
+            n: CPE exponent
+        
+        Returns:
+            Q: CPE parameter (F·s^(n-1))
+        """
+        if R <= 0:
+            return 0.0
+        return (tau ** n) / R
+    
+    @staticmethod
+    def calculate_true_fmax(tau: float, n: float) -> float:
+        """
+        Calculate true characteristic frequency for RQ element.
+        
+        f_max = (1/(2πτ)) * [sin(nπ/2)]^(1/n)
+        
+        Args:
+            tau: Characteristic time constant (seconds)
+            n: CPE exponent
+        
+        Returns:
+            f_max: Frequency of maximum imaginary part (Hz)
+        """
+        if n >= 0.99:  # Near-ideal RC
+            return 1.0 / (2 * np.pi * tau)
+        
+        sin_term = np.sin(n * np.pi / 2)
+        if sin_term <= 0:
+            return 1.0 / (2 * np.pi * tau)
+        
+        return (1.0 / (2 * np.pi * tau)) * (sin_term ** (1.0 / n))
+    
+    @staticmethod
+    def calculate_effective_capacitance(Q: float, R: float, n: float) -> float:
+        """
+        Calculate effective capacitance using Brug's formula.
+        
+        C_eff = Q^(1/n) * R^(1-n)/n
+        
+        Args:
+            Q: CPE parameter
+            R: Resistance
+            n: CPE exponent
+        
+        Returns:
+            C_eff: Effective capacitance (Farads)
+        """
+        if n <= 0 or R <= 0 or Q <= 0:
+            return 0.0
+        
+        return (Q ** (1.0/n)) * (R ** ((1.0 - n)/n))
+    
+    @staticmethod
+    def analyze_peak(peak: GaussianPeak) -> RQPeak:
+        """
+        Convert a GaussianPeak to RQPeak with calculated CPE parameters.
+        
+        Args:
+            peak: GaussianPeak from deconvolution
+        
+        Returns:
+            RQPeak with n, Q, and corrected f_max
+        """
+        # Estimate n from peak width
+        n = RQPeakAnalyzer.estimate_n_from_peak_width(peak.sigma_log)
+        
+        # Calculate Q from τ and R
+        Q = RQPeakAnalyzer.calculate_q_from_tau_and_r(peak.center, peak.area, n)
+        
+        # Calculate true characteristic frequency for RQ
+        true_fmax = RQPeakAnalyzer.calculate_true_fmax(peak.center, n)
+        
+        # Calculate effective capacitance
+        C_eff = RQPeakAnalyzer.calculate_effective_capacitance(Q, peak.area, n)
+        
+        # Create RQPeak with additional parameters
+        rq_peak = RQPeak(
+            id=peak.id,
+            center=peak.center,
+            center_log=peak.center_log,
+            amplitude=peak.amplitude,
+            amplitude_norm=peak.amplitude_norm,
+            sigma_log=peak.sigma_log,
+            fwhm=peak.fwhm,
+            area=peak.area,
+            fraction=peak.fraction,
+            fraction_percent=peak.fraction_percent,
+            source=peak.source,
+            y_norm=peak.y_norm,
+            characteristic_frequency=true_fmax,
+            n=n,
+            Q=Q,
+            effective_capacitance=C_eff
+        )
+        
+        return rq_peak
+    
+    @staticmethod
+    def analyze_all_peaks(peaks: List[GaussianPeak]) -> List[RQPeak]:
+        """
+        Convert all GaussianPeaks to RQPeaks.
+        
+        Args:
+            peaks: List of GaussianPeak objects
+        
+        Returns:
+            List of RQPeak objects with CPE parameters
+        """
+        rq_peaks = []
+        for peak in peaks:
+            rq_peak = RQPeakAnalyzer.analyze_peak(peak)
+            rq_peaks.append(rq_peak)
+        return rq_peaks
 
 
 # ============================================================================
@@ -865,6 +1095,340 @@ class DRTCore:
         mean_error = np.mean(error_percent)
         
         return Z_rec_real, Z_rec_imag, mean_error
+
+
+# ============================================================================
+# RQ-DRT Core (NEW - for CPE kernel support)
+# ============================================================================
+
+class RQDRTCore(DRTCore):
+    """
+    DRT core with RQ kernel support for CPE elements.
+    This class implements the kernel for Constant Phase Elements where n ≠ 1.
+    
+    The RQ impedance is: Z_RQ(ω) = R / (1 + (iωτ)^n)
+    where τ = (R·Q)^(1/n) is the generalized time constant.
+    
+    The DRT kernel for RQ elements is:
+    K_real = [1 + (ωτ)^n cos(nπ/2)] / [1 + 2(ωτ)^n cos(nπ/2) + (ωτ)^{2n}] * d(ln τ)
+    K_imag = -[(ωτ)^n sin(nπ/2)] / [1 + 2(ωτ)^n cos(nπ/2) + (ωτ)^{2n}] * d(ln τ)
+    
+    When n = 1, this reduces to the standard RC kernel.
+    """
+    
+    def __init__(self, data: ImpedanceData, n_fixed: Optional[float] = None, 
+                 include_inductive: bool = False):
+        """
+        Initialize RQ-DRT solver.
+        
+        Args:
+            data: ImpedanceData object
+            n_fixed: If provided, use fixed n for all processes.
+                     If None, n is determined per peak from DRT shape (post-processing).
+            include_inductive: Whether to include inductance in the model
+        """
+        super().__init__(data, include_inductive)
+        self.n_fixed = n_fixed
+        self.alpha = n_fixed * np.pi / 2 if n_fixed is not None else None
+    
+    def _build_kernel_matrix_rq(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build RQ kernel matrix for a fixed n.
+        
+        Args:
+            tau_grid: Array of relaxation times
+            n: CPE exponent (0 < n ≤ 1)
+        
+        Returns:
+            Tuple of (K_real, K_imag) matrices
+        """
+        M = len(tau_grid)
+        K_real = np.zeros((self.N, M))
+        K_imag = np.zeros((self.N, M))
+        
+        omega = 2 * np.pi * self.frequencies
+        dln_tau = np.mean(np.diff(np.log(tau_grid)))
+        
+        cos_term = np.cos(n * np.pi / 2)
+        sin_term = np.sin(n * np.pi / 2)
+        
+        for i in range(self.N):
+            for j in range(M):
+                wtau_n = (omega[i] * tau_grid[j]) ** n
+                denominator = 1 + 2 * wtau_n * cos_term + wtau_n**2
+                
+                if denominator > 0:
+                    K_real[i, j] = (1 + wtau_n * cos_term) / denominator * dln_tau
+                    K_imag[i, j] = -(wtau_n * sin_term) / denominator * dln_tau
+                else:
+                    # Fallback for numerical issues
+                    K_real[i, j] = 0
+                    K_imag[i, j] = 0
+        
+        return K_real, K_imag
+    
+    def _build_kernel_matrix_with_inductance_rq(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build extended kernel matrix with inductance for RQ model.
+        
+        Args:
+            tau_grid: Array of relaxation times
+            n: CPE exponent
+        
+        Returns:
+            Tuple of (K_extended, K_real, K_imag)
+        """
+        K_real, K_imag = self._build_kernel_matrix_rq(tau_grid, n)
+        
+        omega = 2 * np.pi * self.frequencies
+        
+        K_base = np.vstack([K_real, K_imag])
+        L_column = np.concatenate([np.zeros(self.N), -omega])
+        K_extended = np.column_stack([K_base, L_column])
+        
+        return K_extended, K_real, K_imag
+    
+    def compute_rq(self, n_tau: int = 150, n: float = 0.85, 
+                   lambda_value: Optional[float] = None, 
+                   lambda_auto: bool = True,
+                   lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+        """
+        Compute DRT using RQ kernel with fixed n.
+        
+        Args:
+            n_tau: Number of relaxation time points
+            n: CPE exponent (0 < n ≤ 1)
+            lambda_value: Fixed regularization parameter
+            lambda_auto: Whether to auto-select lambda using L-curve
+            lambda_range: Range of lambda values to test
+        
+        Returns:
+            DRTResult object with gamma distribution
+        """
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        K_real, K_imag = self._build_kernel_matrix_rq(tau_grid, n)
+        
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        K = np.vstack([K_real, K_imag])
+        
+        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
+        
+        lambda_opt = None
+        gamma = None
+        
+        if lambda_auto:
+            if lambda_range is None:
+                lambda_range = np.logspace(-8, 2, 30)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    A = np.vstack([K, lam * L_reg])
+                    b = np.concatenate([Z_target, np.zeros(L_reg.shape[0])])
+                    
+                    x = self._solve_nnls(A, b)
+                    
+                    residual = np.linalg.norm(K @ x - Z_target)
+                    sol_norm = np.linalg.norm(L_reg @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                gamma = solutions[best_idx]
+            else:
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K, lambda_opt * L_reg])
+                b = np.concatenate([Z_target, np.zeros(L_reg.shape[0])])
+                gamma = self._solve_nnls(A, b)
+        else:
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K, lambda_opt * L_reg])
+            b = np.concatenate([Z_target, np.zeros(L_reg.shape[0])])
+            gamma = self._solve_nnls(A, b)
+        
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        gamma_corrected = gamma * np.log(10)
+        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std * np.log(10),
+            method=f"RQ-DRT (n={n:.3f})",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            L=0.0,
+            lambda_opt=lambda_opt,
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol,
+                'cpe_n': n
+            }
+        )
+    
+    def _build_regularization_matrix(self, M: int, order: int) -> np.ndarray:
+        """Build regularization matrix"""
+        if order == 0:
+            return np.eye(M)
+        elif order == 1:
+            L = np.zeros((M-1, M))
+            for i in range(M-1):
+                L[i, i] = -1
+                L[i, i+1] = 1
+            return L
+        elif order == 2:
+            L = np.zeros((M-2, M))
+            for i in range(M-2):
+                L[i, i] = 1
+                L[i, i+1] = -2
+                L[i, i+2] = 1
+            return L
+        else:
+            return np.eye(M)
+    
+    def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Solve non-negative least squares problem"""
+        from scipy.optimize import nnls
+        x, resid = nnls(A, b)
+        if resid > 1e-6 * np.linalg.norm(b):
+            logging.warning(f"NNLS residual: {resid}")
+        return x
+    
+    def compute_rq_with_inductance(self, n_tau: int = 150, n: float = 0.85,
+                                    lambda_value: Optional[float] = None,
+                                    lambda_auto: bool = True,
+                                    lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+        """
+        Compute RQ-DRT with inductance.
+        
+        Args:
+            n_tau: Number of relaxation time points
+            n: CPE exponent
+            lambda_value: Fixed regularization parameter
+            lambda_auto: Whether to auto-select lambda
+            lambda_range: Range of lambda values to test
+        
+        Returns:
+            DRTResult object with gamma distribution and inductance
+        """
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        K_extended, K_real, K_imag = self._build_kernel_matrix_with_inductance_rq(tau_grid, n)
+        
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        
+        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
+        n_total = n_tau + 1
+        
+        L_extended = np.zeros((L_reg.shape[0], n_total))
+        L_extended[:, :n_tau] = L_reg
+        
+        lambda_opt = None
+        gamma = None
+        L_value = None
+        
+        if lambda_auto:
+            if lambda_range is None:
+                lambda_range = np.logspace(-8, 2, 30)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    A = np.vstack([K_extended, lam * L_extended])
+                    b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                    
+                    x = self._solve_nnls(A, b)
+                    
+                    residual = np.linalg.norm(K_extended @ x - Z_target)
+                    sol_norm = np.linalg.norm(L_extended @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                x_opt = solutions[best_idx]
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+            else:
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K_extended, lambda_opt * L_extended])
+                b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                x_opt = self._solve_nnls(A, b)
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+        else:
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K_extended, lambda_opt * L_extended])
+            b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+            x_opt = self._solve_nnls(A, b)
+            gamma = x_opt[:n_tau]
+            L_value = x_opt[-1]
+        
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        gamma_corrected = gamma * np.log(10)
+        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std * np.log(10),
+            method=f"RQ-DRT with Inductance (n={n:.3f})",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            L=L_value,
+            lambda_opt=lambda_opt,
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol,
+                'cpe_n': n,
+                'inductance': L_value
+            }
+        )
+    
+    def reconstruct_impedance_rq(self, tau_grid: np.ndarray, gamma: np.ndarray, 
+                                   n: float, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reconstruct impedance from RQ-DRT.
+        
+        Args:
+            tau_grid: Relaxation time grid
+            gamma: DRT values
+            n: CPE exponent
+            L: Inductance value
+        
+        Returns:
+            Tuple of (Z_rec_real, Z_rec_imag)
+        """
+        K_real, K_imag = self._build_kernel_matrix_rq(tau_grid, n)
+        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
+        return Z_rec_real, Z_rec_imag
 
 
 # ============================================================================
@@ -2053,7 +2617,7 @@ class DataPreprocessor:
 
 
 # ============================================================================
-# Gaussian Deconvolver (from second code)
+# Gaussian Deconvolver (from second code) - MODIFIED for RQ support
 # ============================================================================
 class GaussianDeconvolver:
     """Main class for spectral deconvolution with baseline correction"""
@@ -2768,8 +3332,13 @@ class GaussianDeconvolver:
                 progress_callback(1.0, f"Fallback fit failed: {e}")
             return False
     
-    def create_deconvolution_result(self) -> DeconvolutionResult:
-        """Create result container from current components with peaks sorted by frequency (high to low)"""
+    def create_deconvolution_result(self, use_rq_analysis: bool = False) -> DeconvolutionResult:
+        """
+        Create result container from current components with peaks sorted by frequency (high to low)
+        
+        Args:
+            use_rq_analysis: If True, convert peaks to RQPeak with CPE parameters
+        """
         # Sort components by characteristic frequency (high to low) and reassign IDs
         components_with_freq = []
         for c in self.components:
@@ -2799,6 +3368,11 @@ class GaussianDeconvolver:
             )
             peaks.append(peak)
         
+        # Apply RQ analysis if requested
+        rq_peaks = None
+        if use_rq_analysis:
+            rq_peaks = RQPeakAnalyzer.analyze_all_peaks(peaks)
+        
         # Use original y_original values
         y_original_restored = self.y_original.copy()
         
@@ -2809,10 +3383,8 @@ class GaussianDeconvolver:
         print(f"Total area from deconvolution: {total_component_area:.6f} Ω")
         print(f"Ratio (should be ~1.0): {total_component_area/self.drt_integral:.4f}")
         
-        # Reorder fit_y_original according to sorted peaks if needed for consistent display
-        # For fit_y_original, we need to keep it as is (it's the total fit, not per-peak)
-        
-        return DeconvolutionResult(
+        # Create result
+        result = DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             fit_y_original=self.fit_y_original if self.fit_y_original is not None else None,
@@ -2825,9 +3397,13 @@ class GaussianDeconvolver:
             quality_metrics=self.quality_metrics,
             baseline_params=self.baseline_params,
             baseline_method=self.baseline_method,
-            total_area=self.drt_integral,  # Use the original DRT integral as total area
-            max_amplitude=max([p.amplitude for p in peaks]) if peaks else 0
+            total_area=self.drt_integral,
+            max_amplitude=max([p.amplitude for p in peaks]) if peaks else 0,
+            use_rq_analysis=use_rq_analysis,
+            rq_peaks=rq_peaks
         )
+        
+        return result
         
     def calculate_peak_area(self, amplitude: float, sigma: float, is_log_scale: bool = True) -> float:
         """
@@ -3287,6 +3863,36 @@ def calculate_peak_characteristics(peak: GaussianPeak) -> Dict[str, float]:
     
     return {'fmax_hz': fmax_hz, 'c_farad': c_farad}
 
+def calculate_rq_peak_characteristics(peak: RQPeak) -> Dict[str, float]:
+    """
+    Calculate RQ-specific characteristics for a peak.
+    
+    Args:
+        peak: RQPeak object with n, Q, area (R), and center (τ)
+    
+    Returns:
+        Dictionary with 'fmax_hz', 'c_eff_farad', 'q_param', 'n_exponent'
+    """
+    # For RQ, f_max = (1/(2πτ)) * [sin(nπ/2)]^(1/n)
+    if peak.n < 0.99:
+        sin_term = np.sin(peak.n * np.pi / 2)
+        if sin_term > 0:
+            fmax_hz = (1.0 / (2 * np.pi * peak.center)) * (sin_term ** (1.0 / peak.n))
+        else:
+            fmax_hz = 1.0 / (2 * np.pi * peak.center)
+    else:
+        fmax_hz = 1.0 / (2 * np.pi * peak.center)
+    
+    # Effective capacitance from Brug's formula (already in peak.effective_capacitance)
+    c_eff = peak.effective_capacitance
+    
+    return {
+        'fmax_hz': fmax_hz,
+        'c_eff_farad': c_eff,
+        'q_param': peak.Q,
+        'n_exponent': peak.n
+    }
+
 def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str = "Original Impedance Spectrum") -> plt.Figure:
     """
     Plot original Nyquist spectrum with proper sign handling:
@@ -3431,21 +4037,18 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
             # Get the minimum negative value (most negative)
             negative_min = np.min(im_z_plot[negative_mask])
             
-            # Calculate the range of positive values
-            positive_range = positive_max
-            
             # Set y-axis limits:
             # Upper limit: 10% above the maximum positive value
             y_max_data = positive_max * 1.1
             
             # Lower limit: extend only 1/5 of positive range below zero
             # This makes the inductive tail visible but not dominant
-            y_min_data = -positive_range / 5
+            y_min_data = -positive_max / 5
             
             # But if the actual negative data goes beyond this, we need to show at least some of it
             if negative_min < y_min_data:
                 # Still limit to 1/3 of positive range maximum
-                y_min_data = max(negative_min * 0.8, -positive_range / 3)
+                y_min_data = max(negative_min * 0.8, -positive_max / 3)
             
             ax.set_ylim(y_min_data, y_max_data)
             
@@ -3805,6 +4408,165 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     plt.tight_layout()
     return fig
 
+
+# ============================================================================
+# NEW: RQ Parameter Plotting Functions
+# ============================================================================
+
+def plot_rq_parameters_table(deconv_result: DeconvolutionResult) -> plt.Figure:
+    """
+    Create a table plot showing RQ parameters for each peak.
+    
+    Args:
+        deconv_result: DeconvolutionResult with RQ analysis enabled
+    
+    Returns:
+        matplotlib Figure with parameter table
+    """
+    if not deconv_result.use_rq_analysis or not deconv_result.rq_peaks:
+        fig, ax = plt.subplots(figsize=(8, 2))
+        ax.text(0.5, 0.5, "RQ analysis not enabled", ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+    
+    # Prepare data for table
+    table_data = []
+    headers = ['Peak', 'R (Ω)', 'τ (s)', 'n (CPE)', 'Q (F·sⁿ⁻¹)', 'C_eff (F)', 'f_max (Hz)']
+    
+    for peak in deconv_result.rq_peaks:
+        row = [
+            f'{peak.id}',
+            f'{peak.area:.3e}',
+            f'{peak.center:.3e}',
+            f'{peak.n:.4f}',
+            f'{peak.Q:.3e}',
+            f'{peak.effective_capacitance:.3e}',
+            f'{peak.characteristic_frequency:.3e}'
+        ]
+        table_data.append(row)
+    
+    # Create figure with table
+    fig, ax = plt.subplots(figsize=(10, 2 + 0.3 * len(table_data)))
+    ax.axis('off')
+    
+    table = ax.table(cellText=table_data, colLabels=headers, 
+                     cellLoc='center', loc='center',
+                     colWidths=[0.08, 0.12, 0.12, 0.10, 0.14, 0.14, 0.14])
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.5)
+    
+    # Color header row
+    for (i, j), cell in table.get_celld().items():
+        if i == 0:
+            cell.set_facecolor('#4472C4')
+            cell.set_text_props(weight='bold', color='white')
+        elif j == 0:
+            cell.set_facecolor('#E6E6E6')
+    
+    plt.tight_layout()
+    return fig
+
+
+def plot_rq_n_distribution(deconv_result: DeconvolutionResult) -> plt.Figure:
+    """
+    Plot bar chart of CPE exponent n for each peak.
+    
+    Args:
+        deconv_result: DeconvolutionResult with RQ analysis enabled
+    
+    Returns:
+        matplotlib Figure with n distribution
+    """
+    if not deconv_result.use_rq_analysis or not deconv_result.rq_peaks:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "RQ analysis not enabled", ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+    
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
+    ax.xaxis.label.set_color('black')
+    ax.yaxis.label.set_color('black')
+    
+    peaks_sorted = sorted(deconv_result.rq_peaks, key=lambda p: p.id)
+    peak_ids = [f'Process {p.id}' for p in peaks_sorted]
+    n_values = [p.n for p in peaks_sorted]
+    
+    colors = plt.cm.Set3(np.linspace(0, 1, len(peaks_sorted)))
+    
+    bars = ax.bar(peak_ids, n_values, color=colors, edgecolor='black', alpha=0.7)
+    
+    # Add value labels on bars
+    for bar, n_val in zip(bars, n_values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{n_val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    ax.axhline(y=1.0, color='red', linestyle='--', linewidth=1.5, label='Ideal RC (n=1)')
+    ax.set_ylim(0.5, 1.05)
+    ax.set_xlabel('Relaxation Process', fontweight='bold', fontsize=12)
+    ax.set_ylabel('CPE Exponent n', fontweight='bold', fontsize=12)
+    # No title - removed as requested
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    return fig
+
+
+def plot_rq_capacitance_comparison(deconv_result: DeconvolutionResult) -> plt.Figure:
+    """
+    Plot comparison of effective capacitances for each peak.
+    
+    Args:
+        deconv_result: DeconvolutionResult with RQ analysis enabled
+    
+    Returns:
+        matplotlib Figure with capacitance comparison
+    """
+    if not deconv_result.use_rq_analysis or not deconv_result.rq_peaks:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "RQ analysis not enabled", ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+    
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
+    ax.xaxis.label.set_color('black')
+    ax.yaxis.label.set_color('black')
+    
+    peaks_sorted = sorted(deconv_result.rq_peaks, key=lambda p: p.id)
+    peak_ids = [f'Process {p.id}' for p in peaks_sorted]
+    c_eff_values = [p.effective_capacitance for p in peaks_sorted]
+    
+    colors = plt.cm.Set3(np.linspace(0, 1, len(peaks_sorted)))
+    
+    bars = ax.bar(peak_ids, c_eff_values, color=colors, edgecolor='black', alpha=0.7)
+    
+    # Add value labels on bars with scientific notation
+    for bar, c_val in zip(bars, c_eff_values):
+        height = bar.get_height()
+        label = f'{c_val:.2e}'
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                label, ha='center', va='bottom', fontsize=9, fontweight='bold', rotation=45)
+    
+    ax.set_xlabel('Relaxation Process', fontweight='bold', fontsize=12)
+    ax.set_ylabel('Effective Capacitance C_eff (F)', fontweight='bold', fontsize=12)
+    # No title - removed as requested
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.tick_params(axis='x', rotation=45)
+    ax.set_yscale('log')
+    
+    plt.tight_layout()
+    return fig
+
+
 # ============================================================================
 # Step 1: Data Loading and Preprocessing
 # ============================================================================
@@ -4043,7 +4805,8 @@ def step2_drt_analysis():
         analysis_method = st.selectbox(
             "DRT Calculation Method",
             ["Tikhonov Regularization (NNLS)",
-             "Maximum Entropy (auto-λ)"]
+             "Maximum Entropy (auto-λ)",
+             "RQ-DRT (CPE analysis)"]
         )
         
         # Auto-select inductance handling based on detection
@@ -4065,6 +4828,14 @@ def step2_drt_analysis():
         
         n_tau = st.slider("Number of time points", 50, 300, 150)
         
+        # RQ-specific parameter
+        rq_n_fixed = None
+        if analysis_method == "RQ-DRT (CPE analysis)":
+            st.markdown("**CPE Parameters**")
+            rq_n_fixed = st.slider("Fixed CPE exponent n (0.5-1.0)", 0.5, 1.0, 0.85, 0.01,
+                                    help="For RQ-DRT, n is fixed for all processes. n=1 gives standard RC.")
+            st.info("RQ-DRT uses CPE kernel with fixed n. After deconvolution, individual peak n values will be estimated from peak widths.")
+        
         # Method-specific parameters
         lambda_auto = True
         lambda_value = None
@@ -4082,6 +4853,12 @@ def step2_drt_analysis():
                 st.session_state.app_state.drt_parameters['entropy_lambda'] = st.number_input("Entropy λ", value=0.1, format="%.2f")
             st.session_state.app_state.drt_parameters['lambda_auto'] = entropy_lambda_auto
         
+        elif analysis_method == "RQ-DRT (CPE analysis)":
+            lambda_auto = st.checkbox("Automatic λ selection (L-curve)", value=True)
+            if not lambda_auto:
+                lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
+            st.session_state.app_state.drt_parameters['rq_n'] = rq_n_fixed
+        
         # Store parameters
         st.session_state.app_state.drt_method = analysis_method
         st.session_state.app_state.drt_parameters.update({
@@ -4089,7 +4866,8 @@ def step2_drt_analysis():
             'induct_mode': induct_mode,
             'reg_order': reg_order,
             'lambda_auto': lambda_auto,
-            'lambda_value': lambda_value
+            'lambda_value': lambda_value,
+            'rq_n': rq_n_fixed if analysis_method == "RQ-DRT (CPE analysis)" else None
         })
         
         col_prev, col_next = st.columns(2)
@@ -4162,6 +4940,24 @@ def step2_drt_analysis():
                                     lambda_auto=lambda_auto_val
                                 )
                         
+                        elif analysis_method == "RQ-DRT (CPE analysis)":
+                            drt_solver = RQDRTCore(temp_data, n_fixed=rq_n_fixed, include_inductive=include_inductive)
+                            
+                            if include_inductive:
+                                result = drt_solver.compute_rq_with_inductance(
+                                    n_tau=n_tau, 
+                                    n=rq_n_fixed if rq_n_fixed is not None else 0.85,
+                                    lambda_value=lambda_value, 
+                                    lambda_auto=lambda_auto
+                                )
+                            else:
+                                result = drt_solver.compute_rq(
+                                    n_tau=n_tau, 
+                                    n=rq_n_fixed if rq_n_fixed is not None else 0.85,
+                                    lambda_value=lambda_value, 
+                                    lambda_auto=lambda_auto
+                                )
+                        
                         # Store results
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_solver = drt_solver
@@ -4183,6 +4979,8 @@ def step2_drt_analysis():
                             st.info(f"📊 Fitted inductance L = {result.L:.3e} H")
                         if result.lambda_opt is not None:
                             st.info(f"📊 Optimal regularization parameter λ = {result.lambda_opt:.3e}")
+                        if analysis_method == "RQ-DRT (CPE analysis)":
+                            st.info(f"📊 CPE exponent n = {rq_n_fixed:.3f} (fixed for all processes)")
                         
                         st.rerun()
                         
@@ -4211,6 +5009,10 @@ def step2_drt_analysis():
             if result.lambda_opt is not None:
                 st.info(f"**λ:** {result.lambda_opt:.3e}")
             
+            # Display CPE n if RQ method was used
+            if 'cpe_n' in result.metadata:
+                st.info(f"**CPE n:** {result.metadata['cpe_n']:.3f}")
+            
             # Display integral verification
             integral, ratio = result.verify_integral()
             if abs(ratio - 1.0) < 0.05:
@@ -4220,7 +5022,12 @@ def step2_drt_analysis():
             
             # Reconstruct impedance from DRT for validation
             if solver is not None:
-                Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
+                # Check if solver is RQDRTCore for proper reconstruction
+                if isinstance(solver, RQDRTCore):
+                    n_val = result.metadata.get('cpe_n', 0.85)
+                    Z_rec_real, Z_rec_imag = solver.reconstruct_impedance_rq(result.tau_grid, result.gamma, n_val, result.L)
+                else:
+                    Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
                 
                 # Calculate reconstruction error
                 Z_original = data.Z
@@ -4375,6 +5182,12 @@ def step3_gaussian_deconvolution():
     # Prepare data for deconvolution - используем оригинальные ненормированные значения
     log_tau = np.log10(drt_result.tau_grid)
     gamma_original = drt_result.gamma  # Оригинальные ненормированные значения
+    
+    # RQ analysis option
+    use_rq_analysis = st.sidebar.checkbox("🔬 Enable RQ (CPE) Analysis", 
+                                           value=st.session_state.app_state.use_rq_analysis,
+                                           help="Estimate CPE parameters n and Q for each peak from peak width")
+    st.session_state.app_state.use_rq_analysis = use_rq_analysis
     
     # Create deconvolver if not exists OR if DRT result has changed (check by memory address or timestamp)
     # We force recreation when drt_result is new (which happens after recalculation in Step 2)
@@ -4544,10 +5357,14 @@ def step3_gaussian_deconvolution():
                         
                         if success:
                             st.session_state.app_state.last_popt = deconvolver.popt
-                            st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
+                            st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result(
+                                use_rq_analysis=use_rq_analysis
+                            )
                             st.session_state.app_state.deconv_calculated = True
                             st.session_state.app_state.current_step = 4
                             st.success("✅ Deconvolution complete!")
+                            if use_rq_analysis and st.session_state.app_state.deconv_result.rq_peaks:
+                                st.info(f"📊 RQ analysis performed: CPE parameters (n, Q) estimated for {len(st.session_state.app_state.deconv_result.rq_peaks)} peaks")
                             st.rerun()
                         else:
                             st.error("Deconvolution failed. Try adjusting parameters.")
@@ -4653,6 +5470,8 @@ def step3_gaussian_deconvolution():
             st.metric("R²", f"{result.quality_metrics.get('R²', 0):.4f}")
             st.metric("Number of Peaks", len(result.peaks))
             st.metric("Total Area", f"{result.total_area:.4e}")
+            if result.use_rq_analysis and result.rq_peaks:
+                st.metric("RQ Analysis", "Enabled", help="CPE parameters (n, Q) estimated from peak widths")
 
 
 # ============================================================================
@@ -4683,9 +5502,9 @@ def step4_results():
     
     st.markdown("---")
     
-    # Tabs for different views - UPDATED: added "Output Graphs" tab
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Deconvolution Plot", "📊 Area Distribution", "📋 Complete Dataset", 
-                                                   "📈 Normalized View", "📊 Output Graphs", "📥 Export"])
+    # Tabs for different views - UPDATED: added "Output Graphs" tab and "RQ Parameters" tab
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📈 Deconvolution Plot", "📊 Area Distribution", "📋 Complete Dataset", 
+                                                   "📈 Normalized View", "📊 Output Graphs", "🔬 RQ Parameters", "📥 Export"])
     
     with tab1:
         st.subheader("Gaussian Deconvolution Result")
@@ -5112,7 +5931,95 @@ def step4_results():
         - **2.4** - Comparison of experimental data with sequential RC model (each semicircle represents one relaxation process)
         """)
     
+    # NEW TAB 6: RQ Parameters (CPE analysis)
     with tab6:
+        st.subheader("🔬 RQ (CPE) Analysis Results")
+        
+        if deconv_result.use_rq_analysis and deconv_result.rq_peaks:
+            st.success(f"RQ analysis completed for {len(deconv_result.rq_peaks)} peaks")
+            st.markdown("""
+            **CPE Parameters Explanation:**
+            - **n** - CPE exponent (0 < n ≤ 1): n=1 for ideal capacitor, n<1 for non-ideal behavior (roughness, porosity)
+            - **Q** - CPE parameter (F·sⁿ⁻¹): Pseudo-capacitance
+            - **C_eff** - Effective capacitance (F): Equivalent capacitance from Brug's formula
+            - **f_max** - Characteristic frequency corrected for CPE behavior
+            """)
+            
+            # Display RQ parameter table
+            st.subheader("CPE Parameters per Process")
+            rq_data = []
+            for peak in deconv_result.rq_peaks:
+                rq_data.append({
+                    'Process': peak.id,
+                    'R (Ω)': f"{peak.area:.4e}",
+                    'τ (s)': f"{peak.center:.4e}",
+                    'n (CPE)': f"{peak.n:.4f}",
+                    'Q (F·sⁿ⁻¹)': f"{peak.Q:.4e}",
+                    'C_eff (F)': f"{peak.effective_capacitance:.4e}",
+                    'f_max (Hz)': f"{peak.characteristic_frequency:.4e}"
+                })
+            
+            rq_df = pd.DataFrame(rq_data)
+            st.dataframe(rq_df, use_container_width=True)
+            
+            # Plot n distribution
+            st.subheader("CPE Exponent n Distribution")
+            fig_n = plot_rq_n_distribution(deconv_result)
+            st.pyplot(fig_n)
+            plt.close(fig_n)
+            
+            # Download n distribution plot
+            buf_n = io.BytesIO()
+            fig_n.savefig(buf_n, format='png', dpi=300, bbox_inches='tight')
+            buf_n.seek(0)
+            st.download_button("📥 Download n Distribution Plot", data=buf_n,
+                              file_name=f"cpe_n_distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                              mime="image/png")
+            
+            # Plot effective capacitance comparison
+            st.subheader("Effective Capacitance Comparison")
+            fig_c = plot_rq_capacitance_comparison(deconv_result)
+            st.pyplot(fig_c)
+            plt.close(fig_c)
+            
+            # Download capacitance plot
+            buf_c = io.BytesIO()
+            fig_c.savefig(buf_c, format='png', dpi=300, bbox_inches='tight')
+            buf_c.seek(0)
+            st.download_button("📥 Download Capacitance Plot", data=buf_c,
+                              file_name=f"effective_capacitance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                              mime="image/png")
+            
+            # Add interpretation guidance
+            st.markdown("---")
+            st.subheader("📖 Interpretation Guide")
+            
+            st.markdown("""
+            **CPE Exponent n Interpretation:**
+            - **n = 1.00** - Ideal capacitor (smooth, homogeneous surface)
+            - **0.95 < n < 1.00** - Slightly rough surface, minor inhomogeneity
+            - **0.85 < n < 0.95** - Moderately rough surface, significant porosity
+            - **0.70 < n < 0.85** - Highly porous electrode, fractal behavior
+            - **0.50 < n < 0.70** - Strongly dispersive behavior, diffusion-like response
+            
+            **Effective Capacitance C_eff:**
+            - Values typically in μF to mF range for electrochemical interfaces
+            - Larger C_eff indicates higher surface area or thicker double layer
+            - C_eff = Q^(1/n) × R^(1-n)/n (Brug's formula)
+            
+            **Characteristic Frequency f_max:**
+            - For n < 1, f_max is lower than 1/(2πτ) (RC approximation)
+            - Correction factor: [sin(nπ/2)]^(1/n) < 1 for n < 1
+            """)
+            
+        else:
+            st.info("RQ analysis not enabled. To enable RQ (CPE) analysis, go back to Step 3 and check 'Enable RQ (CPE) Analysis' in the sidebar before performing deconvolution.")
+            
+            if st.button("⬅️ Go to Step 3 to enable RQ Analysis"):
+                st.session_state.app_state.current_step = 3
+                st.rerun()
+    
+    with tab7:
         st.subheader("Export Results")
         
         col1, col2 = st.columns(2)
@@ -5141,6 +6048,14 @@ def step4_results():
                     'Characteristic_Frequency_Hz': p.get_characteristic_frequency(),
                     'Resistance_Contribution_Ohm': p.get_resistance_contribution()
                 })
+            
+            # Add RQ parameters if available
+            if deconv_result.use_rq_analysis and deconv_result.rq_peaks:
+                for i, p in enumerate(deconv_result.rq_peaks):
+                    peaks_data[i]['CPE_n'] = p.n
+                    peaks_data[i]['CPE_Q_F_s_n_minus_1'] = p.Q
+                    peaks_data[i]['Effective_Capacitance_F'] = p.effective_capacitance
+                    peaks_data[i]['RQ_f_max_Hz'] = p.characteristic_frequency
             
             peaks_df = pd.DataFrame(peaks_data)
             csv_peaks = peaks_df.to_csv(index=False)
@@ -5215,6 +6130,7 @@ Number of points: {len(deconv_result.x_linear)}
 Logarithmic X scale: {deconv_result.use_log_x}
 Baseline method: {deconv_result.baseline_method}
 Smoothing level: {st.session_state.app_state.smoothing_level}
+RQ Analysis: {'Enabled' if deconv_result.use_rq_analysis else 'Disabled'}
 
 """
                 
@@ -5252,13 +6168,26 @@ Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
 """
                 
                 report += f"""PEAK PARAMETERS:
-{"-"*100}
+{"-"*120}
 ID    Center (s)      Fmax (Hz)       C (F)           Area (Ω·s)     Fraction(%)    
-{"-"*100}"""
+{"-"*120}"""
                 
                 for p in deconv_result.peaks:
                     char = calculate_peak_characteristics(p)
                     report += f"\n{p.id:<4} {p.center:.4e}   {char['fmax_hz']:.4e}   {char['c_farad']:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
+                
+                # Add RQ parameters if available
+                if deconv_result.use_rq_analysis and deconv_result.rq_peaks:
+                    report += f"""
+
+{"="*80}
+RQ (CPE) ANALYSIS RESULTS:
+{"="*80}
+
+ID    n (CPE)        Q (F·sⁿ⁻¹)     C_eff (F)      f_max_RQ (Hz)
+{"-"*80}"""
+                    for p in deconv_result.rq_peaks:
+                        report += f"\n{p.id:<4} {p.n:.4f}       {p.Q:.4e}   {p.effective_capacitance:.4e}   {p.characteristic_frequency:.4e}"
                 
                 report += f"""
 
@@ -5379,7 +6308,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("⚡ **EIS-DRT Analysis Tool v5.0** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis | Updated with proper inductance handling (DRTtools approach)")
+    st.markdown("⚡ **EIS-DRT Analysis Tool v5.0** | Multi-stage workflow: DRT Analysis → Gaussian Deconvolution → Area Distribution Analysis | Updated with RQ (CPE) support for non-ideal behavior analysis")
 
 
 if __name__ == "__main__":
