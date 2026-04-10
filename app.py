@@ -1117,7 +1117,7 @@ class RQDRTCore(DRTCore):
     """
     
     def __init__(self, data: ImpedanceData, n_fixed: Optional[float] = None, 
-                 include_inductive: bool = False):
+                 include_inductive: bool = False, regularization_order: int = 2):
         """
         Initialize RQ-DRT solver.
         
@@ -1126,10 +1126,12 @@ class RQDRTCore(DRTCore):
             n_fixed: If provided, use fixed n for all processes.
                      If None, n is determined per peak from DRT shape (post-processing).
             include_inductive: Whether to include inductance in the model
+            regularization_order: Order of regularization (0, 1, or 2)
         """
         super().__init__(data, include_inductive)
         self.n_fixed = n_fixed
         self.alpha = n_fixed * np.pi / 2 if n_fixed is not None else None
+        self.regularization_order = 2
     
     def _build_kernel_matrix_rq(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -4941,7 +4943,7 @@ def step2_drt_analysis():
                                 )
                         
                         elif analysis_method == "RQ-DRT (CPE analysis)":
-                            drt_solver = RQDRTCore(temp_data, n_fixed=rq_n_fixed, include_inductive=include_inductive)
+                            drt_solver = RQDRTCore(temp_data, n_fixed=rq_n_fixed, include_inductive=include_inductive, regularization_order=reg_order)
                             
                             if include_inductive:
                                 result = drt_solver.compute_rq_with_inductance(
