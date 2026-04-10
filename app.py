@@ -1256,365 +1256,6 @@ class MaxEntropyDRT(DRTCore):
             return np.argmax(curvature) + 1
         return len(residuals) // 2
 
-# ============================================================================
-# RQ DRT Core with RQ Kernel
-# ============================================================================
-
-class RQDRTCore(DRTCore):
-    """
-    DRT core with RQ kernel support for CPE elements.
-    
-    For RQ elements (CPE), the impedance is:
-    Z_RQ(ω) = R / (1 + (iωτ)^n)
-    
-    The kernel for DRT becomes:
-    K_real = [1 + (ωτ)^n cos(nπ/2)] / [1 + 2(ωτ)^n cos(nπ/2) + (ωτ)^(2n)] * d(ln τ)
-    K_imag = -[(ωτ)^n sin(nπ/2)] / [1 + 2(ωτ)^n cos(nπ/2) + (ωτ)^(2n)] * d(ln τ)
-    
-    When n = 1, this reduces to the standard RC kernel.
-    """
-    
-    def __init__(self, data: ImpedanceData, n_global: Optional[float] = None, 
-                 include_inductive: bool = False):
-        """
-        Initialize RQ-DRT solver.
-        
-        Args:
-            data: ImpedanceData object
-            n_global: If provided, use fixed n for all processes.
-                     If None, n is determined per peak from DRT shape.
-            include_inductive: Whether to include inductance in the model
-        """
-        super().__init__(data, include_inductive)
-        self.n_global = n_global
-        self.is_rq_mode = True
-    
-    def _build_rq_kernel_matrix(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Build RQ kernel matrix for given time grid and fixed n.
-        
-        Args:
-            tau_grid: Array of relaxation times
-            n: CPE exponent (0 < n ≤ 1)
-        
-        Returns:
-            Tuple of (K_real, K_imag) matrices
-        """
-        M = len(tau_grid)
-        K_real = np.zeros((self.N, M))
-        K_imag = np.zeros((self.N, M))
-        
-        omega = 2 * np.pi * self.frequencies
-        dln_tau = np.mean(np.diff(np.log(tau_grid)))
-        cos_term = np.cos(n * np.pi / 2)
-        sin_term = np.sin(n * np.pi / 2)
-        
-        for i in range(self.N):
-            for j in range(M):
-                wtau_n = (omega[i] * tau_grid[j]) ** n
-                denominator = 1 + 2 * wtau_n * cos_term + wtau_n**2
-                
-                # RQ kernel
-                K_real[i, j] = (1 + wtau_n * cos_term) / denominator * dln_tau
-                K_imag[i, j] = -(wtau_n * sin_term) / denominator * dln_tau
-        
-        return K_real, K_imag
-    
-    def _build_rq_kernel_matrix_with_inductance(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Build RQ kernel matrix for DRT with inductance column.
-        
-        Args:
-            tau_grid: Array of relaxation times
-            n: CPE exponent
-        
-        Returns:
-            Tuple of (K_extended, K_real, K_imag)
-        """
-        K_real, K_imag = self._build_rq_kernel_matrix(tau_grid, n)
-        
-        # Build extended matrix with inductance column
-        omega = 2 * np.pi * self.frequencies
-        K_base = np.vstack([K_real, K_imag])
-        L_column = np.concatenate([np.zeros(self.N), -omega])
-        K_extended = np.column_stack([K_base, L_column])
-        
-        return K_extended, K_real, K_imag
-    
-    def compute_with_fixed_n(self, n: float, n_tau: int = 150, lambda_value: Optional[float] = None,
-                              lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
-        """
-        Compute DRT using RQ kernel with fixed n.
-        
-        Args:
-            n: CPE exponent (0 < n ≤ 1)
-            n_tau: Number of relaxation time points
-            lambda_value: Manual regularization parameter
-            lambda_auto: Whether to auto-select λ
-            lambda_range: Range of λ values for L-curve
-        
-        Returns:
-            DRTResult with DRT spectrum
-        """
-        # Create logarithmic grid of relaxation times
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        
-        # Build RQ kernel matrices
-        K_real, K_imag = self._build_rq_kernel_matrix(tau_grid, n)
-        
-        # Target vector: subtract ohmic resistance from real part
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
-        K = np.vstack([K_real, K_imag])
-        
-        # Build regularization matrix
-        L = self._build_regularization_matrix(n_tau, self.regularization_order)
-        
-        lambda_opt = None
-        gamma = None
-        
-        if lambda_auto:
-            if lambda_range is None:
-                lambda_range = np.logspace(-8, 2, 30)
-            
-            residuals = []
-            solution_norms = []
-            solutions = []
-            
-            for lam in lambda_range:
-                try:
-                    A = np.vstack([K, lam * L])
-                    b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-                    x = self._solve_nnls(A, b)
-                    
-                    residual = np.linalg.norm(K @ x - Z_target)
-                    sol_norm = np.linalg.norm(L @ x)
-                    
-                    residuals.append(residual)
-                    solution_norms.append(sol_norm)
-                    solutions.append(x)
-                except Exception as e:
-                    logging.warning(f"Lambda {lam} failed: {e}")
-                    continue
-            
-            if len(residuals) > 2:
-                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
-                lambda_opt = lambda_range[best_idx]
-                gamma = solutions[best_idx]
-            else:
-                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
-                A = np.vstack([K, lambda_opt * L])
-                b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-                gamma = self._solve_nnls(A, b)
-        else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-4
-            A = np.vstack([K, lambda_opt * L])
-            b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-            gamma = self._solve_nnls(A, b)
-        
-        # Calculate uncertainty estimate
-        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
-        
-        # Apply ln(10) correction
-        gamma_corrected = gamma * np.log(10)
-        gamma_std_corrected = gamma_std * np.log(10)
-        
-        drt_integral = self.get_drt_integral(gamma_corrected, tau_grid)
-        
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma_corrected,
-            gamma_std=gamma_std_corrected,
-            method=f"RQ-DRT (n={n:.3f})",
-            R_inf=self.R_inf,
-            R_pol=self.R_pol,
-            L=0.0,
-            lambda_opt=lambda_opt,
-            is_rq_mode=True,
-            n_global=n,
-            metadata={
-                'lambda': lambda_opt,
-                'order': self.regularization_order,
-                'lambda_auto': lambda_auto,
-                'drt_integral': drt_integral,
-                'integral_ratio': drt_integral / self.R_pol,
-                'n_global': n
-            }
-        )
-    
-    def compute_with_inductance_and_fixed_n(self, n: float, n_tau: int = 150, 
-                                             lambda_value: Optional[float] = None,
-                                             lambda_auto: bool = True, 
-                                             lambda_range: Optional[np.ndarray] = None) -> DRTResult:
-        """
-        Compute RQ-DRT with inductance using fixed n.
-        
-        Args:
-            n: CPE exponent
-            n_tau: Number of relaxation time points
-            lambda_value: Manual regularization parameter
-            lambda_auto: Whether to auto-select λ
-            lambda_range: Range of λ values for L-curve
-        
-        Returns:
-            DRTResult with DRT spectrum and inductance
-        """
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        
-        # Build extended kernel matrix with inductance
-        K_extended, K_real, K_imag = self._build_rq_kernel_matrix_with_inductance(tau_grid, n)
-        
-        # Target vector
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
-        
-        # Build regularization matrix for γ only
-        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
-        n_total = n_tau + 1
-        L_extended = np.zeros((L_reg.shape[0], n_total))
-        L_extended[:, :n_tau] = L_reg
-        
-        lambda_opt = None
-        gamma = None
-        L_value = None
-        
-        if lambda_auto:
-            if lambda_range is None:
-                lambda_range = np.logspace(-8, 2, 30)
-            
-            residuals = []
-            solution_norms = []
-            solutions = []
-            
-            for lam in lambda_range:
-                try:
-                    A = np.vstack([K_extended, lam * L_extended])
-                    b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
-                    x = self._solve_nnls(A, b)
-                    
-                    residual = np.linalg.norm(K_extended @ x - Z_target)
-                    sol_norm = np.linalg.norm(L_extended @ x)
-                    
-                    residuals.append(residual)
-                    solution_norms.append(sol_norm)
-                    solutions.append(x)
-                except Exception as e:
-                    logging.warning(f"Lambda {lam} failed: {e}")
-                    continue
-            
-            if len(residuals) > 2:
-                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
-                lambda_opt = lambda_range[best_idx]
-                x_opt = solutions[best_idx]
-                gamma = x_opt[:n_tau]
-                L_value = x_opt[-1]
-            else:
-                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
-                A = np.vstack([K_extended, lambda_opt * L_extended])
-                b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
-                x_opt = self._solve_nnls(A, b)
-                gamma = x_opt[:n_tau]
-                L_value = x_opt[-1]
-        else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-4
-            A = np.vstack([K_extended, lambda_opt * L_extended])
-            b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
-            x_opt = self._solve_nnls(A, b)
-            gamma = x_opt[:n_tau]
-            L_value = x_opt[-1]
-        
-        # Apply ln(10) correction
-        gamma_corrected = gamma * np.log(10)
-        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
-        gamma_std_corrected = gamma_std * np.log(10)
-        
-        drt_integral = self.get_drt_integral(gamma_corrected, tau_grid)
-        
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma_corrected,
-            gamma_std=gamma_std_corrected,
-            method=f"RQ-DRT with Inductance (n={n:.3f})",
-            R_inf=self.R_inf,
-            R_pol=self.R_pol,
-            L=L_value,
-            lambda_opt=lambda_opt,
-            is_rq_mode=True,
-            n_global=n,
-            metadata={
-                'lambda': lambda_opt,
-                'order': self.regularization_order,
-                'lambda_auto': lambda_auto,
-                'drt_integral': drt_integral,
-                'integral_ratio': drt_integral / self.R_pol,
-                'inductance': L_value,
-                'n_global': n
-            }
-        )
-    
-    def _build_regularization_matrix(self, M: int, order: int) -> np.ndarray:
-        """Build regularization matrix"""
-        if order == 0:
-            return np.eye(M)
-        elif order == 1:
-            L = np.zeros((M-1, M))
-            for i in range(M-1):
-                L[i, i] = -1
-                L[i, i+1] = 1
-            return L
-        elif order == 2:
-            L = np.zeros((M-2, M))
-            for i in range(M-2):
-                L[i, i] = 1
-                L[i, i+1] = -2
-                L[i, i+2] = 1
-            return L
-        else:
-            return np.eye(M)
-    
-    def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Solve non-negative least squares problem"""
-        from scipy.optimize import nnls
-        x, resid = nnls(A, b)
-        if resid > 1e-6 * np.linalg.norm(b):
-            logging.warning(f"NNLS residual: {resid}")
-        return x
-    
-    def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
-        """Find corner of L-curve (maximum curvature) for automatic λ selection"""
-        if len(residuals) < 3:
-            return len(residuals) // 2
-        
-        log_res = np.log(residuals + 1e-10)
-        log_sol = np.log(solution_norms + 1e-10)
-        
-        dlog_res = np.gradient(log_res)
-        dlog_sol = np.gradient(log_sol)
-        
-        if len(dlog_res) < 2 or len(dlog_sol) < 2:
-            return len(residuals) // 2
-        
-        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
-        
-        if len(curvature) > 0:
-            return np.argmax(curvature) + 1
-        return len(residuals) // 2
-    
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, n: float, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Reconstruct impedance from RQ-DRT.
-        
-        Args:
-            tau_grid: Relaxation time grid
-            gamma: DRT values (already scaled)
-            n: CPE exponent
-            L: Inductance value
-        
-        Returns:
-            Tuple of (Z_rec_real, Z_rec_imag)
-        """
-        K_real, K_imag = self._build_rq_kernel_matrix(tau_grid, n)
-        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
-        return Z_rec_real, Z_rec_imag
 
 # ============================================================================
 # Peak Detection and Analysis (from EIS code)
@@ -2214,6 +1855,366 @@ def multi_gaussian_with_baseline_flat(x, *params, n_peaks, baseline_method):
     )
 
 GaussianModelDeconv.multi_gaussian_with_baseline_flat = multi_gaussian_with_baseline_flat
+
+# ============================================================================
+# RQ DRT Core with RQ Kernel
+# ============================================================================
+
+class RQDRTCore(DRTCore):
+    """
+    DRT core with RQ kernel support for CPE elements.
+    
+    For RQ elements (CPE), the impedance is:
+    Z_RQ(ω) = R / (1 + (iωτ)^n)
+    
+    The kernel for DRT becomes:
+    K_real = [1 + (ωτ)^n cos(nπ/2)] / [1 + 2(ωτ)^n cos(nπ/2) + (ωτ)^(2n)] * d(ln τ)
+    K_imag = -[(ωτ)^n sin(nπ/2)] / [1 + 2(ωτ)^n cos(nπ/2) + (ωτ)^(2n)] * d(ln τ)
+    
+    When n = 1, this reduces to the standard RC kernel.
+    """
+    
+    def __init__(self, data: ImpedanceData, n_global: Optional[float] = None, 
+                 include_inductive: bool = False):
+        """
+        Initialize RQ-DRT solver.
+        
+        Args:
+            data: ImpedanceData object
+            n_global: If provided, use fixed n for all processes.
+                     If None, n is determined per peak from DRT shape.
+            include_inductive: Whether to include inductance in the model
+        """
+        super().__init__(data, include_inductive)
+        self.n_global = n_global
+        self.is_rq_mode = True
+    
+    def _build_rq_kernel_matrix(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build RQ kernel matrix for given time grid and fixed n.
+        
+        Args:
+            tau_grid: Array of relaxation times
+            n: CPE exponent (0 < n ≤ 1)
+        
+        Returns:
+            Tuple of (K_real, K_imag) matrices
+        """
+        M = len(tau_grid)
+        K_real = np.zeros((self.N, M))
+        K_imag = np.zeros((self.N, M))
+        
+        omega = 2 * np.pi * self.frequencies
+        dln_tau = np.mean(np.diff(np.log(tau_grid)))
+        cos_term = np.cos(n * np.pi / 2)
+        sin_term = np.sin(n * np.pi / 2)
+        
+        for i in range(self.N):
+            for j in range(M):
+                wtau_n = (omega[i] * tau_grid[j]) ** n
+                denominator = 1 + 2 * wtau_n * cos_term + wtau_n**2
+                
+                # RQ kernel
+                K_real[i, j] = (1 + wtau_n * cos_term) / denominator * dln_tau
+                K_imag[i, j] = -(wtau_n * sin_term) / denominator * dln_tau
+        
+        return K_real, K_imag
+    
+    def _build_rq_kernel_matrix_with_inductance(self, tau_grid: np.ndarray, n: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build RQ kernel matrix for DRT with inductance column.
+        
+        Args:
+            tau_grid: Array of relaxation times
+            n: CPE exponent
+        
+        Returns:
+            Tuple of (K_extended, K_real, K_imag)
+        """
+        K_real, K_imag = self._build_rq_kernel_matrix(tau_grid, n)
+        
+        # Build extended matrix with inductance column
+        omega = 2 * np.pi * self.frequencies
+        K_base = np.vstack([K_real, K_imag])
+        L_column = np.concatenate([np.zeros(self.N), -omega])
+        K_extended = np.column_stack([K_base, L_column])
+        
+        return K_extended, K_real, K_imag
+    
+    def compute_with_fixed_n(self, n: float, n_tau: int = 150, lambda_value: Optional[float] = None,
+                              lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+        """
+        Compute DRT using RQ kernel with fixed n.
+        
+        Args:
+            n: CPE exponent (0 < n ≤ 1)
+            n_tau: Number of relaxation time points
+            lambda_value: Manual regularization parameter
+            lambda_auto: Whether to auto-select λ
+            lambda_range: Range of λ values for L-curve
+        
+        Returns:
+            DRTResult with DRT spectrum
+        """
+        # Create logarithmic grid of relaxation times
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        # Build RQ kernel matrices
+        K_real, K_imag = self._build_rq_kernel_matrix(tau_grid, n)
+        
+        # Target vector: subtract ohmic resistance from real part
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        K = np.vstack([K_real, K_imag])
+        
+        # Build regularization matrix
+        L = self._build_regularization_matrix(n_tau, self.regularization_order)
+        
+        lambda_opt = None
+        gamma = None
+        
+        if lambda_auto:
+            if lambda_range is None:
+                lambda_range = np.logspace(-8, 2, 30)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    A = np.vstack([K, lam * L])
+                    b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+                    x = self._solve_nnls(A, b)
+                    
+                    residual = np.linalg.norm(K @ x - Z_target)
+                    sol_norm = np.linalg.norm(L @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                gamma = solutions[best_idx]
+            else:
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K, lambda_opt * L])
+                b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+                gamma = self._solve_nnls(A, b)
+        else:
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K, lambda_opt * L])
+            b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+            gamma = self._solve_nnls(A, b)
+        
+        # Calculate uncertainty estimate
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        
+        # Apply ln(10) correction
+        gamma_corrected = gamma * np.log(10)
+        gamma_std_corrected = gamma_std * np.log(10)
+        
+        drt_integral = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std_corrected,
+            method=f"RQ-DRT (n={n:.3f})",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            L=0.0,
+            lambda_opt=lambda_opt,
+            is_rq_mode=True,
+            n_global=n,
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol,
+                'n_global': n
+            }
+        )
+    
+    def compute_with_inductance_and_fixed_n(self, n: float, n_tau: int = 150, 
+                                             lambda_value: Optional[float] = None,
+                                             lambda_auto: bool = True, 
+                                             lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+        """
+        Compute RQ-DRT with inductance using fixed n.
+        
+        Args:
+            n: CPE exponent
+            n_tau: Number of relaxation time points
+            lambda_value: Manual regularization parameter
+            lambda_auto: Whether to auto-select λ
+            lambda_range: Range of λ values for L-curve
+        
+        Returns:
+            DRTResult with DRT spectrum and inductance
+        """
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        # Build extended kernel matrix with inductance
+        K_extended, K_real, K_imag = self._build_rq_kernel_matrix_with_inductance(tau_grid, n)
+        
+        # Target vector
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        
+        # Build regularization matrix for γ only
+        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
+        n_total = n_tau + 1
+        L_extended = np.zeros((L_reg.shape[0], n_total))
+        L_extended[:, :n_tau] = L_reg
+        
+        lambda_opt = None
+        gamma = None
+        L_value = None
+        
+        if lambda_auto:
+            if lambda_range is None:
+                lambda_range = np.logspace(-8, 2, 30)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    A = np.vstack([K_extended, lam * L_extended])
+                    b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                    x = self._solve_nnls(A, b)
+                    
+                    residual = np.linalg.norm(K_extended @ x - Z_target)
+                    sol_norm = np.linalg.norm(L_extended @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                x_opt = solutions[best_idx]
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+            else:
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K_extended, lambda_opt * L_extended])
+                b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                x_opt = self._solve_nnls(A, b)
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+        else:
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K_extended, lambda_opt * L_extended])
+            b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+            x_opt = self._solve_nnls(A, b)
+            gamma = x_opt[:n_tau]
+            L_value = x_opt[-1]
+        
+        # Apply ln(10) correction
+        gamma_corrected = gamma * np.log(10)
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        gamma_std_corrected = gamma_std * np.log(10)
+        
+        drt_integral = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std_corrected,
+            method=f"RQ-DRT with Inductance (n={n:.3f})",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            L=L_value,
+            lambda_opt=lambda_opt,
+            is_rq_mode=True,
+            n_global=n,
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol,
+                'inductance': L_value,
+                'n_global': n
+            }
+        )
+    
+    def _build_regularization_matrix(self, M: int, order: int) -> np.ndarray:
+        """Build regularization matrix"""
+        if order == 0:
+            return np.eye(M)
+        elif order == 1:
+            L = np.zeros((M-1, M))
+            for i in range(M-1):
+                L[i, i] = -1
+                L[i, i+1] = 1
+            return L
+        elif order == 2:
+            L = np.zeros((M-2, M))
+            for i in range(M-2):
+                L[i, i] = 1
+                L[i, i+1] = -2
+                L[i, i+2] = 1
+            return L
+        else:
+            return np.eye(M)
+    
+    def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Solve non-negative least squares problem"""
+        from scipy.optimize import nnls
+        x, resid = nnls(A, b)
+        if resid > 1e-6 * np.linalg.norm(b):
+            logging.warning(f"NNLS residual: {resid}")
+        return x
+    
+    def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
+        """Find corner of L-curve (maximum curvature) for automatic λ selection"""
+        if len(residuals) < 3:
+            return len(residuals) // 2
+        
+        log_res = np.log(residuals + 1e-10)
+        log_sol = np.log(solution_norms + 1e-10)
+        
+        dlog_res = np.gradient(log_res)
+        dlog_sol = np.gradient(log_sol)
+        
+        if len(dlog_res) < 2 or len(dlog_sol) < 2:
+            return len(residuals) // 2
+        
+        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
+        
+        if len(curvature) > 0:
+            return np.argmax(curvature) + 1
+        return len(residuals) // 2
+    
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, n: float, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reconstruct impedance from RQ-DRT.
+        
+        Args:
+            tau_grid: Relaxation time grid
+            gamma: DRT values (already scaled)
+            n: CPE exponent
+            L: Inductance value
+        
+        Returns:
+            Tuple of (Z_rec_real, Z_rec_imag)
+        """
+        K_real, K_imag = self._build_rq_kernel_matrix(tau_grid, n)
+        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
+        return Z_rec_real, Z_rec_imag
 
 
 # ============================================================================
