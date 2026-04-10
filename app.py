@@ -3716,7 +3716,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     
     # For R∞, use the first experimental point (high frequency limit) rather than extrapolated value
     # This ensures R∞ corresponds to the actual spectrum when inductance is present
-    first_point_idx = 0
+    highest_freq_idx = -1
     R_inf_actual = re_exp_sorted[first_point_idx]
     
     # Mark R∞ point with actual first point
