@@ -3714,12 +3714,26 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         ax.plot(curve['end_R'], 0, 'o', color=color, markersize=4,
                markeredgecolor='black', markeredgewidth=0.5)
     
-    # For R∞, use the first experimental point (high frequency limit) rather than extrapolated value
-    # This ensures R∞ corresponds to the actual spectrum when inductance is present
-    highest_freq_idx = -1
-    R_inf_actual = re_exp_sorted[highest_freq_idx]
+    # For R∞ with inductive behavior: find the point where -Im(Z) crosses zero
+    # This is the true high-frequency limit when inductive tail is present
+    R_inf_actual = None
     
-    # Mark R∞ point with actual highest frequency point
+    # Find zero crossing of -Im(Z) (where sign changes from positive to negative)
+    zero_crossing_idx = None
+    for i in range(len(im_exp_sorted) - 1):
+        if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
+            # Linear interpolation to find exact zero crossing
+            t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
+            zero_crossing_idx = i
+            R_inf_actual = re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i])
+            break
+    
+    # If no zero crossing found (no inductive behavior), use highest frequency point
+    if R_inf_actual is None:
+        highest_freq_idx = -1
+        R_inf_actual = re_exp_sorted[highest_freq_idx]
+    
+    # Mark R∞ point with actual intersection point
     ax.plot(R_inf_actual, 0, '^', color='red', markersize=6,
            markeredgecolor='black', markeredgewidth=0.8, label=f'R∞ = {R_inf_actual:.4f} Ω')
     
