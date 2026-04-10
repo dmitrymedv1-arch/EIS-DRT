@@ -3451,7 +3451,7 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
             
             # Add annotation if inductive tail is truncated
             if negative_min < y_min_data:
-                ax.annotate(f'Inductive tail extends to {negative_min:.2e} Ω\n(truncated for clarity)',
+                # ax.annotate(f'Inductive tail extends to {negative_min:.2e} Ω\n(truncated for clarity)',
                            xy=(np.min(re_z_plot), y_min_data * 0.9),
                            xytext=(np.min(re_z_plot) + (np.max(re_z_plot)-np.min(re_z_plot))*0.05, 
                                   y_min_data * 0.7),
