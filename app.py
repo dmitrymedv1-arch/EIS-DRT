@@ -3616,7 +3616,9 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
 def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                               drt_result: DRTResult,
                               data: ImpedanceData,
-                              title: str = "Experimental vs Sequential RC Model") -> plt.Figure:
+                              title: str = "Experimental vs Sequential RC Model",
+                              use_cpe: bool = True,
+                              n_exponent: float = None) -> plt.Figure:
     """
     Plot experimental impedance spectrum with sequential RC model.
     Each Gaussian peak corresponds to one RC element.
@@ -3667,24 +3669,53 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
     color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     
-    # Add each RC element
-    for peak in peaks_sorted:
+    # Determine n values for each peak
+    n_peaks = len(peaks_sorted)
+    
+    if use_cpe:
+        if n_exponent is not None:
+            # Use same n for all peaks
+            n_values = [n_exponent] * n_peaks
+        else:
+            # Estimate n_i from peak width (wider peak = lower n)
+            # This is an empirical correlation
+            n_values = []
+            for peak in peaks_sorted:
+                # FWHM in log space: ideal RC has FWHM ~ 2.0 decades
+                # Wider distribution -> lower n
+                fwhm_decades = peak.fwhm / np.log(10)  # Convert to decades
+                # Empirical mapping: FWHM=2.0 -> n=1.0, FWHM=3.0 -> n=0.8
+                n_est = max(0.6, min(1.0, 2.2 - fwhm_decades * 0.2))
+                n_values.append(n_est)
+    else:
+        n_values = [1.0] * n_peaks
+    
+    # Add each RC/CPE element
+    for idx, peak in enumerate(peaks_sorted):
         R_i = peak.area
         tau_i = peak.center
-        # RC element: Z_i = R_i / (1 + iωτ_i)
-        Z_i = R_i / (1 + 1j * omega * tau_i)
+        n_i = n_values[idx]
+        
+        # Calculate impedance based on model type
+        if use_cpe and n_i < 0.99:
+            Z_i = calculate_cpe_impedance(omega, R_i, tau_i, n_i)
+        else:
+            # Ideal RC element
+            Z_i = R_i / (1 + 1j * omega * tau_i)
+        
         Z_total += Z_i
         
         # Store for individual curve plotting
         cumulative_R_prev = cumulative_R
         cumulative_R += R_i
         
-        # The individual RC element contribution as a separate curve
+        # The individual element contribution
         Z_individual = cumulative_R_prev + Z_i
         rc_curves.append({
             'id': peak.id,
             'R': R_i,
             'tau': tau_i,
+            'n': n_i,
             'f_char': peak.get_characteristic_frequency(),
             'Z': Z_individual,
             'start_R': cumulative_R_prev,
@@ -3705,7 +3736,10 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         re_curve = np.real(curve['Z'])
         im_curve = -np.imag(curve['Z'])  # -Im(Z) for plotting
         ax.plot(re_curve, im_curve, '-', linewidth=1.2, color=color,
-               label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω',
+                if use_cpe and curve.get('n', 1.0) < 0.99:
+                    label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω, n={curve["n"]:.3f}'
+                else:
+                    label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω'
                zorder=2)
         
         # Mark start and end points of each semicircle
@@ -3804,6 +3838,32 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     
     plt.tight_layout()
     return fig
+
+def calculate_cpe_impedance(omega, R, tau, n):
+    """
+    Calculate impedance of CPE element in parallel with R.
+    Z = R / (1 + (iωτ)^n)
+    
+    Args:
+        omega: angular frequency (rad/s)
+        R: resistance (Ohm)
+        tau: characteristic time constant (s)
+        n: CPE exponent (0 < n ≤ 1)
+    
+    Returns:
+        complex impedance array
+    """
+    s = 1j * omega
+    # (iωτ)^n = (iω)^n * τ^n
+    # For numerical stability, compute magnitude and phase separately
+    omega_tau = omega * tau
+    # (i)^n = exp(i * n * π/2)
+    magnitude = omega_tau ** n
+    phase = n * np.pi / 2
+    complex_term = magnitude * (np.cos(phase) + 1j * np.sin(phase))
+    
+    Z = R / (1 + complex_term)
+    return Z
 
 # ============================================================================
 # Step 1: Data Loading and Preprocessing
@@ -5089,7 +5149,9 @@ def step4_results():
         st.markdown("**2.4 Experimental vs Sequential RC Model**")
         if deconv_result is not None and drt_result is not None and data is not None:
             fig4 = plot_sequential_rc_model(deconv_result, drt_result, data,
-                                             "Experimental vs Sequential RC Model")
+                                             "Experimental vs Sequential RC Model",
+                                             use_cpe=True,
+                                             n_exponent=None)
             st.pyplot(fig4)
             plt.close(fig4)
             
