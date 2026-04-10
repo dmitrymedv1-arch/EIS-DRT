@@ -3852,12 +3852,12 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         
         # End point (current cumulative R)
         end_R = np.real(Z_cumulative)
-        ax.plot(end_R, 0, 'o', color=color, markersize=6,
+        ax.plot([end_R], [0], 'o', color=color, markersize=6,
                markeredgecolor='black', markeredgewidth=0.5)
     
     # Mark R∞ point (corrected)
-    ax.plot(R_inf_corrected, 0, '^', color='red', markersize=10,
-           markeredgecolor='black', markeredgewidth=1, label=f'R∞ = {R_inf_corrected:.4f} Ω')
+    ax.plot([R_inf_corrected], [0], '^', color='red', markersize=10,
+            markeredgecolor='black', markeredgewidth=1, label=f'R∞ = {R_inf_corrected:.4f} Ω')
     
     # Add inductance annotation if present
     if drt_result.L > 0:
@@ -3879,8 +3879,8 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     
     # Mark final total resistance
     total_R = R_inf_corrected + drt_result.R_pol
-    ax.plot(total_R, 0, 'd', color='darkred', markersize=10,
-           markeredgecolor='black', markeredgewidth=1, label=f'Total R = {total_R:.4f} Ω')
+    ax.plot([total_R], [0], 'd', color='darkred', markersize=10,
+            markeredgecolor='black', markeredgewidth=1, label=f'Total R = {total_R:.4f} Ω')
     
     # Add horizontal line at y=0 for reference
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
