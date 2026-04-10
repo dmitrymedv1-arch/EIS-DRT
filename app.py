@@ -3735,12 +3735,15 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         color = color_map[curve['id']]
         re_curve = np.real(curve['Z'])
         im_curve = -np.imag(curve['Z'])  # -Im(Z) for plotting
+        
+        # Determine label based on model type
+        if use_cpe and curve.get('n', 1.0) < 0.99:
+            label = f'Process {curve["id"]}: R={curve["R"]:.3e} Ω, n={curve["n"]:.3f}'
+        else:
+            label = f'Process {curve["id"]}: R={curve["R"]:.3e} Ω'
+        
         ax.plot(re_curve, im_curve, '-', linewidth=1.2, color=color,
-                if use_cpe and curve.get('n', 1.0) < 0.99:
-                    label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω, n={curve["n"]:.3f}'
-                else:
-                    label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω'
-               zorder=2)
+                label=label, zorder=2)
         
         # Mark start and end points of each semicircle
         ax.plot(curve['start_R'], 0, 's', color=color, markersize=4,
