@@ -61,7 +61,7 @@ def apply_modern_scientific_style():
         'grid.alpha': 0.3,
         'grid.linestyle': '--',
         
-        # Tick settings - make tick labels black
+        # Tick settings - MAKE TICK LABELS BLACK
         'xtick.color': 'black',
         'ytick.color': 'black',
         'xtick.labelsize': 12,
@@ -220,205 +220,6 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
-
-
-# ============================================================================
-# Helper Functions for Number Formatting
-# ============================================================================
-
-def format_scientific_superscript(value: float, decimals: int = 1) -> str:
-    """
-    Format number in scientific notation with superscript exponents.
-    Example: 1·10⁴ instead of 1·10^4
-    
-    Args:
-        value: Number to format
-        decimals: Number of decimal places for mantissa
-    
-    Returns:
-        Formatted string with superscript exponents
-    """
-    if value == 0:
-        return "0"
-    
-    # Superscript mapping
-    superscript_map = {
-        '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
-        '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
-        '-': '⁻'
-    }
-    
-    # Get exponent
-    exponent = int(np.floor(np.log10(abs(value))))
-    mantissa = value / (10 ** exponent)
-    
-    # Round mantissa to specified decimals
-    mantissa = round(mantissa, decimals)
-    
-    # If mantissa becomes 10 after rounding
-    if abs(mantissa) >= 10:
-        mantissa /= 10
-        exponent += 1
-    
-    # Format mantissa
-    if decimals == 0:
-        mantissa_str = f"{int(mantissa)}"
-    else:
-        mantissa_str = f"{mantissa:.{decimals}f}"
-    
-    # Convert exponent to superscript
-    exponent_str = ''.join(superscript_map.get(ch, ch) for ch in str(exponent))
-    
-    return f"{mantissa_str}·10{exponent_str}"
-
-
-def sort_peaks_by_frequency(peaks: List[GaussianPeak]) -> List[GaussianPeak]:
-    """
-    Sort peaks by characteristic frequency (high to low) and reassign IDs.
-    
-    Args:
-        peaks: List of GaussianPeak objects
-    
-    Returns:
-        Sorted list with reassigned IDs
-    """
-    if not peaks:
-        return peaks
-    
-    # Sort by characteristic frequency (descending: high frequency first)
-    sorted_peaks = sorted(peaks, key=lambda p: p.get_characteristic_frequency(), reverse=True)
-    
-    # Reassign IDs
-    for idx, peak in enumerate(sorted_peaks):
-        peak.id = idx + 1
-    
-    return sorted_peaks
-
-
-def get_consistent_colors(n_peaks: int) -> List[str]:
-    """
-    Get consistent color palette for peaks.
-    
-    Args:
-        n_peaks: Number of peaks
-    
-    Returns:
-        List of colors
-    """
-    return plt.cm.Set3(np.linspace(0, 1, max(n_peaks, 1)))
-
-
-# ============================================================================
-# RQ Model Functions for Sequential RC Model
-# ============================================================================
-
-def calculate_RQ_impedance(omega: np.ndarray, R: float, tau: float, n: float) -> np.ndarray:
-    """
-    Calculate impedance of a constant phase element (RQ) model.
-    Z_RQ = R / (1 + (iωτ)^n)
-    
-    Args:
-        omega: Angular frequency array (rad/s)
-        R: Resistance (Ω)
-        tau: Time constant (s)
-        n: CPE exponent (0 < n ≤ 1)
-    
-    Returns:
-        Complex impedance array
-    """
-    return R / (1 + (1j * omega * tau) ** n)
-
-
-def calculate_sequential_RQ_model(omega: np.ndarray, R_inf: float, L: float,
-                                    peaks: List[GaussianPeak], n_values: Optional[List[float]] = None) -> np.ndarray:
-    """
-    Calculate total impedance of sequential RQ model.
-    Z = R∞ + iωL + Σ [R_i / (1 + (iωτ_i)^n_i)]
-    
-    Args:
-        omega: Angular frequency array (rad/s)
-        R_inf: Ohmic resistance (Ω)
-        L: Inductance (H)
-        peaks: List of GaussianPeak objects (sorted by frequency)
-        n_values: Optional list of n exponents for each peak
-    
-    Returns:
-        Total complex impedance array
-    """
-    Z_total = np.zeros_like(omega, dtype=complex)
-    Z_total += R_inf
-    Z_total += 1j * omega * L
-    
-    if n_values is None:
-        # Default n = 0.85 for all peaks (typical for many systems)
-        n_values = [0.85] * len(peaks)
-    
-    for i, peak in enumerate(peaks):
-        n_val = n_values[i] if i < len(n_values) else 0.85
-        Z_i = calculate_RQ_impedance(omega, peak.area, peak.center, n_val)
-        Z_total += Z_i
-    
-    return Z_total
-
-
-def estimate_RQ_exponents_from_spectrum(peaks: List[GaussianPeak], 
-                                         frequencies: np.ndarray,
-                                         Z_imag: np.ndarray) -> List[float]:
-    """
-    Estimate n exponents for RQ elements based on depression of semicircles.
-    
-    The depression angle φ = (1-n)*π/2, where φ is the angle by which
-    the center of the semicircle is depressed below the real axis.
-    
-    Args:
-        peaks: List of GaussianPeak objects
-        frequencies: Frequency array (Hz)
-        Z_imag: Imaginary part of impedance (-Im(Z))
-    
-    Returns:
-        List of estimated n values for each peak
-    """
-    n_values = []
-    
-    for peak in peaks:
-        f_char = peak.get_characteristic_frequency()
-        
-        # Find frequency range around characteristic frequency
-        freq_range = np.logical_and(frequencies > f_char / 10, frequencies < f_char * 10)
-        
-        if np.any(freq_range):
-            # Get imaginary part in this range
-            imag_around = Z_imag[freq_range]
-            
-            # Find maximum imaginary value (height of semicircle)
-            max_imag = np.max(imag_around)
-            
-            # Get resistance for this process
-            R_i = peak.area
-            
-            # For an ideal RC element, max_imag = R/2
-            # For depressed semicircle, max_imag = R/2 * sin((1-n)*π/2)
-            if R_i > 0:
-                ideal_height = R_i / 2
-                actual_ratio = max_imag / ideal_height
-                
-                # Clamp ratio to [0, 1]
-                actual_ratio = np.clip(actual_ratio, 0.1, 1.0)
-                
-                # Calculate n from ratio: ratio = sin((1-n)*π/2)
-                # (1-n)*π/2 = arcsin(ratio)
-                # n = 1 - (2/π)*arcsin(ratio)
-                n_est = 1 - (2 / np.pi) * np.arcsin(actual_ratio)
-                
-                # Clamp n to reasonable range
-                n_est = np.clip(n_est, 0.3, 1.0)
-                n_values.append(n_est)
-            else:
-                n_values.append(0.85)
-        else:
-            n_values.append(0.85)
-    
-    return n_values
 
 
 # ============================================================================
@@ -589,6 +390,11 @@ class GaussianPeak:
     fraction_percent: float  # Percentage fraction (0-100)
     source: str = 'auto'  # Source: 'auto', 'manual', 'residuals'
     y_norm: np.ndarray = None  # Normalized y values for plotting
+    characteristic_frequency: float = None  # Added for sorting
+    
+    def __post_init__(self):
+        if self.characteristic_frequency is None:
+            self.characteristic_frequency = 1.0 / (2 * np.pi * self.center)
     
     def get_characteristic_frequency(self) -> float:
         """
@@ -598,7 +404,7 @@ class GaussianPeak:
         Returns:
             float: Characteristic frequency in Hz
         """
-        return 1.0 / (2 * np.pi * self.center)
+        return self.characteristic_frequency
     
     def get_resistance_contribution(self) -> float:
         """
@@ -657,16 +463,7 @@ class DeconvolutionResult:
         Returns:
             List[float]: Characteristic frequencies in Hz
         """
-        return [1.0 / (2 * np.pi * p.center) for p in self.peaks]
-    
-    def get_sorted_peaks(self) -> List[GaussianPeak]:
-        """
-        Get peaks sorted by characteristic frequency (high to low).
-        
-        Returns:
-            List of sorted GaussianPeak objects
-        """
-        return sort_peaks_by_frequency(self.peaks.copy())
+        return [p.get_characteristic_frequency() for p in self.peaks]
 
 
 # ============================================================================
@@ -2972,11 +2769,21 @@ class GaussianDeconvolver:
             return False
     
     def create_deconvolution_result(self) -> DeconvolutionResult:
-        """Create result container from current components"""
-        peaks = []
+        """Create result container from current components with peaks sorted by frequency (high to low)"""
+        # Sort components by characteristic frequency (high to low) and reassign IDs
+        components_with_freq = []
         for c in self.components:
+            freq = 1.0 / (2 * np.pi * c['cen_linear'])
+            components_with_freq.append((freq, c))
+        
+        # Sort by frequency descending (high to low)
+        components_with_freq.sort(key=lambda x: x[0], reverse=True)
+        
+        # Create peaks with new IDs in sorted order
+        peaks = []
+        for new_id, (freq, c) in enumerate(components_with_freq, start=1):
             peak = GaussianPeak(
-                id=c['id'],
+                id=new_id,
                 center=c['cen_linear'],
                 center_log=c['cen_log'],
                 amplitude=c['amp'],
@@ -2987,22 +2794,23 @@ class GaussianDeconvolver:
                 fraction=c['fraction'],
                 fraction_percent=c['fraction_percent'],
                 source=c.get('source', 'auto'),
-                y_norm=c['y_norm']
+                y_norm=c['y_norm'],
+                characteristic_frequency=freq
             )
             peaks.append(peak)
-        
-        # Sort peaks by frequency before creating result
-        peaks = sort_peaks_by_frequency(peaks)
         
         # Use original y_original values
         y_original_restored = self.y_original.copy()
         
         # Calculate total area from components (should be close to drt_integral)
-        total_component_area = sum([c['area'] for c in self.components])
+        total_component_area = sum([p.area for p in peaks])
         
         print(f"Original DRT integral: {self.drt_integral:.6f} Ω")
         print(f"Total area from deconvolution: {total_component_area:.6f} Ω")
         print(f"Ratio (should be ~1.0): {total_component_area/self.drt_integral:.4f}")
+        
+        # Reorder fit_y_original according to sorted peaks if needed for consistent display
+        # For fit_y_original, we need to keep it as is (it's the total fit, not per-peak)
         
         return DeconvolutionResult(
             peaks=peaks,
@@ -3018,7 +2826,7 @@ class GaussianDeconvolver:
             baseline_params=self.baseline_params,
             baseline_method=self.baseline_method,
             total_area=self.drt_integral,  # Use the original DRT integral as total area
-            max_amplitude=max([c['amp'] for c in self.components]) if self.components else 0
+            max_amplitude=max([p.amplitude for p in peaks]) if peaks else 0
         )
         
     def calculate_peak_area(self, amplitude: float, sigma: float, is_log_scale: bool = True) -> float:
@@ -3053,6 +2861,56 @@ class GaussianDeconvolver:
         """
         return self.drt_integral
 
+
+# ============================================================================
+# Helper function for number formatting with superscript
+# ============================================================================
+
+def format_with_superscript(number: float) -> str:
+    """
+    Format a number with superscript for powers of 10.
+    Example: 1.23e-4 -> "1.23·10⁻⁴"
+    """
+    if number == 0:
+        return "0"
+    
+    # Handle numbers that don't need scientific notation
+    if 0.001 <= abs(number) <= 10000:
+        # Check if it's a round number
+        if abs(number - round(number)) < 1e-10:
+            return str(int(round(number)))
+        # Format with reasonable precision
+        if abs(number) >= 1:
+            return f"{number:.2f}".rstrip('0').rstrip('.')
+        else:
+            # For small numbers, use scientific notation with superscript
+            pass
+    
+    # Scientific notation with superscript
+    exponent = int(np.floor(np.log10(abs(number))))
+    mantissa = number / (10 ** exponent)
+    
+    # Format mantissa
+    if abs(mantissa - round(mantissa)) < 1e-10:
+        mantissa_str = str(int(round(mantissa)))
+    else:
+        mantissa_str = f"{mantissa:.2f}".rstrip('0').rstrip('.')
+    
+    # Superscript mapping
+    sup_map = {
+        '-': '⁻', '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+        '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'
+    }
+    
+    # Handle negative exponent
+    if exponent < 0:
+        exp_str = ''.join(sup_map.get(c, c) for c in str(abs(exponent)))
+        return f"{mantissa_str}·10⁻{exp_str}"
+    else:
+        exp_str = ''.join(sup_map.get(c, c) for c in str(exponent))
+        return f"{mantissa_str}·10{exp_str}"
+
+
 # ============================================================================
 # Visualization Functions (from both codes)
 # ============================================================================
@@ -3063,9 +2921,8 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
     """Create publication-quality Nyquist plot"""
     fig, ax = plt.subplots(figsize=(9, 7))
     
-    # Set tick colors to black
-    ax.tick_params(axis='x', colors='black')
-    ax.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
@@ -3081,9 +2938,9 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
         ax.plot(re_rec, im_rec, 's-', markersize=4, linewidth=1.2,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=14, color='black')
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=14, color='black')
-    # Title removed as requested
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=14)
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=14)
+    # No title - removed as requested
     ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black', fontsize=12)
     ax.grid(True, alpha=0.3, linestyle='--')
     
@@ -3105,11 +2962,9 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     """Create publication-quality Bode plot with highlight point"""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
     
-    # Set tick colors to black
-    ax1.tick_params(axis='x', colors='black')
-    ax1.tick_params(axis='y', colors='black')
-    ax2.tick_params(axis='x', colors='black')
-    ax2.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax1.tick_params(axis='both', colors='black')
+    ax2.tick_params(axis='both', colors='black')
     ax1.xaxis.label.set_color('black')
     ax1.yaxis.label.set_color('black')
     ax2.xaxis.label.set_color('black')
@@ -3128,8 +2983,8 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax1.loglog(data.freq, mag_rec, 's-', markersize=4, linewidth=1.2,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax1.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14, color='black')
-    ax1.set_ylabel("|Z| / Ohm", fontweight='bold', fontsize=14, color='black')
+    ax1.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14)
+    ax1.set_ylabel("|Z| / Ohm", fontweight='bold', fontsize=14)
     ax1.legend(loc='best', fontsize=12)
     ax1.grid(True, alpha=0.3, linestyle='--')
     
@@ -3150,8 +3005,8 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax2.semilogx(data.freq, phase_rec, 's-', markersize=4, linewidth=1.2,
                      label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax2.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14, color='black')
-    ax2.set_ylabel("Phase / deg", fontweight='bold', fontsize=14, color='black')
+    ax2.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14)
+    ax2.set_ylabel("Phase / deg", fontweight='bold', fontsize=14)
     ax2.legend(loc='best', fontsize=12)
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
@@ -3160,7 +3015,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     ax2.xaxis.set_major_formatter(ScalarFormatter(useMathText=False))
     ax2.yaxis.set_major_formatter(ScalarFormatter(useMathText=False))
     
-    # Title removed as requested
+    # No title - removed as requested
     plt.tight_layout()
     
     return fig
@@ -3171,11 +3026,9 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     """Create publication-quality DRT plot with both tau and frequency axes"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
-    # Set tick colors to black
-    ax1.tick_params(axis='x', colors='black')
-    ax1.tick_params(axis='y', colors='black')
-    ax2.tick_params(axis='x', colors='black')
-    ax2.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax1.tick_params(axis='both', colors='black')
+    ax2.tick_params(axis='both', colors='black')
     ax1.xaxis.label.set_color('black')
     ax1.yaxis.label.set_color('black')
     ax2.xaxis.label.set_color('black')
@@ -3205,9 +3058,9 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
     # Используем обычный текст без LaTeX
-    ax1.set_xlabel("Relaxation Time (s)", fontweight='bold', color='black')
-    ax1.set_ylabel("gamma (Ohm)", fontweight='bold', color='black')
-    # Title removed as requested
+    ax1.set_xlabel("Relaxation Time (s)", fontweight='bold')
+    ax1.set_ylabel("gamma (Ohm)", fontweight='bold')
+    # No title - removed as requested
     ax1.legend(loc='best', frameon=True)
     ax1.grid(True, alpha=0.3, linestyle='--', which='both')
     
@@ -3239,9 +3092,9 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
                        fontsize=8, ha='center',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7))
     
-    ax2.set_xlabel("Frequency (Hz)", fontweight='bold', color='black')
-    ax2.set_ylabel("gamma(tau) (Ohm)", fontweight='bold', color='black')
-    # Title removed as requested
+    ax2.set_xlabel("Frequency (Hz)", fontweight='bold')
+    ax2.set_ylabel("gamma(tau) (Ohm)", fontweight='bold')
+    # No title - removed as requested
     ax2.legend(loc='best', frameon=True)
     ax2.grid(True, alpha=0.3, linestyle='--', which='both')
     ax2.set_xscale('log')
@@ -3249,7 +3102,7 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
     ax2.set_xlim(freqs_sorted[0], freqs_sorted[-1])
     ax2.xaxis.set_minor_locator(AutoMinorLocator())
     
-    # Title removed as requested
+    # No overall figure title - removed as requested
     plt.tight_layout()
     
     return fig
@@ -3260,20 +3113,13 @@ def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_component
     """Plot deconvolution result with components and baseline"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
-    # Set tick colors to black
-    ax1.tick_params(axis='x', colors='black')
-    ax1.tick_params(axis='y', colors='black')
-    ax2.tick_params(axis='x', colors='black')
-    ax2.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax1.tick_params(axis='both', colors='black')
+    ax2.tick_params(axis='both', colors='black')
     ax1.xaxis.label.set_color('black')
     ax1.yaxis.label.set_color('black')
     ax2.xaxis.label.set_color('black')
     ax2.yaxis.label.set_color('black')
-    
-    # Get sorted peaks for consistent coloring
-    sorted_peaks = deconv_result.get_sorted_peaks()
-    n_peaks = len(sorted_peaks)
-    colors = get_consistent_colors(n_peaks)
     
     # Left plot: Main deconvolution
     if deconv_result.use_log_x:
@@ -3288,10 +3134,15 @@ def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_component
     else:
         x_dense_log = x_dense
     
-    if show_components and sorted_peaks:
-        for peak, color in zip(sorted_peaks, colors):
-            y_component = peak.amplitude * GaussianModelDeconv.gaussian(x_dense_log, 1.0, 
-                                                                         peak.center_log, peak.sigma_log)
+    # Define a consistent color mapping based on peak ID
+    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
+    
+    if show_components and deconv_result.peaks:
+        for peak in deconv_result.peaks:
+            color = color_map[peak.id]
+            y_component = GaussianModelDeconv.gaussian(x_dense_log, peak.amplitude_norm, 
+                                                       peak.center_log, peak.sigma_log) * deconv_result.y_original.max()
             ax1.fill_between(x_dense, 0, y_component, color=color, alpha=0.3, linewidth=0)
             ax1.plot(x_dense, y_component, '-', color=color, linewidth=2,
                     label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
@@ -3321,33 +3172,36 @@ def plot_deconvolution_result(deconv_result: DeconvolutionResult, show_component
         y_total_interp = interp_func(x_dense)
         ax1.plot(x_dense, y_total_interp, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
     elif deconv_result.fit_y_norm is not None:
-        n_peaks_fit = len(sorted_peaks)
+        n_peaks = len(deconv_result.peaks)
         peak_params = []
-        for peak in sorted_peaks:
+        for peak in deconv_result.peaks:
             peak_params.extend([peak.amplitude_norm, peak.center_log, peak.sigma_log])
         
         y_total = GaussianModelDeconv.multi_gaussian_with_baseline(
-            x_dense_log, n_peaks_fit, peak_params, 
+            x_dense_log, n_peaks, peak_params, 
             deconv_result.baseline_params or [], deconv_result.baseline_method
         ) * deconv_result.y_original.max()
         
         ax1.plot(x_dense, y_total, 'r--', linewidth=2, label='Total Fit', zorder=3)
     
-    ax1.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold', color='black')
-    ax1.set_ylabel('Intensity', fontweight='bold', color='black')
-    # Title removed as requested
+    ax1.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold')
+    ax1.set_ylabel('Intensity', fontweight='bold')
+    # No title - removed as requested
     ax1.legend(loc='upper right', fontsize=9, frameon=True, edgecolor='black')
     ax1.grid(True, alpha=0.3, linestyle='--')
     
     # Right plot: Area distribution
-    if sorted_peaks:
-        peaks_ids = [f'Peak {p.id}' for p in sorted_peaks]
-        fractions = [p.fraction_percent for p in sorted_peaks]
+    if deconv_result.peaks:
+        # Sort peaks by ID (which are already sorted by frequency high to low)
+        peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
+        peaks_ids = [f'Peak {p.id}' for p in peaks_sorted]
+        fractions = [p.fraction_percent for p in peaks_sorted]
+        colors_sorted = [color_map[p.id] for p in peaks_sorted]
         
-        bars = ax2.bar(peaks_ids, fractions, color=colors, edgecolor='black', alpha=0.7)
-        ax2.set_xlabel('Peak', fontweight='bold', color='black')
-        ax2.set_ylabel('Fraction (%)', fontweight='bold', color='black')
-        # Title removed as requested
+        bars = ax2.bar(peaks_ids, fractions, color=colors_sorted, edgecolor='black', alpha=0.7)
+        ax2.set_xlabel('Peak', fontweight='bold')
+        ax2.set_ylabel('Fraction (%)', fontweight='bold')
+        # No title - removed as requested
         ax2.set_ylim(0, max(fractions) * 1.2 if fractions else 100)
         ax2.grid(True, alpha=0.3, axis='y')
         
@@ -3374,9 +3228,8 @@ def plot_deconvolution_components_comparison(deconv_result: DeconvolutionResult)
     """Plot normalized components comparison"""
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Set tick colors to black
-    ax.tick_params(axis='x', colors='black')
-    ax.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
@@ -3389,22 +3242,22 @@ def plot_deconvolution_components_comparison(deconv_result: DeconvolutionResult)
     else:
         x_dense_log = x_dense
     
-    # Get sorted peaks for consistent coloring
-    sorted_peaks = deconv_result.get_sorted_peaks()
-    colors = get_consistent_colors(len(sorted_peaks))
+    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     
-    for peak, color in zip(sorted_peaks, colors):
+    for peak in deconv_result.peaks:
+        color = color_map[peak.id]
         y_component = GaussianModelDeconv.gaussian(x_dense_log, peak.amplitude_norm, 
                                                    peak.center_log, peak.sigma_log)
         y_component_norm = y_component / max(peak.amplitude_norm, 1e-10)
         
         ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
-               label=f'Peak {peak.id} (center: {peak.center:.3e})')
+               label=f'Peak {peak.id} (f={peak.get_characteristic_frequency():.2e} Hz)')
         ax.axvline(x=peak.center, color=color, linestyle=':', alpha=0.5, linewidth=1)
     
-    ax.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold', color='black')
-    ax.set_ylabel('Normalized Intensity', fontweight='bold', color='black')
-    # Title removed as requested
+    ax.set_xlabel('X' + (' (log scale)' if deconv_result.use_log_x else ''), fontweight='bold')
+    ax.set_ylabel('Normalized Intensity', fontweight='bold')
+    # No title - removed as requested
     ax.legend(loc='upper right', fontsize=9, frameon=True, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--')
     
@@ -3439,12 +3292,12 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     Plot original Nyquist spectrum with proper sign handling:
     - Capacitive loops appear ABOVE the x-axis (positive -Im(Z))
     - Inductive loops appear BELOW the x-axis (negative -Im(Z))
+    Min and max frequency points are plotted as labeled points (not in legend).
     """
     fig, ax = plt.subplots(figsize=(9, 12))
     
-    # Set tick colors to black
-    ax.tick_params(axis='x', colors='black')
-    ax.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
@@ -3461,22 +3314,55 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     min_freq_idx = np.argmin(freq_plot)
     max_freq_idx = np.argmax(freq_plot)
     
-    # Highlight extreme points
+    # Highlight extreme points with labels (not in legend)
     ax.plot(re_z_plot[min_freq_idx], im_z_plot[min_freq_idx], 'ro', 
-            markersize=10, markeredgecolor='darkred', markerfacecolor='red', alpha=0.8,
-            label=f'Min freq: {freq_plot[min_freq_idx]:.2e} Hz')
+            markersize=10, markeredgecolor='darkred', markerfacecolor='red', alpha=0.8)
     ax.plot(re_z_plot[max_freq_idx], im_z_plot[max_freq_idx], 'go', 
-            markersize=10, markeredgecolor='darkgreen', markerfacecolor='green', alpha=0.8,
-            label=f'Max freq: {freq_plot[max_freq_idx]:.2e} Hz')
+            markersize=10, markeredgecolor='darkgreen', markerfacecolor='green', alpha=0.8)
+    
+    # Add labels for min and max frequency points with superscript formatting
+    f_min = freq_plot[min_freq_idx]
+    f_max = freq_plot[max_freq_idx]
+    
+    # Calculate offset for labels based on data range
+    x_range = np.max(re_z_plot) - np.min(re_z_plot)
+    y_range = np.max(im_z_plot) - np.min(im_z_plot)
+    offset_x = x_range * 0.03
+    offset_y = y_range * 0.03
+    
+    # Format frequency labels with superscript
+    f_min_label = format_with_superscript(f_min)
+    f_max_label = format_with_superscript(f_max)
+    
+    # Adjust label position based on sign of imaginary part
+    if im_z_plot[min_freq_idx] >= 0:
+        text_y_offset_min = offset_y
+    else:
+        text_y_offset_min = -offset_y * 1.5
+    
+    if im_z_plot[max_freq_idx] >= 0:
+        text_y_offset_max = offset_y
+    else:
+        text_y_offset_max = -offset_y * 1.5
+    
+    ax.annotate(f'{f_min_label} Hz', 
+               xy=(re_z_plot[min_freq_idx], im_z_plot[min_freq_idx]),
+               xytext=(offset_x, text_y_offset_min),
+               textcoords='offset points',
+               fontsize=9, fontweight='bold',
+               bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.2, edgecolor='red'))
+    
+    ax.annotate(f'{f_max_label} Hz', 
+               xy=(re_z_plot[max_freq_idx], im_z_plot[max_freq_idx]),
+               xytext=(offset_x, text_y_offset_max),
+               textcoords='offset points',
+               fontsize=9, fontweight='bold',
+               bbox=dict(boxstyle="round,pad=0.3", facecolor='green', alpha=0.2, edgecolor='green'))
     
     # Find and label decade frequency points
     log_freqs = np.log10(freq_plot)
     freq_min_log = np.floor(np.min(log_freqs))
     freq_max_log = np.ceil(np.max(log_freqs))
-    
-    # Calculate axis ranges for label positioning
-    x_range = np.max(re_z_plot) - np.min(re_z_plot)
-    y_range = np.max(im_z_plot) - np.min(im_z_plot)
     
     decade_freqs = []
     for exponent in range(int(freq_min_log), int(freq_max_log) + 1):
@@ -3492,37 +3378,28 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
                 markeredgecolor='purple', markerfacecolor='magenta', alpha=0.7)
         
         # Format frequency label with superscript
-        if dec_freq >= 1:
-            if dec_freq >= 10:
-                label = format_scientific_superscript(dec_freq, decimals=1)
-            else:
-                if abs(dec_freq - round(dec_freq)) < 0.05:
-                    label = f'{int(round(dec_freq))}'
-                else:
-                    label = f'{dec_freq:.1f}'
-        else:
-            label = format_scientific_superscript(dec_freq, decimals=1)
+        label = format_with_superscript(dec_freq) + ' Hz'
         
-        # Calculate label position with callout to avoid overlap
-        # Place label outside the curve with an arrow
+        # Offset label position
+        x_range = np.max(re_z_plot) - np.min(re_z_plot)
+        y_range = np.max(im_z_plot) - np.min(im_z_plot)
+        offset_x = x_range * 0.02
+        offset_y = y_range * 0.02
+        
+        # Adjust label position based on sign of imaginary part
         if im_z_plot[idx] >= 0:
-            # For points above x-axis, place label above-right
-            text_x = re_z_plot[idx] + x_range * 0.08
-            text_y = im_z_plot[idx] + y_range * 0.05
+            # Above the curve - label above point
+            text_y_offset = offset_y
         else:
-            # For points below x-axis, place label below-right
-            text_x = re_z_plot[idx] + x_range * 0.08
-            text_y = im_z_plot[idx] - y_range * 0.08
+            # Below the curve - label below point
+            text_y_offset = -offset_y * 1.5
         
-        # Draw arrow from label to point
         ax.annotate(label, 
                    xy=(re_z_plot[idx], im_z_plot[idx]),
-                   xytext=(text_x, text_y),
-                   textcoords='data',
+                   xytext=(offset_x, text_y_offset),
+                   textcoords='offset points',
                    fontsize=8,
-                   bbox=dict(boxstyle="round,pad=0.2", facecolor='yellow', alpha=0.7),
-                   arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6,
-                                  connectionstyle='arc3,rad=0.1'))
+                   bbox=dict(boxstyle="round,pad=0.2", facecolor='yellow', alpha=0.7))
     
     # Add horizontal line at y=0 for reference
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
@@ -3534,9 +3411,9 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
         ax.fill_between([np.min(re_z_plot), np.max(re_z_plot)], data_y_min, 0,
                         alpha=0.1, color='red', label='Inductive region (L)')
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12, color='black')
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=12, color='black')
-    # Title removed as requested
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12)
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=12)
+    # No title - removed as requested
     ax.legend(loc='best', fontsize=9, frameon=True, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
@@ -3599,20 +3476,12 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
                                       title: str = "Gaussian Deconvolution vs Frequency") -> plt.Figure:
     """
     Plot Gaussian deconvolution result with Frequency on x-axis (high to low).
-    
-    Args:
-        deconv_result: DeconvolutionResult from Gaussian deconvolution
-        drt_result: Optional DRTResult for additional info
-        title: Plot title
-    
-    Returns:
-        matplotlib Figure object
+    Legend is placed outside the plot area.
     """
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(3, 4))  # Width 3 inches, Height 4 inches
     
-    # Set tick colors to black
-    ax.tick_params(axis='x', colors='black')
-    ax.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
@@ -3625,7 +3494,7 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
     y_original_sorted = deconv_result.y_original[sort_idx]
     
     # Plot original DRT data vs frequency
-    ax.semilogx(freqs_sorted, y_original_sorted, 'o-', markersize=4, linewidth=1.5,
+    ax.semilogx(freqs_sorted, y_original_sorted, 'o-', markersize=3, linewidth=1,
                 color='black', alpha=0.5, label='DRT Data', zorder=1)
     
     # Create dense frequency grid for smooth curves
@@ -3635,14 +3504,14 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
     # Calculate log frequency for Gaussian evaluation
     log_tau_dense = -np.log10(2 * np.pi * freqs_dense)  # log10(τ) = -log10(2πf)
     
-    # Get sorted peaks for consistent coloring
-    sorted_peaks = deconv_result.get_sorted_peaks()
-    n_peaks = len(sorted_peaks)
-    colors = get_consistent_colors(n_peaks)
+    # Define consistent color mapping based on peak ID
+    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     
     # Plot individual Gaussian components
-    if sorted_peaks:
-        for peak, color in zip(sorted_peaks, colors):
+    if deconv_result.peaks:
+        for peak in deconv_result.peaks:
+            color = color_map[peak.id]
             # Calculate component vs frequency
             y_component = peak.amplitude * GaussianModelDeconv.gaussian(
                 log_tau_dense, 1.0, peak.center_log, peak.sigma_log
@@ -3652,30 +3521,30 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
             
             ax.fill_between(freqs_dense_sorted, 0, y_component_sorted,
                            color=color, alpha=0.3, linewidth=0)
-            ax.plot(freqs_dense_sorted, y_component_sorted, '-', color=color, linewidth=2,
-                   label=f'Peak {peak.id}: {peak.fraction_percent:.1f}% (f={peak.get_characteristic_frequency():.2e} Hz)',
+            ax.plot(freqs_dense_sorted, y_component_sorted, '-', color=color, linewidth=1.5,
+                   label=f'Peak {peak.id} ({peak.fraction_percent:.1f}%)',
                    zorder=2)
             
             # Mark characteristic frequency
             f_char = peak.get_characteristic_frequency()
             y_at_fchar = np.interp(np.log10(f_char), np.log10(freqs_dense_sorted)[::-1], y_component_sorted)
-            ax.plot(f_char, y_at_fchar, 'v', color=color, markersize=8,
+            ax.plot(f_char, y_at_fchar, 'v', color=color, markersize=5,
                    markeredgecolor='black', markeredgewidth=0.5)
     
     # Plot total fit
     if deconv_result.fit_y_original is not None:
         fit_sorted = deconv_result.fit_y_original[sort_idx]
-        ax.semilogx(freqs_sorted, fit_sorted, 'r--', linewidth=2.5,
+        ax.semilogx(freqs_sorted, fit_sorted, 'r--', linewidth=1.5,
                    label='Total Fit', zorder=3)
     
     # Invert x-axis (high frequency to left)
     ax.invert_xaxis()
     
-    ax.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=12, color='black')
-    ax.set_ylabel("γ(τ) / Ohm", fontweight='bold', fontsize=12, color='black')
-    # Title removed as requested
-    # Move legend outside the plot area
-    ax.legend(loc='center left', bbox_to_anchor=(1.05, 0.5), fontsize=9, frameon=True, edgecolor='black')
+    ax.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=10)
+    ax.set_ylabel("γ(τ) / Ohm", fontweight='bold', fontsize=10)
+    # No title - removed as requested
+    # Place legend outside the plot area
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=7, frameon=True, edgecolor='black')
     ax.grid(True, alpha=0.3, linestyle='--', which='both')
     
     # Add quality metrics
@@ -3683,7 +3552,7 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
         metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
         metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
         ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
-                fontsize=9, verticalalignment='top',
+                fontsize=7, verticalalignment='top',
                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
     
     plt.tight_layout()
@@ -3694,45 +3563,38 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
                                               title: str = "Peak Area Distribution") -> plt.Figure:
     """
     Plot bar chart with peak areas (absolute values) and percentages in parentheses.
-    Legend shows total DRT resistance (Rpol).
-    
-    Args:
-        deconv_result: DeconvolutionResult from Gaussian deconvolution
-        drt_result: Optional DRTResult for total resistance
-        title: Plot title
-    
-    Returns:
-        matplotlib Figure object
+    Legend shows total DRT resistance (Rpol). Legend placed outside plot area.
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(3, 4))  # Width 3 inches, Height 4 inches
     
-    # Set tick colors to black
-    ax.tick_params(axis='x', colors='black')
-    ax.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
     if not deconv_result.peaks:
-        ax.text(0.5, 0.5, "No peaks to display", ha='center', va='center', fontsize=14)
+        ax.text(0.5, 0.5, "No peaks to display", ha='center', va='center', fontsize=10)
         return fig
     
-    # Get sorted peaks for consistent ordering
-    sorted_peaks = deconv_result.get_sorted_peaks()
-    n_peaks = len(sorted_peaks)
-    colors = get_consistent_colors(n_peaks)
+    # Sort peaks by ID (which are already sorted by frequency high to low)
+    peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
+    peaks_ids = [f'Process {p.id}' for p in peaks_sorted]
+    areas = [p.area for p in peaks_sorted]
+    fractions_percent = [p.fraction_percent for p in peaks_sorted]
     
-    peaks_ids = [f'Process {p.id}' for p in sorted_peaks]
-    areas = [p.area for p in sorted_peaks]
-    fractions_percent = [p.fraction_percent for p in sorted_peaks]
+    # Define consistent color mapping
+    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
+    colors_sorted = [color_map[p.id] for p in peaks_sorted]
     
-    bars = ax.bar(peaks_ids, areas, color=colors, edgecolor='black', alpha=0.7)
+    bars = ax.bar(peaks_ids, areas, color=colors_sorted, edgecolor='black', alpha=0.7)
     
     # Add labels with absolute value and percentage
     for bar, area, frac in zip(bars, areas, fractions_percent):
         height = bar.get_height()
         label = f'{area:.3e} Ω\n({frac:.1f}%)'
         ax.text(bar.get_x() + bar.get_width()/2., height,
-                label, ha='center', va='bottom', fontsize=9, fontweight='bold')
+                label, ha='center', va='bottom', fontsize=7, fontweight='bold')
     
     # Get total resistance
     if drt_result is not None:
@@ -3742,14 +3604,13 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
         total_resistance = deconv_result.total_area
         legend_text = f'Total Area = {total_resistance:.4f} Ω·s'
     
-    # Add legend with total resistance
-    ax.axhline(y=total_resistance, color='red', linestyle='--', linewidth=1.5,
-               label=legend_text)
+    # Add legend with total resistance outside plot
+    ax.axhline(y=total_resistance, color='red', linestyle='--', linewidth=1, label=legend_text)
     
-    ax.set_xlabel('Relaxation Process', fontweight='bold', fontsize=12, color='black')
-    ax.set_ylabel('Resistance Contribution / Ω', fontweight='bold', fontsize=12, color='black')
-    # Title removed as requested
-    ax.legend(loc='upper right', fontsize=10, frameon=True, edgecolor='black')
+    ax.set_xlabel('Relaxation Process', fontweight='bold', fontsize=10)
+    ax.set_ylabel('Resistance Contribution / Ω', fontweight='bold', fontsize=10)
+    # No title - removed as requested
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=8, frameon=True, edgecolor='black')
     ax.grid(True, alpha=0.3, axis='y')
     
     # Format y-axis with scientific notation
@@ -3763,27 +3624,18 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                               data: ImpedanceData,
                               title: str = "Experimental vs Sequential RC Model") -> plt.Figure:
     """
-    Plot experimental impedance spectrum with sequential RQ model.
-    Each Gaussian peak corresponds to one RQ element with n < 1.
-    Elements are connected in series: R∞ → RQ₁ → RQ₂ → ... → RQₙ
+    Plot experimental impedance spectrum with sequential RC model.
+    Each Gaussian peak corresponds to one RC element.
+    Elements are connected in series: R∞ → RC₁ → RC₂ → ... → RCₙ
     Inductance L is added in series before R∞ if present.
     
     IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
-    
-    Args:
-        deconv_result: DeconvolutionResult from Gaussian deconvolution
-        drt_result: DRTResult with R_inf, R_pol, and L
-        data: ImpedanceData with original experimental data
-        title: Plot title
-    
-    Returns:
-        matplotlib Figure object
+    Legend placed outside plot area.
     """
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(3, 4))  # Width 3 inches, Height 4 inches
     
-    # Set tick colors to black
-    ax.tick_params(axis='x', colors='black')
-    ax.tick_params(axis='y', colors='black')
+    # Make axis tick labels black
+    ax.tick_params(axis='both', colors='black')
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
@@ -3799,65 +3651,83 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     freq_exp_sorted = freq_exp[sort_idx_exp]
     
     # Plot experimental data
-    ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=4, linewidth=1.5,
+    ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=3, linewidth=1,
             color='#1f77b4', alpha=0.7, label='Experimental', zorder=1)
     
-    # Get peaks sorted by characteristic frequency (high to low)
-    sorted_peaks = deconv_result.get_sorted_peaks()
-    n_peaks = len(sorted_peaks)
-    colors = get_consistent_colors(n_peaks)
+    # Get peaks sorted by characteristic frequency (high to low) - they are already sorted by ID
+    peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
     
-    # Estimate RQ exponents from the spectrum
+    # Calculate RC model
     omega = 2 * np.pi * freq_exp_sorted
-    n_values = estimate_RQ_exponents_from_spectrum(sorted_peaks, freq_exp_sorted, im_exp_sorted)
     
-    # Get correct R_inf: use the highest frequency point of the original data
-    # For spectra with inductance, the highest frequency point is the correct R∞
-    highest_freq_idx = np.argmax(data.original_freq)
-    R_inf_corrected = data.original_re_z[highest_freq_idx]
+    # Start with R∞ and inductance
+    Z_total = np.zeros_like(omega, dtype=complex)
+    Z_total += drt_result.R_inf  # R∞
+    Z_total += 1j * omega * drt_result.L  # Inductance contribution
     
-    # Calculate RQ model
-    Z_total = calculate_sequential_RQ_model(omega, R_inf_corrected, drt_result.L, sorted_peaks, n_values)
+    # Store cumulative resistance for plotting individual RC elements
+    cumulative_R = drt_result.R_inf
+    rc_curves = []
+    
+    # Define consistent color mapping
+    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
+    
+    # Add each RC element
+    for peak in peaks_sorted:
+        R_i = peak.area
+        tau_i = peak.center
+        # RC element: Z_i = R_i / (1 + iωτ_i)
+        Z_i = R_i / (1 + 1j * omega * tau_i)
+        Z_total += Z_i
+        
+        # Store for individual curve plotting
+        cumulative_R_prev = cumulative_R
+        cumulative_R += R_i
+        
+        # The individual RC element contribution as a separate curve
+        Z_individual = cumulative_R_prev + Z_i
+        rc_curves.append({
+            'id': peak.id,
+            'R': R_i,
+            'tau': tau_i,
+            'f_char': peak.get_characteristic_frequency(),
+            'Z': Z_individual,
+            'start_R': cumulative_R_prev,
+            'end_R': cumulative_R
+        })
     
     # Calculate total model impedance (real and -imag)
     re_model = np.real(Z_total)
     im_model = -np.imag(Z_total)  # -Im(Z) for plotting (positive = capacitive, negative = inductive)
     
     # Plot total model
-    ax.plot(re_model, im_model, 'r--', linewidth=2.5,
-            label='Total Model (RQ)', zorder=3)
+    ax.plot(re_model, im_model, 'r--', linewidth=1.5,
+            label='Total Model', zorder=3)
     
-    # Plot individual RQ element curves (depressed semicircles)
-    # Calculate cumulative RQ curves
-    Z_cumulative = np.zeros_like(omega, dtype=complex)
-    Z_cumulative += R_inf_corrected
-    Z_cumulative += 1j * omega * drt_result.L
-    
-    for i, (peak, color, n_val) in enumerate(zip(sorted_peaks, colors, n_values)):
-        Z_i = calculate_RQ_impedance(omega, peak.area, peak.center, n_val)
-        Z_cumulative += Z_i
-        
-        re_curve = np.real(Z_cumulative)
-        im_curve = -np.imag(Z_cumulative)
-        
-        ax.plot(re_curve, im_curve, '-', linewidth=2, color=color,
-               label=f'Process {peak.id}: R={peak.area:.3e} Ω, n={n_val:.2f}',
+    # Plot individual RC element curves (sequential semicircles)
+    for curve in rc_curves:
+        color = color_map[curve['id']]
+        re_curve = np.real(curve['Z'])
+        im_curve = -np.imag(curve['Z'])  # -Im(Z) for plotting
+        ax.plot(re_curve, im_curve, '-', linewidth=1.2, color=color,
+               label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω',
                zorder=2)
         
         # Mark start and end points of each semicircle
-        # Start point (previous cumulative R)
-        start_R = np.real(Z_cumulative - Z_i)
-        ax.plot([start_R], [0], 's', color=color, markersize=6,
-                markeredgecolor='black', markeredgewidth=0.5)
-        
-        # End point (current cumulative R)
-        end_R = np.real(Z_cumulative)
-        ax.plot([end_R], [0], 'o', color=color, markersize=6,
+        ax.plot(curve['start_R'], 0, 's', color=color, markersize=4,
+               markeredgecolor='black', markeredgewidth=0.5)
+        ax.plot(curve['end_R'], 0, 'o', color=color, markersize=4,
                markeredgecolor='black', markeredgewidth=0.5)
     
-    # Mark R∞ point (corrected)
-    ax.plot([R_inf_corrected], [0], '^', color='red', markersize=10,
-            markeredgecolor='black', markeredgewidth=1, label=f'R∞ = {R_inf_corrected:.4f} Ω')
+    # For R∞, use the first experimental point (high frequency limit) rather than extrapolated value
+    # This ensures R∞ corresponds to the actual spectrum when inductance is present
+    first_point_idx = 0
+    R_inf_actual = re_exp_sorted[first_point_idx]
+    
+    # Mark R∞ point with actual first point
+    ax.plot(R_inf_actual, 0, '^', color='red', markersize=6,
+           markeredgecolor='black', markeredgewidth=0.8, label=f'R∞ = {R_inf_actual:.4f} Ω')
     
     # Add inductance annotation if present
     if drt_result.L > 0:
@@ -3869,21 +3739,21 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
             if np.any(inductive_mask):
                 # Find the most negative point for annotation
                 most_negative_idx = np.argmin(im_exp_sorted)
-                ax.annotate(f'L = {drt_result.L:.3e} H\n(inductive loop)',
+                ax.annotate(f'L = {drt_result.L:.3e} H',
                            xy=(re_exp_sorted[most_negative_idx], im_exp_sorted[most_negative_idx]),
                            xytext=(re_exp_sorted[most_negative_idx] * 0.95, 
                                   im_exp_sorted[most_negative_idx] * 1.5),
-                           fontsize=9,
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
-                           arrowprops=dict(arrowstyle='->', color='gray'))
+                           fontsize=7,
+                           bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', color='gray', linewidth=0.5))
     
     # Mark final total resistance
-    total_R = R_inf_corrected + drt_result.R_pol
-    ax.plot([total_R], [0], 'd', color='darkred', markersize=10,
-            markeredgecolor='black', markeredgewidth=1, label=f'Total R = {total_R:.4f} Ω')
+    total_R = drt_result.R_inf + drt_result.R_pol
+    ax.plot(total_R, 0, 'd', color='darkred', markersize=6,
+           markeredgecolor='black', markeredgewidth=0.8, label=f'Total R = {total_R:.4f} Ω')
     
     # Add horizontal line at y=0 for reference
-    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
     
     # Add shading for inductive region (below x-axis)
     y_min_current, y_max_current = ax.get_ylim()
@@ -3891,11 +3761,11 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         ax.fill_between([np.min(re_exp_sorted), np.max(re_exp_sorted)], y_min_current, 0,
                         alpha=0.1, color='red', label='Inductive region')
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=12, color='black')
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=12, color='black')
-    # Title removed as requested
-    # Move legend outside the plot area
-    ax.legend(loc='center left', bbox_to_anchor=(1.05, 0.5), fontsize=8, frameon=True, edgecolor='black')
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=10)
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=10)
+    # No title - removed as requested
+    # Place legend outside the plot area
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=6, frameon=True, edgecolor='black', ncol=1)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
@@ -3929,13 +3799,13 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
             
             # Add annotation if inductive tail is truncated
             if negative_min < y_min_data:
-                ax.annotate(f'Inductive tail extends to {negative_min:.2e} Ω\n(truncated for clarity)',
+                ax.annotate(f'Inductive tail extends to {negative_min:.2e} Ω\n(truncated)',
                            xy=(np.min(re_exp_sorted), y_min_data * 0.9),
                            xytext=(np.min(re_exp_sorted) + (np.max(re_exp_sorted)-np.min(re_exp_sorted))*0.05, 
                                   y_min_data * 0.7),
-                           fontsize=8,
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor='lightyellow', alpha=0.8),
-                           arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6))
+                           fontsize=6,
+                           bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6, linewidth=0.5))
         else:
             # Only negative values (unlikely for typical EIS)
             y_min_data = np.min(im_exp_sorted) * 1.1
@@ -3972,15 +3842,6 @@ def step1_data_loading():
             if uploaded_file:
                 try:
                     df = pd.read_csv(uploaded_file, nrows=5)
-                    first_line = uploaded_file.getvalue().split(b'\n')[0].decode('utf-8')
-                    if '\t' in first_line:
-                        delimiter = '\t'
-                    elif ';' in first_line:
-                        delimiter = ';'
-                    else:
-                        delimiter = ','
-                    
-                    df = pd.read_csv(uploaded_file, nrows=5, sep=delimiter)
                     st.subheader("Column Mapping")
                     col_freq = st.selectbox("Frequency column", df.columns)
                     col_re = st.selectbox("Re(Z) column", df.columns)
@@ -4200,16 +4061,16 @@ def step2_drt_analysis():
              "Maximum Entropy (auto-λ)"]
         )
         
-        # Inductance handling mode - automatically suggest based on detection
+        # Auto-select inductance handling based on detection
         if has_inductive:
-            default_index = 1  # "Fitting with Inductance"
+            default_induct_index = 1  # "Fitting with Inductance"
         else:
-            default_index = 0  # "Fitting w/o Inductance"
+            default_induct_index = 0  # "Fitting w/o Inductance"
         
         induct_mode = st.selectbox(
             "Inductance handling",
             ["Fitting w/o Inductance", "Fitting with Inductance", "Discard Inductive Data"],
-            index=default_index,
+            index=default_induct_index,
             help="""
             - Fitting w/o Inductance: Standard DRT model without inductance
             - Fitting with Inductance: Includes L as fitting parameter: Z = R∞ + i·2πf·L + DRT
@@ -4321,7 +4182,8 @@ def step2_drt_analysis():
                         st.session_state.app_state.drt_solver = drt_solver
                         st.session_state.app_state.drt_calculated = True
                         
-                        # Reset deconvolution state when DRT is recalculated
+                        # IMPORTANT: Clear deconvolution state when DRT is recalculated
+                        # This ensures Step 3 uses the updated DRT spectrum
                         st.session_state.app_state.deconvolver = None
                         st.session_state.app_state.deconv_result = None
                         st.session_state.app_state.deconv_calculated = False
@@ -4394,13 +4256,17 @@ def step2_drt_analysis():
                 
                 # Nyquist plot
                 fig_nyq, ax_nyq = plt.subplots(figsize=(8, 6))
+                # Make axis tick labels black
+                ax_nyq.tick_params(axis='both', colors='black')
+                ax_nyq.xaxis.label.set_color('black')
+                ax_nyq.yaxis.label.set_color('black')
                 ax_nyq.plot(data.re_z, data.im_z, 'o', markersize=6, 
                            label='Experimental', color='#1f77b4', alpha=0.7)
                 ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5, 
                            label='Reconstructed from DRT', color='#ff7f0e')
                 ax_nyq.set_xlabel("Re(Z) / Ohm", fontweight='bold')
                 ax_nyq.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
-                ax_nyq.set_title("Nyquist Plot: Validation", fontweight='bold')
+                # No title - removed as requested
                 ax_nyq.legend(loc='best', frameon=True)
                 ax_nyq.grid(True, alpha=0.3, linestyle='--')
                 ax_nyq.set_aspect('equal', adjustable='box')
@@ -4409,6 +4275,13 @@ def step2_drt_analysis():
                 
                 # Bode plots
                 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
+                # Make axis tick labels black
+                ax1.tick_params(axis='both', colors='black')
+                ax2.tick_params(axis='both', colors='black')
+                ax1.xaxis.label.set_color('black')
+                ax1.yaxis.label.set_color('black')
+                ax2.xaxis.label.set_color('black')
+                ax2.yaxis.label.set_color('black')
                 
                 # Magnitude plot
                 mag_exp = data.Z_mod
@@ -4435,18 +4308,21 @@ def step2_drt_analysis():
                 ax2.grid(True, alpha=0.3, linestyle='--')
                 ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
                 
-                fig.suptitle("Bode Plot: Validation", fontweight='bold', fontsize=14)
+                # No overall figure title - removed as requested
                 plt.tight_layout()
                 st.pyplot(fig)
                 plt.close()
                 
                 # Error plot
                 fig_err, ax_err = plt.subplots(figsize=(8, 5))
+                ax_err.tick_params(axis='both', colors='black')
+                ax_err.xaxis.label.set_color('black')
+                ax_err.yaxis.label.set_color('black')
                 ax_err.semilogx(data.freq, error_percent, 'o-', markersize=5, 
                                linewidth=1.5, color='#d62728')
                 ax_err.set_xlabel("Frequency / Hz", fontweight='bold')
                 ax_err.set_ylabel("Relative Error / %", fontweight='bold')
-                ax_err.set_title("Reconstruction Error vs Frequency", fontweight='bold')
+                # No title - removed as requested
                 ax_err.grid(True, alpha=0.3, linestyle='--')
                 ax_err.axhline(y=mean_error, color='gray', linestyle='--', 
                               label=f'Mean Error: {mean_error:.2f}%')
@@ -4460,12 +4336,15 @@ def step2_drt_analysis():
                     st.subheader("🔌 Inductance Contribution")
                     
                     fig_L, ax_L = plt.subplots(figsize=(8, 5))
+                    ax_L.tick_params(axis='both', colors='black')
+                    ax_L.xaxis.label.set_color('black')
+                    ax_L.yaxis.label.set_color('black')
                     omega = 2 * np.pi * data.freq
                     L_contribution = omega * result.L
                     ax_L.loglog(data.freq, L_contribution, '-', linewidth=2, color='#9467bd', label='L contribution to -Im(Z)')
                     ax_L.set_xlabel("Frequency / Hz", fontweight='bold')
                     ax_L.set_ylabel("-ωL / Ohm", fontweight='bold')
-                    ax_L.set_title(f"Inductive Contribution (L = {result.L:.3e} H)", fontweight='bold')
+                    # No title - removed as requested
                     ax_L.grid(True, alpha=0.3, linestyle='--')
                     ax_L.legend()
                     st.pyplot(fig_L)
@@ -4512,7 +4391,8 @@ def step3_gaussian_deconvolution():
     log_tau = np.log10(drt_result.tau_grid)
     gamma_original = drt_result.gamma  # Оригинальные ненормированные значения
     
-    # Create deconvolver if not exists
+    # Create deconvolver if not exists OR if DRT result has changed (check by memory address or timestamp)
+    # We force recreation when drt_result is new (which happens after recalculation in Step 2)
     if st.session_state.app_state.deconvolver is None:
         deconvolver = GaussianDeconvolver(
             x_linear=drt_result.tau_grid,
@@ -4693,6 +4573,11 @@ def step3_gaussian_deconvolution():
         if st.session_state.app_state.peak_info is not None:
             fig, ax = plt.subplots(figsize=(10, 6))
             
+            # Make axis tick labels black
+            ax.tick_params(axis='both', colors='black')
+            ax.xaxis.label.set_color('black')
+            ax.yaxis.label.set_color('black')
+            
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
@@ -4723,7 +4608,7 @@ def step3_gaussian_deconvolution():
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
             ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')  # Изменено с (norm.) на (Ω)
-            ax.set_title(f'Detected Peaks ({len(st.session_state.app_state.peak_info)} peaks)', fontweight='bold')
+            # No title - removed as requested
             ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')  # Изменено loc на upper left
             ax.grid(True, alpha=0.3, linestyle='--')
             
@@ -4822,6 +4707,11 @@ def step4_results():
         
         fig, ax = plt.subplots(figsize=(12, 7))
         
+        # Make axis tick labels black
+        ax.tick_params(axis='both', colors='black')
+        ax.xaxis.label.set_color('black')
+        ax.yaxis.label.set_color('black')
+        
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
@@ -4838,13 +4728,13 @@ def step4_results():
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
-        # Get sorted peaks for consistent coloring
-        sorted_peaks = deconv_result.get_sorted_peaks()
-        n_peaks = len(sorted_peaks)
-        colors = get_consistent_colors(n_peaks)
+        # Define consistent color mapping
+        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
         
-        if sorted_peaks:
-            for peak, color in zip(sorted_peaks, colors):
+        if deconv_result.peaks:
+            for peak in deconv_result.peaks:
+                color = color_map[peak.id]
                 y_component = peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )
@@ -4873,9 +4763,9 @@ def step4_results():
                                    kind='cubic', fill_value='extrapolate')
             y_total_interp = interp_func(x_dense)
             ax.plot(x_dense, y_total_interp, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
-        elif sorted_peaks:
+        elif deconv_result.peaks:
             y_total = np.zeros_like(x_dense)
-            for peak in sorted_peaks:
+            for peak in deconv_result.peaks:
                 y_total += peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )
@@ -4894,7 +4784,7 @@ def step4_results():
         
         ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
         ax.set_ylabel('γ(τ) (Ω)', fontweight='bold', fontsize=12)
-        ax.set_title('Gaussian Deconvolution of DRT Spectrum', fontweight='bold', fontsize=14)
+        # No title - removed as requested
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
         
@@ -4924,18 +4814,23 @@ def step4_results():
         
         with col1:
             fig, ax = plt.subplots(figsize=(8, 6))
-            # Get sorted peaks for consistent ordering
-            sorted_peaks = deconv_result.get_sorted_peaks()
-            n_peaks = len(sorted_peaks)
-            colors = get_consistent_colors(n_peaks)
+            # Make axis tick labels black
+            ax.tick_params(axis='both', colors='black')
+            ax.xaxis.label.set_color('black')
+            ax.yaxis.label.set_color('black')
             
-            peaks_ids = [f'Peak {p.id}' for p in sorted_peaks]
-            fractions = [p.fraction_percent for p in sorted_peaks]
+            # Sort peaks by ID
+            peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
+            peaks_ids = [f'Peak {p.id}' for p in peaks_sorted]
+            fractions = [p.fraction_percent for p in peaks_sorted]
+            colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+            color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
+            colors_sorted = [color_map[p.id] for p in peaks_sorted]
             
-            bars = ax.bar(peaks_ids, fractions, color=colors, edgecolor='black', alpha=0.7)
+            bars = ax.bar(peaks_ids, fractions, color=colors_sorted, edgecolor='black', alpha=0.7)
             ax.set_xlabel('Peak', fontweight='bold')
             ax.set_ylabel('Fraction (%)', fontweight='bold')
-            ax.set_title('Peak Area Distribution', fontweight='bold')
+            # No title - removed as requested
             ax.set_ylim(0, max(fractions) * 1.2 if fractions else 100)
             ax.grid(True, alpha=0.3, axis='y')
             
@@ -4952,9 +4847,9 @@ def step4_results():
         with col2:
             fig, ax = plt.subplots(figsize=(8, 6))
             wedges, texts, autotexts = ax.pie(fractions, labels=peaks_ids, autopct='%1.1f%%',
-                                               colors=colors, startangle=90,
+                                               colors=colors_sorted, startangle=90,
                                                textprops={'fontweight': 'bold'})
-            ax.set_title('Area Distribution - Pie Chart', fontweight='bold')
+            # No title - removed as requested
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
@@ -4979,9 +4874,7 @@ def step4_results():
         
         # Create detailed table with Fmax and C columns
         data_rows = []
-        # Use sorted peaks for consistent order
-        sorted_peaks = deconv_result.get_sorted_peaks()
-        for peak in sorted_peaks:
+        for peak in deconv_result.peaks:
             char = calculate_peak_characteristics(peak)
             data_rows.append({
                 'Peak ID': peak.id,
@@ -5046,6 +4939,11 @@ def step4_results():
         
         fig, ax = plt.subplots(figsize=(12, 7))
         
+        # Make axis tick labels black
+        ax.tick_params(axis='both', colors='black')
+        ax.xaxis.label.set_color('black')
+        ax.yaxis.label.set_color('black')
+        
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
@@ -5065,13 +4963,12 @@ def step4_results():
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
-        # Get sorted peaks for consistent coloring
-        sorted_peaks = deconv_result.get_sorted_peaks()
-        n_peaks = len(sorted_peaks)
-        colors = get_consistent_colors(n_peaks)
+        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
         
-        if sorted_peaks:
-            for peak, color in zip(sorted_peaks, colors):
+        if deconv_result.peaks:
+            for peak in deconv_result.peaks:
+                color = color_map[peak.id]
                 y_component_norm = (peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )) / max_amp
@@ -5102,9 +4999,9 @@ def step4_results():
                                    kind='cubic', fill_value='extrapolate')
             y_total_norm_interp = interp_func(x_dense)
             ax.plot(x_dense, y_total_norm_interp, 'r--', linewidth=2.5, label='Total Fit (normalized)', zorder=3)
-        elif sorted_peaks:
+        elif deconv_result.peaks:
             y_total_norm = np.zeros_like(x_dense)
-            for peak in sorted_peaks:
+            for peak in deconv_result.peaks:
                 y_total_norm += (peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )) / max_amp
@@ -5124,7 +5021,7 @@ def step4_results():
         
         ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
         ax.set_ylabel('Normalized Intensity (γ(τ) / γ_max)', fontweight='bold', fontsize=12)
-        ax.set_title('Normalized Gaussian Deconvolution Result', fontweight='bold', fontsize=14)
+        # No title - removed as requested
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
         
@@ -5141,16 +5038,15 @@ def step4_results():
         
         st.caption(f"Normalized to maximum value γ_max = {max_amp:.4e} Ω")
     
-    # NEW TAB 5: Output Graphs
+    # NEW TAB 5: Output Graphs - Vertical layout with separators
     with tab5:
         st.subheader("📊 Output Graphs")
         st.markdown("Comprehensive visualization of impedance spectroscopy analysis results")
         
-        # Create vertical layout with graphs one below another
-        # Graph 2.1
+        # Graph 2.1 - Original Impedance Spectrum
         st.markdown("**2.1 Original Impedance Spectrum**")
         if data is not None:
-            fig1 = plot_original_nyquist_with_frequency_labels(data, "")
+            fig1 = plot_original_nyquist_with_frequency_labels(data, "Original Nyquist Spectrum")
             st.pyplot(fig1)
             plt.close(fig1)
             
@@ -5164,12 +5060,13 @@ def step4_results():
         else:
             st.warning("No impedance data available")
         
-        st.markdown("****")
+        st.markdown("***")  # Separator
         
-        # Graph 2.2
+        # Graph 2.2 - Gaussian Deconvolution vs Frequency
         st.markdown("**2.2 Gaussian Deconvolution vs Frequency**")
         if deconv_result is not None:
-            fig2 = plot_deconvolution_vs_frequency(deconv_result, drt_result, "")
+            fig2 = plot_deconvolution_vs_frequency(deconv_result, drt_result, 
+                                                    "DRT Deconvolution vs Frequency")
             st.pyplot(fig2)
             plt.close(fig2)
             
@@ -5182,12 +5079,13 @@ def step4_results():
         else:
             st.warning("No deconvolution results available")
         
-        st.markdown("****")
+        st.markdown("***")  # Separator
         
-        # Graph 2.3
+        # Graph 2.3 - Peak Area Distribution (Resistance Contributions)
         st.markdown("**2.3 Peak Area Distribution (Resistance Contributions)**")
         if deconv_result is not None:
-            fig3 = plot_peak_area_distribution_with_values(deconv_result, drt_result, "")
+            fig3 = plot_peak_area_distribution_with_values(deconv_result, drt_result,
+                                                            "Resistance Distribution by Process")
             st.pyplot(fig3)
             plt.close(fig3)
             
@@ -5200,12 +5098,13 @@ def step4_results():
         else:
             st.warning("No deconvolution results available")
         
-        st.markdown("****")
+        st.markdown("***")  # Separator
         
-        # Graph 2.4
-        st.markdown("**2.4 Experimental vs Sequential RQ Model**")
+        # Graph 2.4 - Experimental vs Sequential RC Model
+        st.markdown("**2.4 Experimental vs Sequential RC Model**")
         if deconv_result is not None and drt_result is not None and data is not None:
-            fig4 = plot_sequential_rc_model(deconv_result, drt_result, data, "")
+            fig4 = plot_sequential_rc_model(deconv_result, drt_result, data,
+                                             "Experimental vs Sequential RC Model")
             st.pyplot(fig4)
             plt.close(fig4)
             
@@ -5213,7 +5112,7 @@ def step4_results():
             fig4.savefig(buf4, format='png', dpi=300, bbox_inches='tight')
             buf4.seek(0)
             st.download_button("📥 Download", data=buf4,
-                              file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                              file_name=f"sequential_rc_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                               mime="image/png", key="download_model")
         else:
             st.warning("Insufficient data for model comparison")
@@ -5225,7 +5124,7 @@ def step4_results():
         - **2.1** - Original impedance spectrum with marked extreme and decade frequency points
         - **2.2** - DRT deconvolution results plotted against frequency (high to low)
         - **2.3** - Bar chart showing resistance contribution (Area in Ω) and percentage for each process
-        - **2.4** - Comparison of experimental data with sequential RQ model (depressed semicircles represent CPE behavior)
+        - **2.4** - Comparison of experimental data with sequential RC model (each semicircle represents one relaxation process)
         """)
     
     with tab6:
@@ -5238,9 +5137,7 @@ def step4_results():
             
             # Create peaks DataFrame with Fmax and C columns
             peaks_data = []
-            # Use sorted peaks for consistent order
-            sorted_peaks = deconv_result.get_sorted_peaks()
-            for p in sorted_peaks:
+            for p in deconv_result.peaks:
                 char = calculate_peak_characteristics(p)
                 peaks_data.append({
                     'Peak_ID': p.id,
@@ -5374,9 +5271,7 @@ Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
 ID    Center (s)      Fmax (Hz)       C (F)           Area (Ω·s)     Fraction(%)    
 {"-"*100}"""
                 
-                # Use sorted peaks for report
-                sorted_peaks_report = deconv_result.get_sorted_peaks()
-                for p in sorted_peaks_report:
+                for p in deconv_result.peaks:
                     char = calculate_peak_characteristics(p)
                     report += f"\n{p.id:<4} {p.center:.4e}   {char['fmax_hz']:.4e}   {char['c_farad']:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
                 
