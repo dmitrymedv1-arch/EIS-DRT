@@ -3847,8 +3847,8 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         # Mark start and end points of each semicircle
         # Start point (previous cumulative R)
         start_R = np.real(Z_cumulative - Z_i)
-        ax.plot(start_R, 0, 's', color=color, markersize=6,
-               markeredgecolor='black', markeredgewidth=0.5)
+        ax.plot([start_R], [0], 's', color=color, markersize=6,
+                markeredgecolor='black', markeredgewidth=0.5)
         
         # End point (current cumulative R)
         end_R = np.real(Z_cumulative)
