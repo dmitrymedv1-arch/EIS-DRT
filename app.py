@@ -3294,7 +3294,7 @@ def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str 
     - Inductive loops appear BELOW the x-axis (negative -Im(Z))
     Min and max frequency points are plotted as labeled points (not in legend).
     """
-    fig, ax = plt.subplots(figsize=(9, 12))
+    fig, ax = plt.subplots(figsize=(9, 10))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
