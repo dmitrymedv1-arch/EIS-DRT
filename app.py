@@ -5011,34 +5011,28 @@ def step2_drt_analysis():
             if result.lambda_opt is not None:
                 st.info(f"**λ:** {result.lambda_opt:.3e}")
             
-            # Display CPE n if RQ method was used
             if 'cpe_n' in result.metadata:
                 st.info(f"**CPE n:** {result.metadata['cpe_n']:.3f}")
             
-            # Display integral verification
             integral, ratio = result.verify_integral()
             if abs(ratio - 1.0) < 0.05:
                 st.success(f"✅ DRT integral verification: {integral:.4f} Ω (ratio = {ratio:.4f})")
             else:
                 st.warning(f"⚠️ DRT integral verification: {integral:.4f} Ω (ratio = {ratio:.4f})")
             
-            # Reconstruct impedance from DRT for validation
             if solver is not None:
-                # CORRECTED BLOCK: Properly handle different solver types
                 try:
-                    # Check if solver is RQDRTCore for proper reconstruction
+                    # CORRECTED: Properly handle different solver types
                     if isinstance(solver, RQDRTCore):
                         n_val = result.metadata.get('cpe_n', 0.85)
                         Z_rec_real, Z_rec_imag = solver.reconstruct_impedance_rq(
                             result.tau_grid, result.gamma, n_val, result.L
                         )
                     else:
-                        # For TikhonovDRT and MaxEntropyDRT
                         Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(
                             result.tau_grid, result.gamma, result.L
                         )
                     
-                    # Calculate reconstruction error
                     Z_original = data.Z
                     Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
                     error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
@@ -5051,7 +5045,6 @@ def step2_drt_analysis():
                     **Max Error:** {max_error:.2f}%
                     """)
                     
-                    # Display validation plots
                     st.markdown("---")
                     st.subheader("🔍 Validation: Original vs Reconstructed Impedance")
                     
@@ -5081,7 +5074,6 @@ def step2_drt_analysis():
                     ax2.xaxis.label.set_color('black')
                     ax2.yaxis.label.set_color('black')
                     
-                    # Magnitude plot
                     mag_exp = data.Z_mod
                     mag_rec = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
                     ax1.loglog(data.freq, mag_exp, 'o', markersize=6, 
@@ -5093,7 +5085,6 @@ def step2_drt_analysis():
                     ax1.legend(loc='best')
                     ax1.grid(True, alpha=0.3, linestyle='--')
                     
-                    # Phase plot
                     phase_exp = data.phase
                     phase_rec = np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
                     ax2.semilogx(data.freq, phase_exp, 'o', markersize=6, 
@@ -5126,7 +5117,6 @@ def step2_drt_analysis():
                     st.pyplot(fig_err)
                     plt.close()
                     
-                    # If inductance was fitted, show its contribution
                     if result.L > 0:
                         st.markdown("---")
                         st.subheader("🔌 Inductance Contribution")
@@ -5150,7 +5140,6 @@ def step2_drt_analysis():
                     import traceback
                     st.code(traceback.format_exc())
             
-            # DRT plot
             st.markdown("---")
             st.subheader("📈 DRT Spectrum")
             peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
@@ -5168,8 +5157,7 @@ def step2_drt_analysis():
                     st.rerun()
         else:
             st.info("👈 Configure parameters and click 'Run DRT Analysis' to begin")
-
-
+        
 # ============================================================================
 # Step 3: Gaussian Deconvolution of DRT Peaks
 # ============================================================================
