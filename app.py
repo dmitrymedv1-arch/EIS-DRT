@@ -3524,12 +3524,6 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
             ax.plot(freqs_dense_sorted, y_component_sorted, '-', color=color, linewidth=1.5,
                    label=f'Peak {peak.id} ({peak.fraction_percent:.1f}%)',
                    zorder=2)
-            
-            # Mark characteristic frequency
-            f_char = peak.get_characteristic_frequency()
-            y_at_fchar = np.interp(np.log10(f_char), np.log10(freqs_dense_sorted)[::-1], y_component_sorted)
-            ax.plot(f_char, y_at_fchar, 'v', color=color, markersize=5,
-                   markeredgecolor='black', markeredgewidth=0.5)
     
     # Plot total fit
     if deconv_result.fit_y_original is not None:
