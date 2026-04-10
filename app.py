@@ -3591,7 +3591,10 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
                 label, ha='center', va='bottom', fontsize=7, fontweight='bold')
     
     # Get total resistance
-    if drt_result is not None:
+    if deconv_result is not None and deconv_result.peaks:
+        total_resistance = sum([p.area for p in deconv_result.peaks])
+        legend_text = f'Total R_pol = {total_resistance:.4f} Ω'
+    elif drt_result is not None:
         total_resistance = drt_result.R_pol
         legend_text = f'Total R_pol = {total_resistance:.4f} Ω'
     else:
@@ -3756,7 +3759,11 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                            arrowprops=dict(arrowstyle='->', color='gray', linewidth=0.5))
     
     # Mark final total resistance
-    total_R = drt_result.R_inf + drt_result.R_pol
+    if deconv_result is not None and deconv_result.peaks:
+        sum_peak_areas = sum([p.area for p in deconv_result.peaks])
+        total_R = drt_result.R_inf + sum_peak_areas
+    else:
+        total_R = drt_result.R_inf + drt_result.R_pol
     ax.plot(total_R, 0, 'd', color='darkred', markersize=6,
            markeredgecolor='black', markeredgewidth=0.8, label=f'Total R = {total_R:.4f} Ω')
     
@@ -4924,7 +4931,14 @@ def step4_results():
                 st.metric("Method", drt_result.method)
                 st.metric("R∞", f"{drt_result.R_inf:.4f} Ω")
             with meta_col2:
-                st.metric("Rpol", f"{drt_result.R_pol:.4f} Ω")
+                # Rpol should equal sum of peak areas from deconvolution
+                if deconv_result is not None and deconv_result.peaks:
+                    rpol_from_peaks = sum([p.area for p in deconv_result.peaks])
+                    st.metric("Rpol (sum of peak areas)", f"{rpol_from_peaks:.4f} Ω")
+                    # Also show DRT integral for reference
+                    st.caption(f"DRT integral: {drt_result.R_pol:.4f} Ω")
+                else:
+                    st.metric("Rpol", f"{drt_result.R_pol:.4f} Ω")
                 if drt_result.L > 0:
                     st.metric("Inductance L", f"{drt_result.L:.3e} H")
             with meta_col3:
