@@ -3629,7 +3629,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
     Legend placed outside plot area.
     """
-    fig, ax = plt.subplots(figsize=(5, 3))
+    fig, ax = plt.subplots(figsize=(7, 4))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
