@@ -3478,7 +3478,7 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
     Plot Gaussian deconvolution result with Frequency on x-axis (high to low).
     Legend is placed outside the plot area.
     """
-    fig, ax = plt.subplots(figsize=(4, 3))
+    fig, ax = plt.subplots(figsize=(5, 3))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
