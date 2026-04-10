@@ -3559,7 +3559,7 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
     Plot bar chart with peak areas (absolute values) and percentages in parentheses.
     Legend shows total DRT resistance (Rpol). Legend placed outside plot area.
     """
-    fig, ax = plt.subplots(figsize=(5, 3))
+    fig, ax = plt.subplots(figsize=(8, 3))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
