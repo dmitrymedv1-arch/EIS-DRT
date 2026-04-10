@@ -3972,6 +3972,15 @@ def step1_data_loading():
             if uploaded_file:
                 try:
                     df = pd.read_csv(uploaded_file, nrows=5)
+                    first_line = uploaded_file.getvalue().split(b'\n')[0].decode('utf-8')
+                    if '\t' in first_line:
+                        delimiter = '\t'
+                    elif ';' in first_line:
+                        delimiter = ';'
+                    else:
+                        delimiter = ','
+                    
+                    df = pd.read_csv(uploaded_file, nrows=5, sep=delimiter)
                     st.subheader("Column Mapping")
                     col_freq = st.selectbox("Frequency column", df.columns)
                     col_re = st.selectbox("Re(Z) column", df.columns)
