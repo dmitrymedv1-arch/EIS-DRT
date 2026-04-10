@@ -3791,15 +3791,6 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
             
             ax.set_ylim(y_min_data, y_max_data)
             
-            # Add annotation if inductive tail is truncated
-            if negative_min < y_min_data:
-                ax.annotate(f'Inductive tail extends to {negative_min:.2e} Ω\n(truncated)',
-                           xy=(np.min(re_exp_sorted), y_min_data * 0.9),
-                           xytext=(np.min(re_exp_sorted) + (np.max(re_exp_sorted)-np.min(re_exp_sorted))*0.05, 
-                                  y_min_data * 0.7),
-                           fontsize=6,
-                           bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow', alpha=0.8),
-                           arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6, linewidth=0.5))
         else:
             # Only negative values (unlikely for typical EIS)
             y_min_data = np.min(im_exp_sorted) * 1.1
