@@ -3478,7 +3478,7 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
     Plot Gaussian deconvolution result with Frequency on x-axis (high to low).
     Legend is placed outside the plot area.
     """
-    fig, ax = plt.subplots(figsize=(3, 4))  # Width 3 inches, Height 4 inches
+    fig, ax = plt.subplots(figsize=(4, 3))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
@@ -3565,7 +3565,7 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
     Plot bar chart with peak areas (absolute values) and percentages in parentheses.
     Legend shows total DRT resistance (Rpol). Legend placed outside plot area.
     """
-    fig, ax = plt.subplots(figsize=(3, 4))  # Width 3 inches, Height 4 inches
+    fig, ax = plt.subplots(figsize=(4, 3))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
@@ -3632,7 +3632,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
     Legend placed outside plot area.
     """
-    fig, ax = plt.subplots(figsize=(3, 4))  # Width 3 inches, Height 4 inches
+    fig, ax = plt.subplots(figsize=(4, 3))
     
     # Make axis tick labels black
     ax.tick_params(axis='both', colors='black')
