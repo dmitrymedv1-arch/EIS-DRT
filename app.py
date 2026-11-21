@@ -705,36 +705,20 @@ class DRTCore:
     def _estimate_R_inf_robust(self) -> float:
         """
         Robust estimation of ohmic resistance R∞.
-        For spectra with inductive behavior, extrapolation is used.
-        
-        Returns:
-            float: Estimated R∞ in Ω
+        If spectrum crosses -Im(Z) = 0 into inductive region, uses exact zero-crossing Re(Z).
+        Otherwise uses the highest-frequency capacitive point.
         """
-        # Take highest frequency points (top 20% or at least 3 points)
-        n_high = max(3, len(self.frequencies) // 5)
-        high_freq_indices = np.argsort(self.frequencies)[-n_high:]
+        # self.frequencies уже отсортированы по возрастанию в __init__
+        for i in range(len(self.Z_imag) - 1):
+            if self.Z_imag[i] >= 0 and self.Z_imag[i + 1] < 0:
+                t = -self.Z_imag[i] / (self.Z_imag[i + 1] - self.Z_imag[i])
+                return float(self.Z_real[i] + t * (self.Z_real[i + 1] - self.Z_real[i]))
         
-        # Check if inductive behavior is present
-        has_inductive = self.data.detect_inductive_behavior()
-        
-        if has_inductive and len(high_freq_indices) >= 3:
-            # For spectra with inductance, extrapolate R∞ using 1/ω²
-            omega = 2 * np.pi * self.frequencies[high_freq_indices]
-            re_z_high = self.Z_real[high_freq_indices]
-            
-            # Avoid division by zero
-            inv_omega2 = 1 / (omega**2 + 1e-10)
-            
-            try:
-                # Linear regression: Re(Z) = R∞ + slope * (1/ω²)
-                slope, intercept, r_value, p_value, std_err = linregress(inv_omega2, re_z_high)
-                return intercept
-            except Exception as e:
-                logging.warning(f"Extrapolation failed: {e}, using mean of high frequencies")
-                return np.mean(self.Z_real[high_freq_indices])
-        else:
-            # Simple mean of high frequency points
-            return np.mean(self.Z_real[high_freq_indices])
+        # Если весь высокочастотный край емкостной (>= 0), берем среднее по 3 самым высокочастотным точкам
+        capacitive_idx = np.where(self.Z_imag >= 0)[0]
+        if len(capacitive_idx) >= 3:
+            return float(np.min(self.Z_real[capacitive_idx[-3:]]))
+        return float(self.Z_real[-1])
     
     def _detect_inductive_behavior(self) -> bool:
         """
@@ -747,8 +731,9 @@ class DRTCore:
     
     def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
         """
-        Find corner of L-curve (maximum positive curvature) for automatic λ selection.
-        Uses exact parametric curvature formula: k = (x' y'' - y' x'') / (x'^2 + y'^2)^1.5
+        Find corner of L-curve using Hansen's signed curvature formula (avoids noisy small-λ spikes).
+        As λ increases: residuals (x) increase (dx > 0) and solution_norms (y) decrease (dy < 0).
+        The true L-curve corner has positive signed curvature: (dx * ddy - dy * ddx) > 0.
         """
         if len(residuals) < 5:
             return len(residuals) // 2
@@ -756,17 +741,21 @@ class DRTCore:
         x = np.log10(residuals + 1e-15)
         y = np.log10(solution_norms + 1e-15)
         
-        dx = np.gradient(x)
-        dy = np.gradient(y)
+        # Smooth slightly to suppress discrete NNLS active-set jumps
+        x_s = gaussian_filter1d(x, sigma=1.0)
+        y_s = gaussian_filter1d(y, sigma=1.0)
+        
+        dx = np.gradient(x_s)
+        dy = np.gradient(y_s)
         ddx = np.gradient(dx)
         ddy = np.gradient(dy)
         
         denom = (dx**2 + dy**2)**1.5 + 1e-15
-        # Corner of L-curve corresponds to maximum curvature (exclude boundary artifacts)
-        curvature = np.abs(dx * ddy - dy * ddx) / denom
+        # Signed curvature WITHOUT abs(): selects convex corner, ignores concave noise kinks
+        signed_curvature = (dx * ddy - dy * ddx) / denom
         
-        valid_slice = curvature[2:-2]
-        if len(valid_slice) > 0:
+        valid_slice = signed_curvature[2:-2]
+        if len(valid_slice) > 0 and np.max(valid_slice) > 0:
             return int(np.argmax(valid_slice) + 2)
         return len(residuals) // 2
     
@@ -874,31 +863,38 @@ class DRTCore:
 # ============================================================================
 
 class TikhonovDRT(DRTCore):
-    """Tikhonov regularization for DRT using non-negative least squares (simultaneous R_inf, L, and gamma)"""
+    """Tikhonov regularization for DRT using non-negative least squares"""
     
     def __init__(self, data: ImpedanceData, regularization_order: int = 2, include_inductive: bool = False):
         super().__init__(data, include_inductive)
         self.regularization_order = regularization_order
     
     def _build_regularization_matrix(self, M: int, order: int) -> np.ndarray:
-        """Build regularization matrix"""
+        """
+        Build regularization matrix with soft zero-boundary conditions at extreme τ_min and τ_max
+        (which lie 1 decade outside measured frequencies) to prevent boundary spikes.
+        """
         if order == 0:
-            return np.eye(M)
+            L = np.eye(M)
         elif order == 1:
             L = np.zeros((M - 1, M))
             for i in range(M - 1):
                 L[i, i] = -1
                 L[i, i + 1] = 1
-            return L
         elif order == 2:
             L = np.zeros((M - 2, M))
             for i in range(M - 2):
                 L[i, i] = 1
                 L[i, i + 1] = -2
                 L[i, i + 2] = 1
-            return L
         else:
-            return np.eye(M)
+            L = np.eye(M)
+        
+        # Soft boundary pinning at padded grid ends (prevents boundary wall artifacts)
+        boundary = np.zeros((2, M))
+        boundary[0, 0] = 1.0
+        boundary[1, -1] = 1.0
+        return np.vstack([L, boundary])
     
     def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Solve non-negative least squares problem"""
@@ -908,26 +904,25 @@ class TikhonovDRT(DRTCore):
     def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
-        Compute DRT using Tikhonov regularization with NNLS, simultaneously fitting R_inf >= 0.
+        Compute DRT using Tikhonov regularization with NNLS.
         """
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         
-        # Unknowns vector: [gamma (n_tau); R_inf (1)]
-        R_inf_col = np.concatenate([np.ones(self.N), np.zeros(self.N)])
-        K_full = np.column_stack([np.vstack([K_real, K_imag]), R_inf_col])
+        # Clamp negative Re(Z) - R_inf anomalies in purely inductive tail so NNLS doesn't create HF spikes
+        re_diff = self.Z_real - self.R_inf
+        inductive_pts = self.Z_imag < 0
+        if np.any(inductive_pts):
+            re_diff = re_diff.copy()
+            re_diff[inductive_pts] = np.maximum(re_diff[inductive_pts], 0.0)
         
-        # Target vector: raw Re(Z) and +Im(Z) = -self.Z_imag
-        Z_target = np.concatenate([self.Z_real, -self.Z_imag])
-        
-        # Regularization applies ONLY to gamma (R_inf is unregularized)
-        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
-        L_full = np.zeros((L_reg.shape[0], n_tau + 1))
-        L_full[:, :n_tau] = L_reg
+        Z_target = np.concatenate([re_diff, -self.Z_imag])
+        K = np.vstack([K_real, K_imag])
+        L = self._build_regularization_matrix(n_tau, self.regularization_order)
         
         if lambda_auto:
             if lambda_range is None:
-                lambda_range = np.logspace(-6, -1, 35)
+                lambda_range = np.logspace(-5, 1, 35)
             
             residuals = []
             solution_norms = []
@@ -935,12 +930,12 @@ class TikhonovDRT(DRTCore):
             
             for lam in lambda_range:
                 try:
-                    A = np.vstack([K_full, lam * L_full])
-                    b = np.concatenate([Z_target, np.zeros(L_full.shape[0])])
+                    A = np.vstack([K, lam * L])
+                    b = np.concatenate([Z_target, np.zeros(L.shape[0])])
                     x = self._solve_nnls(A, b)
                     
-                    residuals.append(np.linalg.norm(K_full @ x - Z_target))
-                    solution_norms.append(np.linalg.norm(L_full @ x))
+                    residuals.append(np.linalg.norm(K @ x - Z_target))
+                    solution_norms.append(np.linalg.norm(L @ x))
                     solutions.append(x)
                 except Exception as e:
                     logging.warning(f"Lambda {lam} failed: {e}")
@@ -949,21 +944,17 @@ class TikhonovDRT(DRTCore):
             if len(residuals) > 4:
                 best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
                 lambda_opt = lambda_range[best_idx]
-                x_opt = solutions[best_idx]
+                gamma = solutions[best_idx]
             else:
-                lambda_opt = 1e-3
-                A = np.vstack([K_full, lambda_opt * L_full])
-                b = np.concatenate([Z_target, np.zeros(L_full.shape[0])])
-                x_opt = self._solve_nnls(A, b)
+                lambda_opt = 1e-2
+                A = np.vstack([K, lambda_opt * L])
+                b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+                gamma = self._solve_nnls(A, b)
         else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-3
-            A = np.vstack([K_full, lambda_opt * L_full])
-            b = np.concatenate([Z_target, np.zeros(L_full.shape[0])])
-            x_opt = self._solve_nnls(A, b)
-        
-        gamma = x_opt[:n_tau]
-        fitted_R_inf = float(x_opt[n_tau]) if x_opt[n_tau] > 0 else self.R_inf
-        self.R_inf = fitted_R_inf
+            lambda_opt = lambda_value if lambda_value is not None else 1e-2
+            A = np.vstack([K, lambda_opt * L])
+            b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+            gamma = self._solve_nnls(A, b)
         
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         drt_integral = self.get_drt_integral(gamma, tau_grid)
@@ -994,28 +985,28 @@ class TikhonovDRT(DRTCore):
     def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
                                  lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
-        Compute DRT with inductance using the DRTtools approach, simultaneously fitting
-        gamma(tau) >= 0, R_inf >= 0, and L >= 0.
+        Compute DRT with inductance using the DRTtools approach (fixed zero-crossing R_inf, fitted L >= 0).
         """
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
         K_extended, K_real, K_imag = self._build_kernel_matrix_with_inductance(tau_grid)
         
-        # Unknowns vector: [gamma (n_tau); L (1); R_inf (1)] -> total n_tau + 2
-        R_inf_col = np.concatenate([np.ones(self.N), np.zeros(self.N)])
-        K_full = np.column_stack([K_extended, R_inf_col])
+        # Clamp negative Re(Z) - R_inf in high-frequency inductive region (skin/cable effect)
+        re_diff = self.Z_real - self.R_inf
+        inductive_pts = self.Z_imag < 0
+        if np.any(inductive_pts):
+            re_diff = re_diff.copy()
+            re_diff[inductive_pts] = np.maximum(re_diff[inductive_pts], 0.0)
         
-        # Target vector: raw Re(Z) and +Im(Z) = -self.Z_imag
-        Z_target = np.concatenate([self.Z_real, -self.Z_imag])
+        Z_target = np.concatenate([re_diff, -self.Z_imag])
         
-        # Regularization applies ONLY to gamma (both L and R_inf are unregularized)
         L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
-        n_total = n_tau + 2
+        n_total = n_tau + 1
         L_extended = np.zeros((L_reg.shape[0], n_total))
         L_extended[:, :n_tau] = L_reg
         
         if lambda_auto:
             if lambda_range is None:
-                lambda_range = np.logspace(-6, -1, 35)
+                lambda_range = np.logspace(-5, 1, 35)
             
             residuals = []
             solution_norms = []
@@ -1023,11 +1014,11 @@ class TikhonovDRT(DRTCore):
             
             for lam in lambda_range:
                 try:
-                    A = np.vstack([K_full, lam * L_extended])
+                    A = np.vstack([K_extended, lam * L_extended])
                     b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
                     x = self._solve_nnls(A, b)
                     
-                    residuals.append(np.linalg.norm(K_full @ x - Z_target))
+                    residuals.append(np.linalg.norm(K_extended @ x - Z_target))
                     solution_norms.append(np.linalg.norm(L_extended @ x))
                     solutions.append(x)
                 except Exception as e:
@@ -1039,20 +1030,18 @@ class TikhonovDRT(DRTCore):
                 lambda_opt = lambda_range[best_idx]
                 x_opt = solutions[best_idx]
             else:
-                lambda_opt = 1e-3
-                A = np.vstack([K_full, lambda_opt * L_extended])
+                lambda_opt = 1e-2
+                A = np.vstack([K_extended, lambda_opt * L_extended])
                 b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
                 x_opt = self._solve_nnls(A, b)
         else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-3
-            A = np.vstack([K_full, lambda_opt * L_extended])
+            lambda_opt = lambda_value if lambda_value is not None else 1e-2
+            A = np.vstack([K_extended, lambda_opt * L_extended])
             b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
             x_opt = self._solve_nnls(A, b)
         
         gamma = x_opt[:n_tau]
-        L_value = float(x_opt[n_tau])
-        fitted_R_inf = float(x_opt[n_tau + 1]) if x_opt[n_tau + 1] > 0 else self.R_inf
-        self.R_inf = fitted_R_inf
+        L_value = float(x_opt[-1])
         
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
         drt_integral = self.get_drt_integral(gamma, tau_grid)
@@ -1087,7 +1076,6 @@ class TikhonovDRT(DRTCore):
         """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        # Z_rec_imag stores -Im(Z): capacitive part is positive, inductive part (-omega*L) is negative
         Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
         return Z_rec_real, Z_rec_imag
 
