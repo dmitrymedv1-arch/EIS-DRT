@@ -3291,7 +3291,7 @@ def calculate_peak_characteristics(peak: GaussianPeak) -> Dict[str, float]:
 
 def calculate_rq_parameters(peak: GaussianPeak) -> Dict[str, float]:
     """
-    Calculate equivalent ZARC (parallel R||Q) parameters (R_i, Q_i, alpha_i)
+    Calculate equivalent ZARC (parallel R||Q) parameters (R_i, Q_i, alpha_i, C_i, f_i)
     for a distributed Gaussian DRT peak.
     """
     R_i = float(peak.area)
@@ -3300,14 +3300,12 @@ def calculate_rq_parameters(peak: GaussianPeak) -> Dict[str, float]:
     center_log = float(peak.center_log)
     
     if R_i <= 0 or tau_i <= 0:
-        return {'R_i': 0.0, 'Q_i': 0.0, 'alpha_i': 1.0}
+        return {'R_i': 0.0, 'Q_i': 0.0, 'alpha_i': 1.0, 'C_i': 0.0, 'f_i': 0.0}
     
     # For very narrow Gaussian peak, process is an ideal capacitor (alpha = 1, Q = C = tau/R)
     if sigma < 1e-4:
         alpha_i = 1.0
     else:
-        # Evaluate exact apex height (-Im(Z)) at characteristic frequency omega_0 = 1/tau_i
-        # At omega_0 = 1/tau_i: -Im(1 / (1 + i*omega_0*tau)) = (tau/tau_i) / (1 + (tau/tau_i)^2)
         u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
         ratio = 10.0 ** (u_grid - center_log)  # tau / tau_i
         
@@ -3315,10 +3313,8 @@ def calculate_rq_parameters(peak: GaussianPeak) -> Dict[str, float]:
         profile_area = np.trapezoid(gauss_profile, u_grid)
         
         if profile_area > 0:
-            # Normalized apex height h_max / R_i
             kernel_apex = ratio / (1.0 + ratio ** 2)
             norm_apex = np.trapezoid(gauss_profile * kernel_apex, u_grid) / profile_area
-            # Exact ZARC relation: h_max / R_i = 0.5 * tan(pi * alpha / 4)
             alpha_i = float(np.clip((4.0 / np.pi) * np.arctan(2.0 * norm_apex), 1e-4, 1.0))
         else:
             alpha_i = 1.0
@@ -3326,11 +3322,21 @@ def calculate_rq_parameters(peak: GaussianPeak) -> Dict[str, float]:
     # CPE parameter Q_i from tau_i^alpha_i = R_i * Q_i  (units: F·s^(alpha-1) = S·s^alpha)
     Q_i = (tau_i ** alpha_i) / R_i
     
+    # Effective capacitance: C_i = ((R_i * Q_i)^(1 / alpha_i)) / R_i
+    rq_product = R_i * Q_i
+    C_i = (rq_product ** (1.0 / alpha_i)) / R_i if R_i > 0 else 0.0
+    
+    # Characteristic frequency: f_i = ((R_i * Q_i)^(-1 / alpha_i)) / (2 * pi)
+    f_i = (rq_product ** (-1.0 / alpha_i)) / (2.0 * np.pi) if rq_product > 0 else 0.0
+    
     return {
         'R_i': R_i,
         'Q_i': float(Q_i),
-        'alpha_i': alpha_i
+        'alpha_i': alpha_i,
+        'C_i': float(C_i),
+        'f_i': float(f_i)
     }
+    
 
 def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str = "Original Impedance Spectrum") -> plt.Figure:
     """
@@ -5244,7 +5250,7 @@ def step4_results():
             st.pyplot(fig4)
             plt.close(fig4)
             
-            # Display R_i, Q_i, alpha_i table directly under Graph 2.4
+            # Display R_i, Q_i, alpha_i, C_i, f_i table directly under Graph 2.4
             if deconv_result.peaks:
                 st.markdown("**Equivalent RQ (ZARC) Parameters per Process:**")
                 rq_rows = []
@@ -5254,7 +5260,9 @@ def step4_results():
                         'Process': f"Process {peak.id}",
                         'R_i (Ω)': f"{rq['R_i']:.4e}",
                         'Q_i (F·s^(α-1))': f"{rq['Q_i']:.4e}",
-                        'α_i': f"{rq['alpha_i']:.4f}"
+                        'α_i': f"{rq['alpha_i']:.4f}",
+                        'C_i (F)': f"{rq['C_i']:.4e}",
+                        'f_i (Hz)': f"{rq['f_i']:.4e}"
                     })
                 rq_df = pd.DataFrame(rq_rows)
                 st.dataframe(rq_df, use_container_width=True, hide_index=True)
