@@ -1,4 +1,4 @@
-import streamlit as st
+import streamlit as stimport streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -273,7 +273,6 @@ class DRTResult:
         return integral, ratio
 
 @dataclass
-@dataclass
 class ImpedanceData:
     """Container for impedance data with preprocessing"""
     freq: np.ndarray
@@ -284,21 +283,17 @@ class ImpedanceData:
     original_im_z: np.ndarray = None
     removed_indices: List[int] = field(default_factory=list)
     frequency_range: Tuple[float, float] = (None, None)
-    auto_convention: bool = True
     
     def __post_init__(self):
-        # Приводим мнимую часть к конвенции -Im(Z) > 0 для емкостной дуги:
-        # если медиана основной части спектра отрицательна (пришел сырой Im(Z)), инвертируем знак;
-        # если данные уже в конвенции -Im(Z) > 0 (или auto_convention=False), оставляем как есть.
-        if self.auto_convention and np.median(self.im_z) < 0:
-            im_converted = -self.im_z.copy()
-        else:
-            im_converted = self.im_z.copy()
-            
+        # Инвертируем знак для -Im(Z) в соответствии с электрохимической конвенцией
+        # В EIS обычно: -Im(Z) положительна для емкостных процессов
+        # Если данные пришли с отрицательным знаком, инвертируем их
         self.original_freq = self.freq.copy()
         self.original_re_z = self.re_z.copy()
-        self.original_im_z = im_converted.copy()
-        self.im_z = im_converted
+        # Инвертируем im_z, чтобы емкостные процессы были сверху (положительные)
+        self.original_im_z = -self.im_z.copy()
+        # Обновляем self.im_z
+        self.im_z = -self.im_z
         self._sort_by_frequency()
     
     def _sort_by_frequency(self):
@@ -4058,9 +4053,7 @@ def step1_data_loading():
         @st.cache_data(ttl=60, show_spinner=False)
         def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, n_points, original_len):
             """Cache plots to prevent rerender on slider movement"""
-            # Передаем -np.array(im_tuple), так как ImpedanceData.__post_init__ инвертирует знак,
-            # либо используем автоопределение в обновленном ImpedanceData ниже:
-            temp_data = ImpedanceData(np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple), auto_convention=False)
+            temp_data = ImpedanceData(np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple))
             fig_nyquist = plot_nyquist_matplotlib(temp_data, highlight_idx=point_idx)
             fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx)
             return fig_nyquist, fig_bode
@@ -4187,8 +4180,8 @@ def step2_drt_analysis():
                     try:
                         # Handle data discarding if needed
                         if induct_mode == "Discard Inductive Data":
-                            # Индуктивные точки имеют отрицательный data.im_z (так как data.im_z хранит -Im(Z))
-                            mask = data.im_z < 0
+                            # Discard points with positive -Im(Z)
+                            mask = -data.im_z > 0  # -Im(Z) > 0 indicates inductive behavior
                             n_discarded = np.sum(mask)
                             if n_discarded > 0:
                                 st.info(f"Discarding {n_discarded} inductive data points")
@@ -4196,8 +4189,7 @@ def step2_drt_analysis():
                                 temp_data = ImpedanceData(
                                     data.freq[~mask],
                                     data.re_z[~mask],
-                                    data.im_z[~mask],
-                                    auto_convention=False
+                                    data.im_z[~mask]
                                 )
                             else:
                                 temp_data = data
