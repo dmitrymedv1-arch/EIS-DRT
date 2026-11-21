@@ -23,8 +23,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 import time
-import cvxopt
-from cvxopt import matrix, solvers
 
 warnings.filterwarnings('ignore')
 
@@ -283,25 +281,35 @@ class ImpedanceData:
     original_im_z: np.ndarray = None
     removed_indices: List[int] = field(default_factory=list)
     frequency_range: Tuple[float, float] = (None, None)
-    
+    invert_imag: Optional[bool] = None
+
     def __post_init__(self):
-        # Инвертируем знак для -Im(Z) в соответствии с электрохимической конвенцией
-        # В EIS обычно: -Im(Z) положительна для емкостных процессов
-        # Если данные пришли с отрицательным знаком, инвертируем их
+        self.freq = np.asarray(self.freq, dtype=float)
+        self.re_z = np.asarray(self.re_z, dtype=float)
+        self.im_z = np.asarray(self.im_z, dtype=float)
+
+        # Внутри приложения self.im_z хранит -Im(Z):
+        # емкостные полуокружности > 0 (выше оси X), индуктивные петли < 0 (ниже оси X).
+        if self.invert_imag is None:
+            # Автоопределение: если медиана отрицательна, на вход подан Im(Z) -> инвертируем в -Im(Z)
+            should_invert = bool(np.median(self.im_z) < 0) if len(self.im_z) > 0 else False
+        else:
+            should_invert = self.invert_imag
+
+        if should_invert:
+            self.im_z = -self.im_z
+
         self.original_freq = self.freq.copy()
         self.original_re_z = self.re_z.copy()
-        # Инвертируем im_z, чтобы емкостные процессы были сверху (положительные)
-        self.original_im_z = -self.im_z.copy()
-        # Обновляем self.im_z
-        self.im_z = -self.im_z
+        self.original_im_z = self.im_z.copy()
         self._sort_by_frequency()
-    
+
     def _sort_by_frequency(self):
         idx = np.argsort(self.freq)
         self.freq = self.freq[idx]
         self.re_z = self.re_z[idx]
         self.im_z = self.im_z[idx]
-    
+
     def remove_point(self, index: int):
         """Remove a specific point by index"""
         if 0 <= index < len(self.freq):
@@ -311,15 +319,16 @@ class ImpedanceData:
             self.freq = self.freq[mask]
             self.re_z = self.re_z[mask]
             self.im_z = self.im_z[mask]
-    
+
     def apply_frequency_range(self, f_min: float, f_max: float):
         """Crop frequency range"""
-        mask = (self.freq >= f_min) & (self.freq <= f_max)
+        low, high = min(f_min, f_max), max(f_min, f_max)
+        mask = (self.freq >= low) & (self.freq <= high)
         self.freq = self.freq[mask]
         self.re_z = self.re_z[mask]
         self.im_z = self.im_z[mask]
-        self.frequency_range = (f_min, f_max)
-    
+        self.frequency_range = (low, high)
+
     def reset(self):
         """Reset to original data"""
         self.freq = self.original_freq.copy()
@@ -328,48 +337,36 @@ class ImpedanceData:
         self.removed_indices = []
         self.frequency_range = (None, None)
         self._sort_by_frequency()
-    
+
     @property
     def n_points(self) -> int:
         return len(self.freq)
-    
+
     @property
     def Z(self) -> np.ndarray:
         return self.re_z + 1j * self.im_z
-    
+
     @property
     def Z_mod(self) -> np.ndarray:
         return np.sqrt(self.re_z**2 + self.im_z**2)
-    
+
     @property
     def phase(self) -> np.ndarray:
         return np.arctan2(self.im_z, self.re_z) * 180 / np.pi
-    
+
     def detect_inductive_behavior(self) -> bool:
         """
         Automatically detect if the spectrum shows inductive behavior.
-        Inductive behavior is indicated by NEGATIVE -Im(Z) at high frequencies
-        or decreasing trend in -Im(Z) towards high frequencies.
-        
-        Returns:
-            bool: True if inductive behavior is detected
+        Inductive behavior is indicated by NEGATIVE -Im(Z) at high frequencies.
         """
-        # Check for negative -Im(Z) at high frequencies (inductive behavior)
-        high_freq_mask = self.freq > 0.1 * np.max(self.freq)
-        if np.any(high_freq_mask):
-            # Inductive behavior: -Im(Z) is negative (below x-axis)
-            if np.any(self.im_z[high_freq_mask] < 0):
-                return True
-        
-        # Check for decreasing trend in -Im(Z) at high frequencies (going more negative)
-        if len(self.freq) > 10:
-            high_idx = np.argsort(self.freq)[-10:]  # Top 10 highest frequencies
-            imag_high = self.im_z[high_idx]
-            if len(imag_high) > 2 and np.all(np.diff(imag_high) < 0):
-                return True
-        
-        return False
+        if len(self.freq) == 0:
+            return False
 
+        high_freq_mask = self.freq > 0.1 * np.max(self.freq)
+        if np.any(high_freq_mask) and np.any(self.im_z[high_freq_mask] < 0):
+            return True
+
+        return False
 
 # ============================================================================
 # Data Classes for Gaussian Deconvolution Results
@@ -534,17 +531,133 @@ if 'app_state' not in st.session_state:
 # Data Loading and Validation (from EIS code)
 # ============================================================================
 
+def _read_eis_dataframe(file, nrows: Optional[int] = None) -> pd.DataFrame:
+    """Safely read EIS data from CSV, TXT, DAT, Z, MPT, or XLSX stream with cursor reset."""
+    file.seek(0)
+    filename = getattr(file, "name", "").lower()
+
+    if filename.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(file, nrows=nrows)
+        file.seek(0)
+        return df.dropna(axis=1, how="all")
+
+    raw_bytes = file.read()
+    file.seek(0)
+
+    if not raw_bytes or not raw_bytes.strip():
+        raise ValueError("Файл пуст.")
+
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "latin1"):
+        try:
+            text = raw_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    all_lines = text.splitlines()
+    non_empty = [l for l in all_lines if l.strip()]
+    if not non_empty:
+        raise ValueError("Файл не содержит данных.")
+
+    # Поддержка шапки BioLogic EC-Lab (.mpt): "Nb header lines : XX"
+    skiprows = 0
+    for line in non_empty[:15]:
+        match = re.search(r"Nb header lines\s*:\s*(\d+)", line, re.IGNORECASE)
+        if match:
+            skiprows = max(0, int(match.group(1)) - 1)
+            break
+
+    # Поиск начала таблицы для .txt / .dat / .z файлов с текстовой шапкой прибора
+    if skiprows == 0:
+        for idx, line in enumerate(all_lines[:100]):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [p for p in re.split(r"[;\t,]|\s+", stripped) if p]
+            if len(parts) >= 3:
+                for next_line in all_lines[idx + 1 : idx + 6]:
+                    n_stripped = next_line.strip()
+                    if not n_stripped:
+                        continue
+                    n_parts = [p for p in re.split(r"[;\t,]|\s+", n_stripped) if p]
+                    if len(n_parts) >= 3:
+                        try:
+                            [float(p.replace(",", ".")) for p in n_parts[:3]]
+                            skiprows = idx
+                            break
+                        except ValueError:
+                            pass
+                if skiprows == idx:
+                    break
+
+    sample_lines = all_lines[skiprows : skiprows + 10]
+    sample_line = next((l for l in sample_lines if l.strip()), "")
+
+    # Автоопределение разделителя
+    if "\t" in sample_line:
+        sep = "\t"
+    elif ";" in sample_line:
+        sep = ";"
+    elif "," in sample_line:
+        comma_parts = sample_line.split(",")
+        ws_parts = sample_line.split()
+        sep = "," if len(comma_parts) >= len(ws_parts) else r"\s+"
+    else:
+        sep = r"\s+"
+
+    # Проверка, есть ли строка заголовков или данные начинаются сразу с чисел
+    first_tokens = [p for p in re.split(r"[;\t,]|\s+", sample_line.strip()) if p]
+    try:
+        [float(t.replace(",", ".")) for t in first_tokens]
+        has_header = False
+    except ValueError:
+        has_header = True
+
+    df = pd.read_csv(
+        io.StringIO(text),
+        sep=sep,
+        skiprows=skiprows,
+        header=0 if has_header else None,
+        nrows=nrows,
+        engine="python"
+    )
+    df = df.dropna(axis=1, how="all")
+
+    if not has_header:
+        df.columns = [f"Column_{i + 1}" for i in range(df.shape[1])]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+
+    return df
+
+
 def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Load impedance data from uploaded file."""
     if file is not None:
         try:
-            df = pd.read_csv(file)
+            df = _read_eis_dataframe(file, nrows=None)
             if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
-                freq = df[freq_col].values.astype(float)
-                re_z = df[re_col].values.astype(float)
-                # Загружаем как есть - инверсия будет в ImpedanceData.__post_init__
-                im_z = df[im_col].values.astype(float)
+                def _to_float(series: pd.Series) -> np.ndarray:
+                    if pd.api.types.is_numeric_dtype(series):
+                        return series.to_numpy(dtype=float)
+                    cleaned = series.astype(str).str.strip().str.replace(",", ".", regex=False)
+                    return pd.to_numeric(cleaned, errors="coerce").to_numpy(dtype=float)
+
+                freq = _to_float(df[freq_col])
+                re_z = _to_float(df[re_col])
+                im_z = _to_float(df[im_col])
+
+                valid = np.isfinite(freq) & np.isfinite(re_z) & np.isfinite(im_z) & (freq > 0)
+                freq, re_z, im_z = freq[valid], re_z[valid], im_z[valid]
+
+                if len(freq) < 3:
+                    st.error("После фильтрации некорректных строк осталось меньше 3 точек спектра.")
+                    return None, None, None
+
                 return freq, re_z, im_z
+            else:
+                st.error("Выбранные столбцы не найдены в файле.")
         except Exception as e:
             st.error(f"Error loading file: {e}")
     return None, None, None
@@ -656,214 +769,168 @@ def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: n
 # ============================================================================
 # Base DRT Class with Generalized Support (from EIS code)
 # ============================================================================
-
 class DRTCore:
     """Base class for DRT inversion with support for inductive loops"""
-    
+
     def __init__(self, data: ImpedanceData, include_inductive: bool = False):
         self.data = data
         self.include_inductive = include_inductive
-        self.frequencies = data.freq
-        self.Z_real = data.re_z
-        self.Z_imag = data.im_z
+        self.frequencies = data.freq.copy()
+        self.Z_real = data.re_z.copy()
+        self.Z_imag = data.im_z.copy()  # Хранит -Im(Z): > 0 для емкости, < 0 для индуктивности
         self.Z = data.Z
         self.N = len(self.frequencies)
-        
-        # Sort by frequency
+
+        # Sort by frequency ascending
         sort_idx = np.argsort(self.frequencies)
         self.frequencies = self.frequencies[sort_idx]
         self.Z_real = self.Z_real[sort_idx]
         self.Z_imag = self.Z_imag[sort_idx]
-        
-        # Determine if inductive behavior is present
-        high_freq_idx = np.where(self.frequencies > 0.1 * np.max(self.frequencies))[0]
-        if len(high_freq_idx) > 0:
-            self.has_inductive_loop = np.any(self.Z_imag[high_freq_idx] > 0)
-        else:
-            self.has_inductive_loop = False
-        
+
+        # Determine if inductive behavior is present (-Im(Z) < 0 at high frequencies)
+        self.has_inductive_loop = self.data.detect_inductive_behavior()
+
         # Automatic determination of relaxation time range
         self.tau_min = 1.0 / (2 * np.pi * np.max(self.frequencies)) * 0.1
-        self.tau_max = 1.0 / (2 * np.pi * np.min(self.frequencies)) * 10
-        
-        # Robust estimation of ohmic resistance
+        self.tau_max = 1.0 / (2 * np.pi * np.min(self.frequencies)) * 10.0
+
+        # Initial robust estimation of ohmic and polarization resistances
         self.R_inf = self._estimate_R_inf_robust()
-        
-        # Total polarization resistance (difference between low and high frequency real parts)
-        low_freq_idx = np.where(self.frequencies < 0.1 * np.max(self.frequencies))[0]
-        if len(low_freq_idx) > 3:
-            R_total = np.mean(self.Z_real[low_freq_idx[:5]])
-        else:
-            R_total = self.Z_real[0] if len(self.Z_real) > 0 else 0
-        self.R_pol = R_total - self.R_inf if R_total > self.R_inf else 1.0
-    
+        self.R_pol = self._estimate_R_pol_from_R_inf(self.R_inf)
+
+    def _estimate_R_pol_from_R_inf(self, r_inf: float) -> float:
+        """Estimate total polarization resistance R_dc - R_inf from lowest frequencies."""
+        n_low = max(1, min(3, self.N // 10))
+        R_total = float(np.mean(self.Z_real[:n_low]))
+        return float(max(R_total - r_inf, 1e-6))
+
     def _estimate_R_inf_robust(self) -> float:
         """
-        Robust estimation of ohmic resistance R∞.
-        For spectra with inductive behavior, extrapolation is used.
-        
-        Returns:
-            float: Estimated R∞ in Ω
+        Robust estimation of ohmic resistance R_inf.
+        Uses zero-crossing of -Im(Z) if inductive loop crosses the real axis,
+        otherwise uses the highest-frequency points.
         """
-        # Take highest frequency points (top 20% or at least 3 points)
-        n_high = max(3, len(self.frequencies) // 5)
-        high_freq_indices = np.argsort(self.frequencies)[-n_high:]
-        
-        # Check if inductive behavior is present
-        has_inductive = self.data.detect_inductive_behavior()
-        
-        if has_inductive and len(high_freq_indices) >= 3:
-            # For spectra with inductance, extrapolate R∞ using 1/ω²
-            omega = 2 * np.pi * self.frequencies[high_freq_indices]
-            re_z_high = self.Z_real[high_freq_indices]
-            
-            # Avoid division by zero
-            inv_omega2 = 1 / (omega**2 + 1e-10)
-            
-            try:
-                # Linear regression: Re(Z) = R∞ + slope * (1/ω²)
-                slope, intercept, r_value, p_value, std_err = linregress(inv_omega2, re_z_high)
-                return intercept
-            except Exception as e:
-                logging.warning(f"Extrapolation failed: {e}, using mean of high frequencies")
-                return np.mean(self.Z_real[high_freq_indices])
-        else:
-            # Simple mean of high frequency points
-            return np.mean(self.Z_real[high_freq_indices])
-    
+        # Если есть переход от емкостной области (-Im(Z) >= 0) к индуктивной (-Im(Z) < 0),
+        # пересечение с осью Re(Z) дает физически точную оценку R_inf
+        for i in range(self.N - 1):
+            if self.Z_imag[i] >= 0 and self.Z_imag[i + 1] < 0:
+                denom = self.Z_imag[i + 1] - self.Z_imag[i]
+                if abs(denom) > 1e-15:
+                    t = -self.Z_imag[i] / denom
+                    return float(self.Z_real[i] + t * (self.Z_real[i + 1] - self.Z_real[i]))
+
+        n_high = max(1, min(3, self.N // 10))
+        return float(np.mean(self.Z_real[-n_high:]))
+
     def _detect_inductive_behavior(self) -> bool:
-        """
-        Automatically detect if the spectrum shows inductive behavior.
-        
-        Returns:
-            bool: True if inductive behavior is detected
-        """
         return self.data.detect_inductive_behavior()
-    
+
     def _l_curve_criterion(self, residuals: np.ndarray, solution_norms: np.ndarray) -> int:
         """
-        Find corner of L-curve (maximum curvature) for automatic λ selection.
-        
-        Args:
-            residuals: Array of residuals for different λ values
-            solution_norms: Array of solution norms for different λ values
-        
-        Returns:
-            int: Index of optimal λ in the λ array
+        Find corner of L-curve using true parametric curvature with 1st and 2nd derivatives:
+        kappa = (x' y'' - y' x'') / (x'^2 + y'^2)^(3/2)
+        in normalized (log10(residual), log10(solution_norm)) coordinates.
         """
-        if len(residuals) < 3:
-            return len(residuals) // 2
-        
-        log_res = np.log(residuals + 1e-10)
-        log_sol = np.log(solution_norms + 1e-10)
-        
-        dlog_res = np.gradient(log_res)
-        dlog_sol = np.gradient(log_sol)
-        
-        if len(dlog_res) < 2 or len(dlog_sol) < 2:
-            return len(residuals) // 2
-        
-        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
-        
-        if len(curvature) > 0:
-            return np.argmax(curvature) + 1
-        return len(residuals) // 2
-    
+        n_pts = len(residuals)
+        if n_pts < 4:
+            return n_pts // 2
+
+        res = np.asarray(residuals, dtype=float)
+        sol = np.asarray(solution_norms, dtype=float)
+
+        max_sol = np.max(sol) if np.max(sol) > 0 else 1.0
+        valid_mask = np.isfinite(res) & np.isfinite(sol) & (res > 0) & (sol > 1e-9 * max_sol)
+        valid_indices = np.where(valid_mask)[0]
+
+        if len(valid_indices) < 4:
+            return n_pts // 2
+
+        log_res = np.log10(res[valid_indices] + 1e-15)
+        log_sol = np.log10(sol[valid_indices] + 1e-15)
+
+        # Нормировка логарифмических осей к [0, 1] для инвариантности к масштабу Ом
+        x_norm = (log_res - np.min(log_res)) / (np.max(log_res) - np.min(log_res) + 1e-12)
+        y_norm = (log_sol - np.min(log_sol)) / (np.max(log_sol) - np.min(log_sol) + 1e-12)
+
+        # Удаление неподвижных участков кривой при малых lambda, чтобы избежать 0/0
+        ds = np.hypot(np.diff(x_norm), np.diff(y_norm))
+        keep = np.concatenate([[True], ds > 1e-3])
+        active_indices = valid_indices[keep]
+        xm = x_norm[keep]
+        ym = y_norm[keep]
+
+        if len(xm) >= 4:
+            s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xm), np.diff(ym)))])
+            dx = np.gradient(xm, s)
+            dy = np.gradient(ym, s)
+            ddx = np.gradient(dx, s)
+            ddy = np.gradient(dy, s)
+
+            curvature = (dx * ddy - dy * ddx) / (dx**2 + dy**2 + 1e-12) ** 1.5
+            inner_curv = curvature[1:-1]
+            if len(inner_curv) > 0 and np.max(inner_curv) > 0:
+                best_local = int(np.argmax(inner_curv)) + 1
+                return int(active_indices[best_local])
+
+        # Надежный fallback: точка, ближайшая к углу утопии (0, 0) в нормированном лог-пространстве
+        dist_utopia = x_norm**2 + y_norm**2
+        return int(valid_indices[int(np.argmin(dist_utopia))])
+
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Build kernel matrix for given time grid.
-        IMPORTANT: Kernels are scaled for integration over d(ln τ)
-        
-        Args:
-            tau_grid: Array of relaxation times
-            include_rl: If True, includes RL contribution for inductive loops
-                        (Note: In DRTtools, L is handled separately, not in kernel)
-        
-        Returns:
-            Tuple of (K_real, K_imag) matrices
+        Build vectorized DRT kernel matrices scaled with trapezoidal integration weights over d(ln tau).
+        K_real corresponds to Re(Z_DRT), K_imag corresponds to +Im(Z_DRT) = -(-Im(Z_DRT)).
         """
+        ln_tau = np.log(tau_grid)
         M = len(tau_grid)
-        K_real = np.zeros((self.N, M))
-        K_imag = np.zeros((self.N, M))
-        
-        omega = 2 * np.pi * self.frequencies
-        
-        # Calculate step in natural logarithm (ln) for proper integration
-        # d(ln τ) = d(log10 τ) * ln(10)
-        dln_tau = np.mean(np.diff(np.log(tau_grid)))  # This is the step in ln(τ)
-        
-        for i in range(self.N):
-            for j in range(M):
-                # Standard DRT kernel for RC elements
-                denominator = 1 + (omega[i] * tau_grid[j])**2
-                
-                # K_real = 1 / (1 + ω²τ²) * d(ln τ)
-                K_real[i, j] = 1.0 / denominator * dln_tau
-                
-                # K_imag = -ωτ / (1 + ω²τ²) * d(ln τ)
-                K_imag[i, j] = -omega[i] * tau_grid[j] / denominator * dln_tau
-        
+        w = np.zeros(M, dtype=float)
+        if M > 1:
+            w[0] = 0.5 * (ln_tau[1] - ln_tau[0])
+            w[1:-1] = 0.5 * (ln_tau[2:] - ln_tau[:-2])
+            w[-1] = 0.5 * (ln_tau[-1] - ln_tau[-2])
+        else:
+            w[:] = 1.0
+
+        omega = 2.0 * np.pi * self.frequencies
+        wt = omega[:, None] * tau_grid[None, :]
+        denom = 1.0 + wt**2
+
+        K_real = w[None, :] / denom
+        K_imag = -wt * w[None, :] / denom
+
         return K_real, K_imag
-    
+
     def _build_kernel_matrix_with_inductance(self, tau_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Build kernel matrix for DRT and also return the column for inductance.
-        This follows the DRTtools approach where L is handled as a separate parameter.
-        
-        Args:
-            tau_grid: Array of relaxation times
-        
-        Returns:
-            Tuple of (K_extended, K_real, K_imag) where:
-            - K_extended: Full matrix for [γ; L] with shape (2N, M+1)
-            - K_real: Real part kernel (without L)
-            - K_imag: Imag part kernel (without L)
+        Build kernel matrix with extra column for inductance L.
+        Target vector second half is -self.Z_imag = +Im(Z_exp).
+        Since Z_L = +i * omega * L, its contribution to +Im(Z) is +omega * L.
         """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        
-        # Build the combined kernel matrix
-        # For Real part: contribution from γ only (L has no real part)
-        # For Imag part: contribution from γ AND from L: -ωL
-        omega = 2 * np.pi * self.frequencies
-        
-        # Create extended matrix: [K_real; K_imag] with extra column for L
+        omega = 2.0 * np.pi * self.frequencies
+
         K_base = np.vstack([K_real, K_imag])
-        L_column = np.concatenate([np.zeros(self.N), -omega])
+        L_column = np.concatenate([np.zeros(self.N), omega])
         K_extended = np.column_stack([K_base, L_column])
-        
+
         return K_extended, K_real, K_imag
-    
+
     def get_drt_integral(self, gamma: np.ndarray, tau_grid: np.ndarray) -> float:
-        """
-        Calculate integral of DRT over ln(τ) which equals polarization resistance.
-        R_pol = ∫ γ(τ) d(ln τ)
-        """
-        return np.trapezoid(gamma, np.log(tau_grid))
-    
+        """Calculate R_pol = integral of gamma(tau) over d(ln tau)."""
+        return float(np.trapezoid(gamma, np.log(tau_grid)))
+
     def verify_reconstruction(self, gamma: np.ndarray, L: float, tau_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-        """
-        Verify reconstruction quality by calculating fitted impedance and error.
-        
-        Args:
-            gamma: DRT array
-            L: Inductance value (0 if not used)
-            tau_grid: Relaxation time grid
-        
-        Returns:
-            Tuple of (Z_rec_real, Z_rec_imag, relative_error)
-        """
+        """Verify reconstruction quality in (Re(Z), -Im(Z)) coordinates."""
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        
-        # Reconstruct impedance
-        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
-        
-        # Calculate relative error
+
+        Z_rec_real = self.R_inf + (K_real @ gamma)
+        Z_rec_imag = -(K_imag @ gamma) - 2.0 * np.pi * self.frequencies * L
+
         Z_original = self.Z_real + 1j * self.Z_imag
         Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
-        error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
-        mean_error = np.mean(error_percent)
-        
+        error_percent = np.abs((Z_original - Z_reconstructed) / (np.abs(Z_original) + 1e-10)) * 100.0
+        mean_error = float(np.mean(error_percent))
+
         return Z_rec_real, Z_rec_imag, mean_error
 
 
@@ -872,132 +939,102 @@ class DRTCore:
 # ============================================================================
 
 class TikhonovDRT(DRTCore):
-    """Tikhonov regularization for DRT using non-negative least squares"""
-    
+    """Tikhonov regularization for DRT using non-negative least squares (DRTtools formulation)"""
+
     def __init__(self, data: ImpedanceData, regularization_order: int = 2, include_inductive: bool = False):
         super().__init__(data, include_inductive)
         self.regularization_order = regularization_order
-    
+
     def _build_regularization_matrix(self, M: int, order: int) -> np.ndarray:
-        """Build regularization matrix"""
+        """Build finite-difference regularization matrix over ln(tau) grid"""
         if order == 0:
             return np.eye(M)
         elif order == 1:
-            L = np.zeros((M-1, M))
-            for i in range(M-1):
-                L[i, i] = -1
-                L[i, i+1] = 1
+            L = np.zeros((M - 1, M))
+            idx = np.arange(M - 1)
+            L[idx, idx] = -1.0
+            L[idx, idx + 1] = 1.0
             return L
         elif order == 2:
-            L = np.zeros((M-2, M))
-            for i in range(M-2):
-                L[i, i] = 1
-                L[i, i+1] = -2
-                L[i, i+2] = 1
+            L = np.zeros((M - 2, M))
+            idx = np.arange(M - 2)
+            L[idx, idx] = 1.0
+            L[idx, idx + 1] = -2.0
+            L[idx, idx + 2] = 1.0
             return L
-        else:
-            return np.eye(M)
-    
+        return np.eye(M)
+
     def _solve_nnls(self, A: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Solve non-negative least squares problem"""
-        from scipy.optimize import nnls
-        x, resid = nnls(A, b)
-        if resid > 1e-6 * np.linalg.norm(b):
-            logging.warning(f"NNLS residual: {resid}")
+        x, _ = nnls(A, b)
         return x
-    
-    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
+
+    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
         Compute DRT using Tikhonov regularization with NNLS.
-        
-        The DRT gamma(τ) satisfies:
-        Z(ω) = R∞ + ∫ γ(τ) / (1 + iωτ) d(ln τ)
-        
-        Therefore: R_pol = ∫ γ(τ) d(ln τ)
+        Jointly fits gamma(tau) >= 0 and R_inf (unregularized).
         """
-        
-        # Create logarithmic grid of relaxation times
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        
-        # Build kernel matrices (already scaled with d(ln τ))
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        
-        # Target vector: subtract ohmic resistance from real part
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
         K = np.vstack([K_real, K_imag])
-        
-        # Build regularization matrix
-        L = self._build_regularization_matrix(n_tau, self.regularization_order)
-        
-        lambda_opt = None
-        gamma = None
-        
+
+        # Сдвиг для корректной работы NNLS даже если Re(Z) на ВЧ уходит в минус из-за калибровки
+        r_offset = min(0.0, float(np.min(self.Z_real)))
+        Z_target = np.concatenate([self.Z_real - r_offset, -self.Z_imag])
+
+        # Столбец для dR_inf >= 0 (R_inf = r_offset + dR_inf)
+        r_inf_col = np.concatenate([np.ones(self.N), np.zeros(self.N)])
+        K_ext = np.column_stack([K, r_inf_col])
+
+        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
+        L_ext = np.zeros((L_reg.shape[0], n_tau + 1))
+        L_ext[:, :n_tau] = L_reg
+
         if lambda_auto:
             if lambda_range is None:
-                lambda_range = np.logspace(-8, 2, 30)
-            
-            residuals = []
-            solution_norms = []
-            solutions = []
-            
+                lambda_range = np.logspace(-7, 1, 30)
+
+            residuals, solution_norms, solutions, valid_lambdas = [], [], [], []
             for lam in lambda_range:
                 try:
-                    # Augmented system: [K; λL] * gamma = [Z_target; 0]
-                    A = np.vstack([K, lam * L])
-                    b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-                    
+                    A = np.vstack([K_ext, lam * L_ext])
+                    b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
                     x = self._solve_nnls(A, b)
-                    
-                    # Calculate residual and solution norm
-                    residual = np.linalg.norm(K @ x - Z_target)
-                    sol_norm = np.linalg.norm(L @ x)
-                    
-                    residuals.append(residual)
-                    solution_norms.append(sol_norm)
+
+                    residuals.append(np.linalg.norm(K_ext @ x - Z_target))
+                    solution_norms.append(np.linalg.norm(L_reg @ x[:n_tau]))
                     solutions.append(x)
+                    valid_lambdas.append(lam)
                 except Exception as e:
                     logging.warning(f"Lambda {lam} failed: {e}")
-                    continue
-            
+
             if len(residuals) > 2:
                 best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
-                lambda_opt = lambda_range[best_idx]
-                gamma = solutions[best_idx]
+                lambda_opt = float(valid_lambdas[best_idx])
+                x_opt = solutions[best_idx]
             else:
-                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
-                A = np.vstack([K, lambda_opt * L])
-                b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-                gamma = self._solve_nnls(A, b)
+                lambda_opt = 1e-3
+                A = np.vstack([K_ext, lambda_opt * L_ext])
+                b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
+                x_opt = self._solve_nnls(A, b)
         else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-4
-            A = np.vstack([K, lambda_opt * L])
-            b = np.concatenate([Z_target, np.zeros(L.shape[0])])
-            gamma = self._solve_nnls(A, b)
-        
-        # Calculate uncertainty estimate from second derivative
+            lambda_opt = float(lambda_value) if lambda_value is not None else 1e-3
+            A = np.vstack([K_ext, lambda_opt * L_ext])
+            b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
+            x_opt = self._solve_nnls(A, b)
+
+        gamma = x_opt[:n_tau]
+        self.R_inf = float(r_offset + x_opt[n_tau])
+        self.R_pol = self._estimate_R_pol_from_R_inf(self.R_inf)
+
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
-        
-        # Verify integral of DRT equals R_pol
         drt_integral = self.get_drt_integral(gamma, tau_grid)
-        
-        # Log verification
-        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
-        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
-        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
-        
-        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
-            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
-        
-        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
-        
-        # Пересчитываем интеграл с corrected gamma
-        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-        
+
         return DRTResult(
             tau_grid=tau_grid,
-            gamma=gamma_corrected,
-            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
+            gamma=gamma,
+            gamma_std=gamma_std,
             method="Tikhonov Regularization (NNLS)",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
@@ -1007,117 +1044,76 @@ class TikhonovDRT(DRTCore):
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
-                'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / self.R_pol
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol if self.R_pol > 0 else 0.0
             }
         )
-    
+
     def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+                                lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
         Compute DRT with inductance using the DRTtools approach.
-        
-        In this method, L is fitted as a separate parameter along with γ(τ).
-        The model is: Z(ω) = R∞ + i·2πf·L + ∫ γ(τ)/(1 + iωτ) d(ln τ)
-        
-        The extended matrix is: [K_real; K_imag] with an extra column [0; -ω] for L
+        Simultaneously fits gamma(tau) >= 0, R_inf, and L >= 0.
         """
-        
-        # Create logarithmic grid of relaxation times
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        
-        # Build extended kernel matrix with L column
-        K_extended, K_real, K_imag = self._build_kernel_matrix_with_inductance(tau_grid)
-        
-        # Target vector: subtract ohmic resistance from real part
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
-        
-        # Build regularization matrix for γ only (L is not regularized)
+        K_with_L, _, _ = self._build_kernel_matrix_with_inductance(tau_grid)
+
+        r_offset = min(0.0, float(np.min(self.Z_real)))
+        Z_target = np.concatenate([self.Z_real - r_offset, -self.Z_imag])
+
+        # Порядок неизвестных: [gamma (n_tau), L (1), dR_inf (1)]
+        r_inf_col = np.concatenate([np.ones(self.N), np.zeros(self.N)])
+        K_ext = np.column_stack([K_with_L, r_inf_col])
+
         L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
-        
-        # Number of unknowns: n_tau (γ) + 1 (L)
-        n_total = n_tau + 1
-        
-        # Build extended regularization matrix: zeros for L
-        L_extended = np.zeros((L_reg.shape[0], n_total))
-        L_extended[:, :n_tau] = L_reg
-        
-        lambda_opt = None
-        gamma = None
-        L_value = None
-        
+        L_ext = np.zeros((L_reg.shape[0], n_tau + 2))
+        L_ext[:, :n_tau] = L_reg
+
         if lambda_auto:
             if lambda_range is None:
-                lambda_range = np.logspace(-8, 2, 30)
-            
-            residuals = []
-            solution_norms = []
-            solutions = []
-            
+                lambda_range = np.logspace(-7, 1, 30)
+
+            residuals, solution_norms, solutions, valid_lambdas = [], [], [], []
             for lam in lambda_range:
                 try:
-                    # Augmented system: [K_extended; λL_extended] * x = [Z_target; 0]
-                    A = np.vstack([K_extended, lam * L_extended])
-                    b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
-                    
+                    A = np.vstack([K_ext, lam * L_ext])
+                    b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
                     x = self._solve_nnls(A, b)
-                    
-                    # Calculate residual and solution norm
-                    residual = np.linalg.norm(K_extended @ x - Z_target)
-                    sol_norm = np.linalg.norm(L_extended @ x)
-                    
-                    residuals.append(residual)
-                    solution_norms.append(sol_norm)
+
+                    residuals.append(np.linalg.norm(K_ext @ x - Z_target))
+                    solution_norms.append(np.linalg.norm(L_reg @ x[:n_tau]))
                     solutions.append(x)
+                    valid_lambdas.append(lam)
                 except Exception as e:
                     logging.warning(f"Lambda {lam} failed: {e}")
-                    continue
-            
+
             if len(residuals) > 2:
                 best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
-                lambda_opt = lambda_range[best_idx]
+                lambda_opt = float(valid_lambdas[best_idx])
                 x_opt = solutions[best_idx]
-                gamma = x_opt[:n_tau]
-                L_value = x_opt[-1]
             else:
-                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
-                A = np.vstack([K_extended, lambda_opt * L_extended])
-                b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                lambda_opt = 1e-3
+                A = np.vstack([K_ext, lambda_opt * L_ext])
+                b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
                 x_opt = self._solve_nnls(A, b)
-                gamma = x_opt[:n_tau]
-                L_value = x_opt[-1]
         else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-4
-            A = np.vstack([K_extended, lambda_opt * L_extended])
-            b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+            lambda_opt = float(lambda_value) if lambda_value is not None else 1e-3
+            A = np.vstack([K_ext, lambda_opt * L_ext])
+            b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
             x_opt = self._solve_nnls(A, b)
-            gamma = x_opt[:n_tau]
-            L_value = x_opt[-1]
-        
-        # Calculate uncertainty estimate from second derivative
+
+        gamma = x_opt[:n_tau]
+        L_value = float(x_opt[n_tau])
+        self.R_inf = float(r_offset + x_opt[n_tau + 1])
+        self.R_pol = self._estimate_R_pol_from_R_inf(self.R_inf)
+
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
-        
-        # Verify integral of DRT equals R_pol
         drt_integral = self.get_drt_integral(gamma, tau_grid)
-        
-        # Log verification
-        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
-        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
-        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
-        print(f"Fitted inductance L: {L_value:.6e} H")
-        
-        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
-            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
-        
-        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
-        
-        # Recalculate integral with corrected gamma
-        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-        
+
         return DRTResult(
             tau_grid=tau_grid,
-            gamma=gamma_corrected,
-            gamma_std=gamma_std * np.log(10),
+            gamma=gamma,
+            gamma_std=gamma_std,
             method="Tikhonov Regularization with Inductance",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
@@ -1127,27 +1123,17 @@ class TikhonovDRT(DRTCore):
                 'lambda': lambda_opt,
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
-                'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / self.R_pol,
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol if self.R_pol > 0 else 0.0,
                 'inductance': L_value
             }
         )
-    
+
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Reconstruct impedance from DRT and optional inductance.
-        
-        Args:
-            tau_grid: Relaxation time grid
-            gamma: DRT values
-            L: Inductance value (default 0)
-        
-        Returns:
-            Tuple of (Z_rec_real, Z_rec_imag)
-        """
+        """Reconstruct impedance in (Re(Z), -Im(Z)) coordinates."""
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
+        Z_rec_real = self.R_inf + (K_real @ gamma)
+        Z_rec_imag = -(K_imag @ gamma) - 2.0 * np.pi * self.frequencies * L
         return Z_rec_real, Z_rec_imag
 
 
@@ -1156,148 +1142,123 @@ class TikhonovDRT(DRTCore):
 # ============================================================================
 
 class MaxEntropyDRT(DRTCore):
-    """Maximum Entropy method for DRT with automatic lambda selection"""
-    
+    """Maximum Entropy method for DRT with analytic gradient and scale-invariant prior"""
+
     def __init__(self, data: ImpedanceData, include_inductive: bool = False):
         super().__init__(data, include_inductive)
-    
-    def _entropy(self, gamma: np.ndarray) -> float:
-        """Calculate Shannon entropy"""
-        gamma_pos = gamma[gamma > 1e-10]
-        if len(gamma_pos) == 0:
-            return 0
-        return -np.sum(gamma_pos * np.log(gamma_pos))
-    
-    def _objective_function(self, x: np.ndarray, K: np.ndarray, Z_target: np.ndarray, lam: float) -> float:
-        """Objective function with entropy penalty"""
-        gamma = np.maximum(x, 1e-10)
-        residual = K @ gamma - Z_target
-        data_fit = 0.5 * np.sum(residual**2)
-        entropy_penalty = -lam * self._entropy(gamma)
-        return data_fit + entropy_penalty
-    
-    def _solve_for_lambda(self, K: np.ndarray, Z_target: np.ndarray, 
-                          lambda_range: np.ndarray, n_tau: int) -> Tuple[np.ndarray, float]:
-        """Solve for multiple lambda and return best based on L-curve"""
-        residuals = []
-        solutions = []
-        
-        for lam in lambda_range:
-            try:
-                x0 = np.ones(n_tau) / n_tau
-                result = optimize.minimize(
-                    self._objective_function, x0,
-                    args=(K, Z_target, lam),
-                    method='L-BFGS-B',
-                    bounds=[(1e-10, None) for _ in range(n_tau)],
-                    options={'maxiter': 500, 'disp': False}
-                )
-                gamma = result.x
-                residual = np.linalg.norm(K @ gamma - Z_target)
-                residuals.append(residual)
-                solutions.append(gamma)
-            except Exception as e:
-                logging.warning(f"Lambda {lam} failed: {e}")
-                residuals.append(1e10)
-                solutions.append(np.zeros(n_tau))
-        
-        if len(residuals) > 2:
-            best_idx = self._l_curve_criterion(np.array(residuals), np.array(lambda_range))
-        else:
-            best_idx = np.argmin(residuals)
-        
-        return solutions[best_idx], lambda_range[best_idx]
-    
-    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                lambda_auto: bool = True) -> DRTResult:
-        """Compute DRT using maximum entropy method with automatic lambda selection"""
-        
+
+    def _kl_penalty_and_grad(self, gamma: np.ndarray, prior: float) -> Tuple[float, np.ndarray]:
+        """Relative entropy (KL divergence) penalty S(gamma || prior) >= 0 and its gradient."""
+        g = np.maximum(gamma, 1e-12)
+        ratio = g / prior
+        kl = float(np.sum(g * np.log(ratio) - g + prior))
+        grad_kl = np.log(ratio)
+        return kl, grad_kl
+
+    def _solve_single_lambda(self, K_ext: np.ndarray, Z_target: np.ndarray,
+                             lam: float, n_tau: int, prior: float, fit_L: bool) -> np.ndarray:
+        n_vars = K_ext.shape[1]
+        x0 = np.zeros(n_vars)
+        x0[:n_tau] = prior
+        x0[-1] = max(0.0, self.R_inf - min(0.0, float(np.min(self.Z_real))))
+
+        bounds = [(1e-12, None) for _ in range(n_tau)]
+        if fit_L:
+            bounds.append((0.0, None))  # L >= 0
+        bounds.append((0.0, None))      # dR_inf >= 0
+
+        def obj_and_grad(x: np.ndarray):
+            res = K_ext @ x - Z_target
+            data_misfit = 0.5 * float(np.dot(res, res))
+            grad = K_ext.T @ res
+
+            kl, grad_kl = self._kl_penalty_and_grad(x[:n_tau], prior)
+            total_obj = data_misfit + lam * kl
+            grad[:n_tau] += lam * grad_kl
+            return total_obj, grad
+
+        res = optimize.minimize(
+            obj_and_grad,
+            x0,
+            jac=True,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 600, 'ftol': 1e-10}
+        )
+        return res.x
+
+    def _run_mem(self, n_tau: int, lambda_value: Optional[float], lambda_auto: bool, fit_L: bool) -> DRTResult:
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        
-        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
-        K = np.vstack([K_real, K_imag])
-        
+        r_offset = min(0.0, float(np.min(self.Z_real)))
+        Z_target = np.concatenate([self.Z_real - r_offset, -self.Z_imag])
+        r_inf_col = np.concatenate([np.ones(self.N), np.zeros(self.N)])
+
+        if fit_L:
+            K_with_L, _, _ = self._build_kernel_matrix_with_inductance(tau_grid)
+            K_ext = np.column_stack([K_with_L, r_inf_col])
+        else:
+            K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
+            K_ext = np.column_stack([np.vstack([K_real, K_imag]), r_inf_col])
+
+        span_ln = np.log(self.tau_max / self.tau_min)
+        prior = max(self.R_pol / max(span_ln, 1.0), 1e-8)
+
         if lambda_auto:
             lambda_range = np.logspace(-4, 2, 20)
-            gamma, lambda_opt = self._solve_for_lambda(K, Z_target, lambda_range, n_tau)
+            residuals, reg_norms, solutions = [], [], []
+            for lam in lambda_range:
+                x = self._solve_single_lambda(K_ext, Z_target, float(lam), n_tau, prior, fit_L)
+                residuals.append(np.linalg.norm(K_ext @ x - Z_target))
+                kl, _ = self._kl_penalty_and_grad(x[:n_tau], prior)
+                reg_norms.append(max(kl, 1e-12))
+                solutions.append(x)
+
+            best_idx = self._l_curve_criterion(np.array(residuals), np.array(reg_norms))
+            x_opt = solutions[best_idx]
+            lambda_opt = float(lambda_range[best_idx])
         else:
-            lam = lambda_value if lambda_value is not None else 0.1
-            x0 = np.ones(n_tau) / n_tau
-            result = optimize.minimize(
-                self._objective_function, x0,
-                args=(K, Z_target, lam),
-                method='L-BFGS-B',
-                bounds=[(1e-10, None) for _ in range(n_tau)],
-                options={'maxiter': 500, 'disp': False}
-            )
-            gamma = result.x
-            lambda_opt = lam
-        
-        # Calculate uncertainty estimate from second derivative
+            lambda_opt = float(lambda_value) if lambda_value is not None else 0.1
+            x_opt = self._solve_single_lambda(K_ext, Z_target, lambda_opt, n_tau, prior, fit_L)
+
+        gamma = x_opt[:n_tau]
+        L_val = float(x_opt[n_tau]) if fit_L else 0.0
+        self.R_inf = float(r_offset + x_opt[-1])
+        self.R_pol = self._estimate_R_pol_from_R_inf(self.R_inf)
+
         gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
-        
-        # Apply ln(10) correction for consistency with Tikhonov method
-        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
-        
-        # Recalculate integral with corrected gamma
-        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-        
-        print(f"MaxEntropy DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
-        print(f"MaxEntropy DRT - Integral (before correction): {self.get_drt_integral(gamma, tau_grid):.6f} Ω")
-        print(f"MaxEntropy DRT - Integral (after correction): {drt_integral_corrected:.6f} Ω")
-        print(f"MaxEntropy DRT - Ratio (after correction): {drt_integral_corrected/self.R_pol:.4f}")
-        
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+
         return DRTResult(
             tau_grid=tau_grid,
-            gamma=gamma_corrected,
-            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
-            method="Maximum Entropy",
+            gamma=gamma,
+            gamma_std=gamma_std,
+            method="Maximum Entropy with Inductance" if fit_L else "Maximum Entropy",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            L=0.0,
+            L=L_val,
             lambda_opt=lambda_opt,
             metadata={
                 'lambda': lambda_opt,
-                'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / self.R_pol
+                'drt_integral': drt_integral,
+                'integral_ratio': drt_integral / self.R_pol if self.R_pol > 0 else 0.0,
+                'inductance': L_val
             }
         )
-    
-    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                                 lambda_auto: bool = True) -> DRTResult:
-        """
-        Compute DRT with inductance using maximum entropy method.
-        Note: Full implementation would require extending the entropy framework.
-        For now, this is a placeholder that uses the standard method.
-        """
-        # For maximum entropy, the extension to include L is non-trivial
-        # This is a simplified version that just adds L after the fact
-        result = self.compute(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto)
-        
-        # Estimate L from high frequency data
-        has_inductive = self.data.detect_inductive_behavior()
-        if has_inductive:
-            high_freq_mask = self.frequencies > 0.1 * np.max(self.frequencies)
-            if np.any(high_freq_mask):
-                omega_high = 2 * np.pi * self.frequencies[high_freq_mask]
-                imag_high = -self.Z_imag[high_freq_mask]
-                # Estimate L from slope of -Im(Z) vs ω
-                if len(omega_high) > 2:
-                    slope, _, _, _, _ = linregress(omega_high, imag_high)
-                    L_est = -slope  # Since -Im(Z) = -ωL + RC part, slope ≈ -L
-                    result.L = max(0, L_est)
-        
-        result.method = "Maximum Entropy with Inductance (estimated)"
-        return result
-    
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        """Reconstruct impedance from DRT"""
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
-        return Z_rec_real, Z_rec_imag
 
+    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                lambda_auto: bool = True) -> DRTResult:
+        return self._run_mem(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto, fit_L=False)
+
+    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                                lambda_auto: bool = True) -> DRTResult:
+        return self._run_mem(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto, fit_L=True)
+
+    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Reconstruct impedance in (Re(Z), -Im(Z)) coordinates."""
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
+        Z_rec_real = self.R_inf + (K_real @ gamma)
+        Z_rec_imag = -(K_imag @ gamma) - 2.0 * np.pi * self.frequencies * L
+        return Z_rec_real, Z_rec_imag
 
 # ============================================================================
 # Peak Detection and Analysis (from EIS code)
@@ -1387,90 +1348,87 @@ def fit_gaussian_peaks(tau_grid: np.ndarray, gamma: np.ndarray, n_peaks: Optiona
         return gamma, []
 
 class GaussianModel:
-    """Model for sum of Gaussians with baseline correction"""
-    
+    """Unified model for sum of Gaussians with baseline correction"""
+
     @staticmethod
     def gaussian(x, amp, cen, sigma):
         """Gaussian function with safe sigma"""
-        return amp * np.exp(-(x - cen)**2 / (2 * max(sigma, np.finfo(float).eps)**2))
-    
+        safe_sigma = max(abs(sigma), np.finfo(float).eps)
+        return amp * np.exp(-((x - cen) ** 2) / (2.0 * safe_sigma**2))
+
     @staticmethod
     def multi_gaussian(x, *params):
         """Sum of multiple Gaussians"""
         n = len(params) // 3
         y = np.zeros_like(x, dtype=float)
         for i in range(n):
-            amp = params[3*i]
-            cen = params[3*i + 1]
-            sigma = abs(params[3*i + 2])
+            amp = params[3 * i]
+            cen = params[3 * i + 1]
+            sigma = abs(params[3 * i + 2])
             y += GaussianModel.gaussian(x, amp, cen, sigma)
         return y
-    
+
     @staticmethod
     def multi_gaussian_with_baseline(x, n_peaks, peak_params, baseline_params, baseline_method):
         """Sum of Gaussians with baseline correction"""
-        # Calculate peaks
-        y_peaks = np.zeros_like(x, dtype=float)
-        for i in range(n_peaks):
-            amp = peak_params[3*i]
-            cen = peak_params[3*i + 1]
-            sigma = abs(peak_params[3*i + 2])
-            y_peaks += GaussianModel.gaussian(x, amp, cen, sigma)
-        
-        # Calculate baseline
+        y_peaks = GaussianModel.multi_gaussian(x, *peak_params[: n_peaks * 3])
+
         if baseline_method == "constant" and len(baseline_params) >= 1:
             y_baseline = baseline_params[0]
         elif baseline_method == "linear" and len(baseline_params) >= 2:
             y_baseline = baseline_params[0] + baseline_params[1] * x
         elif baseline_method == "quadratic" and len(baseline_params) >= 3:
-            y_baseline = baseline_params[0] + baseline_params[1] * x + baseline_params[2] * x**2
+            y_baseline = baseline_params[0] + baseline_params[1] * x + baseline_params[2] * (x**2)
         else:
-            y_baseline = 0
-        
+            y_baseline = 0.0
+
         return y_peaks + y_baseline
-    
+
     @staticmethod
-    def calculate_area(amp, sigma):
-        """Area under Gaussian"""
-        return amp * sigma * np.sqrt(2 * np.pi)
-    
+    def calculate_area(amp, sigma, use_log_x: bool = False):
+        """
+        Area under Gaussian peak.
+        When x = log10(tau), integrating over d(ln tau) = ln(10) * d(log10 tau)
+        yields exact resistance contribution R_i in Ohms.
+        """
+        area_dx = amp * abs(sigma) * np.sqrt(2.0 * np.pi)
+        return area_dx * np.log(10.0) if use_log_x else area_dx
+
     @staticmethod
     def calculate_fwhm(sigma):
         """Full width at half maximum"""
-        return 2 * np.sqrt(2 * np.log(2)) * sigma
-    
+        return 2.0 * np.sqrt(2.0 * np.log(2.0)) * abs(sigma)
+
     @staticmethod
     def estimate_sigma_from_peak(x, y, peak_idx):
         """Estimate sigma with fallback methods"""
         try:
-            widths, width_heights, left_ips, right_ips = peak_widths(
-                y, [peak_idx], rel_height=0.5
-            )
+            widths, _, _, _ = peak_widths(y, [peak_idx], rel_height=0.5)
             fwhm = widths[0] * np.mean(np.diff(x))
-            sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
-            return sigma
-        except Exception as e:
-            # Fallback: estimate from distance to nearest minimum
-            left_min = peak_idx
-            right_min = peak_idx
-            
-            # Find left minimum
-            for i in range(peak_idx - 1, 0, -1):
-                if y[i] < y[i-1] and y[i] < y[i+1]:
-                    left_min = i
-                    break
-            
-            # Find right minimum
-            for i in range(peak_idx + 1, len(y) - 1):
-                if y[i] < y[i-1] and y[i] < y[i+1]:
-                    right_min = i
-                    break
-            
-            # Estimate sigma as 1/3 of the width to nearest minima
-            width = (right_min - left_min) * np.mean(np.diff(x))
-            sigma = width / 3.0
-            return max(sigma, 0.01 * (np.max(x) - np.min(x)) / 10)
+            sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+            if sigma > 0:
+                return sigma
+        except Exception:
+            pass
 
+        left_min = peak_idx
+        right_min = peak_idx
+        for i in range(peak_idx - 1, 0, -1):
+            if y[i] < y[i - 1] and y[i] < y[i + 1]:
+                left_min = i
+                break
+        for i in range(peak_idx + 1, len(y) - 1):
+            if y[i] < y[i - 1] and y[i] < y[i + 1]:
+                right_min = i
+                break
+
+        width = (right_min - left_min) * np.mean(np.diff(x))
+        sigma = width / 3.0
+        return max(sigma, 0.01 * (np.max(x) - np.min(x)) / 10.0)
+
+
+# Алиас для обратной совместимости со всеми функциями визуализации
+GaussianModelDeconv = GaussianModel
 
 # ============================================================================
 # Gaussian Model for Deconvolution (from second code)
@@ -2056,39 +2014,34 @@ class DataPreprocessor:
 # Gaussian Deconvolver (from second code)
 # ============================================================================
 class GaussianDeconvolver:
-    """Main class for spectral deconvolution with baseline correction"""
-    
+    """Main class for spectral deconvolution with 3-stage refinement and baseline correction"""
+
     def __init__(self, x_linear, y_original, use_log_x=True, use_log_y=False,
                  clip_negative=True, show_warnings=True, baseline_method='none',
                  smoothing_level='none'):
-        # Store original data WITHOUT ANY MODIFICATIONS for display purposes
-        self.x_original = np.array(x_linear).copy()
-        self.y_original_raw = np.array(y_original).copy()
-        
-        # Working arrays that may be modified
-        self.x_linear = np.array(x_linear)
-        self.y_original = np.array(y_original)
+        self.x_original = np.array(x_linear, dtype=float).copy()
+        self.y_original_raw = np.array(y_original, dtype=float).copy()
+
+        self.x_linear = np.array(x_linear, dtype=float)
+        self.y_original = np.array(y_original, dtype=float)
         self.use_log_x = use_log_x
         self.use_log_y = use_log_y
         self.baseline_method = baseline_method
         self.smoothing_level = smoothing_level
-        
-        # Sort by X to ensure monotonic increasing X
+        self.show_warnings = show_warnings
+
         sort_idx = np.argsort(self.x_linear)
         self.x_linear = self.x_linear[sort_idx]
         self.y_original = self.y_original[sort_idx]
-        
-        # Store sorted original data for display
+
         self.x_sorted = self.x_linear.copy()
         self.y_sorted = self.y_original.copy()
-        
-        # Preprocess data
+
         self.preprocessor = DataPreprocessor(clip_negative, show_warnings)
         preprocessed = self.preprocessor.preprocess_for_fitting(
             self.x_linear, self.y_original, use_log_x, use_log_y, smoothing_level
         )
-        
-        # Update with preprocessed data
+
         self.x_sorted = preprocessed['x_sorted']
         self.y_sorted = preprocessed['y_sorted']
         self.x = preprocessed['x']
@@ -2098,609 +2051,433 @@ class GaussianDeconvolver:
         self.y_label = preprocessed['y_label']
         self.clipped_points = preprocessed['clipped_points']
         self.small_values_warning = preprocessed['small_values_warning']
-        
-        # Calculate the integral of DRT to verify scaling
+
         if self.use_log_x:
-            # Integration over d(ln τ) - this should equal R_pol
-            self.drt_integral = np.trapezoid(self.y_original, np.log(self.x_linear))
+            self.drt_integral = float(np.trapezoid(self.y_original, np.log(self.x_linear)))
         else:
-            # Integration over dτ (not correct, for reference only)
-            self.drt_integral = np.trapezoid(self.y_original, self.x_linear)
-        
-        print(f"DRT integral before deconvolution: {self.drt_integral:.6f} Ω")
-        print(f"This should equal the polarization resistance R_pol from EIS")
-        
-        # Normalization - use 95th percentile instead of max for robustness
-        self.y_max = np.percentile(self.y_for_fitting, 95) if np.any(self.y_for_fitting > 0) else 1.0
-        
-        # For fitting, we normalize but keep track for denormalization
-        if self.y_max > 0:
-            self.y_norm = self.y / self.y_max
-        else:
-            self.y_norm = self.y
-        
-        # Results containers
+            self.drt_integral = float(np.trapezoid(self.y_original, self.x_linear))
+
+        self.y_max = float(np.percentile(self.y_for_fitting, 95)) if np.any(self.y_for_fitting > 0) else 1.0
+        if self.y_max <= 0:
+            self.y_max = 1.0
+        self.y_norm = self.y / self.y_max
+
         self.components = []
         self.fit_y_norm = None
-        self.fit_y_original = None  # Added for original scale fit
+        self.fit_y_original = None
         self.popt = None
         self.baseline_params = None
         self.quality_metrics = {}
         self.convergence_history = []
-        self.total_area = 0
-        
-        # Fitter
-        self.fitter = None
-        
-        # For compatibility with existing code
+        self.total_area = 0.0
+
         self.multi_gaussian = GaussianModel.multi_gaussian
         self.gaussian = GaussianModel.gaussian
-    
+
     def _get_n_baseline_params(self):
-        """Get number of baseline parameters"""
         return {
             'none': 0,
             'constant': 1,
             'linear': 2,
             'quadratic': 3
         }.get(self.baseline_method, 0)
-    
+
     def _prepare_initial_params(self, peak_params, n_baseline):
-        """Prepare initial parameters with baseline if needed"""
         params = list(peak_params)
         if n_baseline > 0:
+            p5 = float(np.percentile(self.y_norm, 5))
             if self.baseline_method == 'constant':
-                baseline_init = [np.percentile(self.y_norm, 5)]
+                baseline_init = [p5]
             elif self.baseline_method == 'linear':
-                baseline_init = [np.percentile(self.y_norm, 5), 0]
-            else:  # quadratic
-                baseline_init = [np.percentile(self.y_norm, 5), 0, 0]
+                baseline_init = [p5, 0.0]
+            else:
+                baseline_init = [p5, 0.0, 0.0]
             params.extend(baseline_init[:n_baseline])
         return params
-    
+
     def auto_detect_peaks(self, sensitivity=0.03, min_distance=5):
-        """Automatic peak detection using derivatives"""
-        # Smoothing
+        """Automatic peak detection using Savitzky-Golay derivatives and prominence"""
         window_length = min(11, len(self.y_norm) // 5 * 2 + 1)
         if window_length % 2 == 0:
             window_length += 1
-        
-        if window_length >= 5:
-            y_smooth = savgol_filter(self.y_norm, window_length, 3)
-        else:
-            y_smooth = self.y_norm
-        
-        # Calculate derivatives
+
+        y_smooth = savgol_filter(self.y_norm, window_length, 3) if window_length >= 5 else self.y_norm
         dy, d2y, y_smooth = DerivativeAnalyzer.calculate_derivatives(self.x, y_smooth)
-        
-        # Peak search with different methods
+
         height_threshold = sensitivity * np.max(y_smooth)
         peaks1, _ = find_peaks(y_smooth, height=height_threshold, distance=min_distance)
         peaks2 = DerivativeAnalyzer.find_peaks_by_derivatives(self.x, y_smooth, dy, d2y, sensitivity)
-        
-        # Combine results
-        all_peaks = sorted(set(np.concatenate([peaks1, peaks2])))
-        
-        # Filter close peaks
+
+        all_peaks = sorted(set(np.concatenate([peaks1, peaks2])).astype(int))
+
         filtered_peaks = []
+        dx_mean = np.mean(np.diff(self.x))
         for peak in all_peaks:
-            if not filtered_peaks or abs(self.x[peak] - self.x[filtered_peaks[-1]]) > min_distance * np.mean(np.diff(self.x)):
+            if not filtered_peaks or abs(self.x[peak] - self.x[filtered_peaks[-1]]) > min_distance * dx_mean:
                 filtered_peaks.append(peak)
-        
-        # Estimate parameters
+
         peak_info = []
         initial_params = []
-        
+        x_span = np.max(self.x) - np.min(self.x)
+
         for peak_idx in filtered_peaks:
-            cen = self.x[peak_idx]
-            amp = y_smooth[peak_idx]
-            
-            # Estimate sigma with fallback
+            cen = float(self.x[peak_idx])
+            amp = float(max(y_smooth[peak_idx], 1e-6))
+
             sigma = GaussianModel.estimate_sigma_from_peak(self.x, y_smooth, peak_idx)
-            sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / max(len(filtered_peaks), 1))
-            
-            # Get original Y value for display
-            if self.use_log_x:
-                x_linear = 10**self.x[peak_idx]
-            else:
-                x_linear = self.x[peak_idx]
-            
-            # Find closest index in original data - always in linear space
-            idx = np.argmin(np.abs(self.x_sorted - x_linear))
-            y_original_value = self.y_sorted[idx]
-            
+            sigma = float(max(sigma, 0.01 * x_span / max(len(filtered_peaks), 1)))
+
+            x_linear = float(10**cen) if self.use_log_x else cen
+            idx = int(np.argmin(np.abs(self.x_sorted - x_linear)))
+            y_original_value = float(self.y_sorted[idx])
+
             peak_info.append({
                 'index': peak_idx,
-                'x': self.x[peak_idx],
+                'x': cen,
                 'x_linear': x_linear,
-                'y': self.y[peak_idx],
+                'y': float(self.y[peak_idx]),
                 'y_original': y_original_value,
                 'amp_est': amp,
                 'cen_est': cen,
                 'sigma_est': sigma,
-                'dy': dy[peak_idx],
-                'd2y': d2y[peak_idx],
+                'dy': float(dy[peak_idx]),
+                'd2y': float(d2y[peak_idx]),
                 'source': 'auto'
             })
-            
             initial_params.extend([amp, cen, sigma])
-        
+
         return filtered_peaks, peak_info, initial_params, (dy, d2y, y_smooth)
-    
+
     def add_manual_peak(self, x_position_linear, amplitude=None, sigma_est=None):
         """Add a peak manually at specified linear X position"""
-        # Convert to log space if needed
-        if self.use_log_x:
-            x_position = np.log10(x_position_linear)
-        else:
-            x_position = x_position_linear
-        
-        # Find index for amplitude estimation
-        idx = np.argmin(np.abs(self.x_sorted - x_position_linear))
-        
-        # Estimate amplitude if not provided
+        x_position = float(np.log10(x_position_linear)) if self.use_log_x else float(x_position_linear)
+        idx = int(np.argmin(np.abs(self.x_sorted - x_position_linear)))
+
         if amplitude is None:
-            # Get normalized amplitude at this position
             if self.use_log_x:
-                # Find closest index in log space
-                log_idx = np.argmin(np.abs(self.x - x_position))
-                amplitude = self.y_norm[log_idx] if log_idx < len(self.y_norm) else 0.1
+                log_idx = int(np.argmin(np.abs(self.x - x_position)))
+                amplitude = float(self.y_norm[log_idx]) if log_idx < len(self.y_norm) else 0.1
             else:
-                amplitude = self.y_norm[idx] if idx < len(self.y_norm) else 0.1
-        
-        # Estimate sigma if not provided
+                amplitude = float(self.y_norm[idx]) if idx < len(self.y_norm) else 0.1
+            amplitude = max(amplitude, 0.05 * float(np.max(self.y_norm)))
+
         if sigma_est is None:
-            # Estimate based on distance to nearest minimum
-            if self.use_log_x:
-                x_search = self.x
-                y_search = self.y_norm
-            else:
-                x_search = self.x_linear
-                y_search = self.y_original / self.y_max
-            
-            # Find nearest minima to left and right
-            left_idx = idx
-            right_idx = idx
+            x_search = self.x if self.use_log_x else self.x_linear
+            y_search = self.y_norm if self.use_log_x else (self.y_original / self.y_max)
+
+            left_idx, right_idx = idx, idx
             for i in range(idx - 1, 0, -1):
-                if i < len(y_search) - 1 and y_search[i] < y_search[i-1] and y_search[i] < y_search[i+1]:
+                if i < len(y_search) - 1 and y_search[i] < y_search[i - 1] and y_search[i] < y_search[i + 1]:
                     left_idx = i
                     break
             for i in range(idx + 1, len(y_search) - 1):
-                if y_search[i] < y_search[i-1] and y_search[i] < y_search[i+1]:
+                if y_search[i] < y_search[i - 1] and y_search[i] < y_search[i + 1]:
                     right_idx = i
                     break
-            
-            # Estimate sigma
-            width = (x_search[right_idx] - x_search[left_idx]) if right_idx > left_idx else 0.1
-            sigma_est = max(width / 3.0, 0.01 * (np.max(x_search) - np.min(x_search)) / 20)
-        
-        # Add peak info
+
+            width = (x_search[right_idx] - x_search[left_idx]) if right_idx > left_idx else 0.2
+            sigma_est = float(max(width / 3.0, 0.01 * (np.max(x_search) - np.min(x_search)) / 20.0))
+
         peak_info_entry = {
             'index': idx,
             'x': x_position,
-            'x_linear': x_position_linear,
-            'y': amplitude,
-            'y_original': self.y_sorted[idx],
-            'amp_est': amplitude,
+            'x_linear': float(x_position_linear),
+            'y': float(amplitude),
+            'y_original': float(self.y_sorted[idx]),
+            'amp_est': float(amplitude),
             'cen_est': x_position,
-            'sigma_est': sigma_est,
-            'dy': 0,
-            'd2y': 0,
+            'sigma_est': float(sigma_est),
+            'dy': 0.0,
+            'd2y': 0.0,
             'source': 'manual'
         }
-        
-        return peak_info_entry, [amplitude, x_position, sigma_est]
-    
+        return peak_info_entry, [float(amplitude), x_position, float(sigma_est)]
+
     def find_missing_peaks_by_residuals(self, peak_info, sensitivity=0.02, min_distance=5):
-        """Find missing peaks by analyzing residuals after initial fit"""
+        """Find missing peaks by analyzing positive residuals after initial model estimate"""
         if not peak_info:
             return [], []
-        
-        # Build initial model with current peaks
-        n_peaks = len(peak_info)
-        if n_peaks == 0:
-            return [], []
-        
+
         peak_params = []
         for info in peak_info:
             peak_params.extend([info['amp_est'], info['cen_est'], info['sigma_est']])
-        
-        # Calculate initial fit
+
         y_initial_fit = GaussianModel.multi_gaussian(self.x, *peak_params)
-        
-        # Calculate residuals
         residuals = self.y_norm - y_initial_fit
-        
-        # Detect peaks in residuals
-        height_threshold = sensitivity * np.max(np.abs(residuals))
-        
-        # Smooth residuals for better peak detection
+
+        max_res = np.max(np.abs(residuals))
+        if max_res <= 0:
+            return [], []
+
+        height_threshold = sensitivity * max_res
         window_length = min(11, len(residuals) // 5 * 2 + 1)
         if window_length % 2 == 0:
             window_length += 1
-        
-        if window_length >= 5:
-            residuals_smooth = savgol_filter(residuals, window_length, 3)
-        else:
-            residuals_smooth = residuals
-        
-        # Find positive peaks (where data exceeds fit)
+
+        residuals_smooth = savgol_filter(residuals, window_length, 3) if window_length >= 5 else residuals
         positive_peaks, _ = find_peaks(residuals_smooth, height=height_threshold, distance=min_distance)
-        
-        # Find negative peaks (where fit exceeds data - potential shoulders)
-        negative_peaks, _ = find_peaks(-residuals_smooth, height=height_threshold, distance=min_distance)
-        
-        # Combine and filter
-        all_candidate_indices = sorted(set(positive_peaks) | set(negative_peaks))
-        
+
         missing_peaks = []
         missing_params = []
-        
-        for idx in all_candidate_indices:
-            # Skip if too close to existing peaks
-            too_close = False
-            for info in peak_info:
-                if abs(self.x[idx] - info['cen_est']) < min_distance * np.mean(np.diff(self.x)):
-                    too_close = True
-                    break
-            
-            if too_close:
+        dx_mean = np.mean(np.diff(self.x))
+        x_span = np.max(self.x) - np.min(self.x)
+
+        for idx in sorted(positive_peaks):
+            idx = int(idx)
+            if any(abs(self.x[idx] - info['cen_est']) < min_distance * dx_mean for info in peak_info):
                 continue
-            
-            cen = self.x[idx]
-            amp = abs(residuals_smooth[idx])
-            sigma = GaussianModel.estimate_sigma_from_peak(self.x, residuals_smooth, idx)
-            sigma = max(sigma, 0.01 * (np.max(self.x) - np.min(self.x)) / 20)
-            
-            # Get original Y value for display
-            if self.use_log_x:
-                x_linear = 10**cen
-            else:
-                x_linear = cen
-            
-            # Find closest index in original data
-            orig_idx = np.argmin(np.abs(self.x_sorted - x_linear))
-            y_original_value = self.y_sorted[orig_idx]
-            
+
+            cen = float(self.x[idx])
+            amp = float(max(residuals_smooth[idx], 1e-5))
+            sigma = GaussianModel.estimate_sigma_from_peak(self.x, np.maximum(residuals_smooth, 0), idx)
+            sigma = float(max(sigma, 0.01 * x_span / 20.0))
+
+            x_linear = float(10**cen) if self.use_log_x else cen
+            orig_idx = int(np.argmin(np.abs(self.x_sorted - x_linear)))
+
             missing_peaks.append({
                 'index': idx,
                 'x': cen,
                 'x_linear': x_linear,
                 'y': amp,
-                'y_original': y_original_value,
+                'y_original': float(self.y_sorted[orig_idx]),
                 'amp_est': amp,
                 'cen_est': cen,
                 'sigma_est': sigma,
-                'dy': 0,
-                'd2y': 0,
+                'dy': 0.0,
+                'd2y': 0.0,
                 'source': 'residuals'
             })
-            
             missing_params.extend([amp, cen, sigma])
-        
+
         return missing_peaks, missing_params
-    
-    def _create_bounds(self, x, y_norm, n_peaks, n_baseline):
-        """Create bounds for fitting"""
-        lower_bounds = []
-        upper_bounds = []
-        x_range = np.max(x) - np.min(x)
-        
-        # Peak bounds
-        for i in range(n_peaks):
-            lower_bounds.extend([0, np.min(x), x_range * 0.001])
-            upper_bounds.extend([2 * np.max(y_norm), np.max(x), x_range * 0.5])
-        
-        # Baseline bounds
-        if n_baseline >= 1:  # constant
-            lower_bounds.append(-np.max(y_norm))
-            upper_bounds.append(np.max(y_norm))
-        if n_baseline >= 2:  # linear term
+
+    def _append_baseline_bounds(self, lower_bounds, upper_bounds, y_norm, x_range, n_baseline):
+        y_top = max(float(np.max(y_norm)), 1.0)
+        if n_baseline >= 1:
+            lower_bounds.append(-y_top)
+            upper_bounds.append(y_top)
+        if n_baseline >= 2:
             lower_bounds.append(-x_range)
             upper_bounds.append(x_range)
-        if n_baseline >= 3:  # quadratic term
-            lower_bounds.append(-x_range**2)
+        if n_baseline >= 3:
+            lower_bounds.append(-(x_range**2))
             upper_bounds.append(x_range**2)
-        
+
+    def _create_bounds(self, x, y_norm, n_peaks, n_baseline):
+        lower_bounds, upper_bounds = [], []
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        x_range = x_max - x_min
+        y_top = 2.0 * max(float(np.max(y_norm)), 1e-3)
+
+        for _ in range(n_peaks):
+            lower_bounds.extend([0.0, x_min, x_range * 0.001])
+            upper_bounds.extend([y_top, x_max, x_range * 0.5])
+
+        self._append_baseline_bounds(lower_bounds, upper_bounds, y_norm, x_range, n_baseline)
         return lower_bounds, upper_bounds
-    
-    def fit(self, initial_params=None, method='trf', maxfev=5000, 
+
+    def _create_bounds_with_fixed_centers(self, x, y_norm, n_peaks, n_baseline, fixed_centers):
+        lower_bounds, upper_bounds = [], []
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        x_range = x_max - x_min
+        y_top = 2.0 * max(float(np.max(y_norm)), 1e-3)
+        eps_cen = max(x_range * 1e-6, 1e-8)
+
+        for i in range(n_peaks):
+            c_fix = float(np.clip(fixed_centers[i], x_min + eps_cen, x_max - eps_cen))
+            lower_bounds.extend([0.0, c_fix - eps_cen, x_range * 0.001])
+            upper_bounds.extend([y_top, c_fix + eps_cen, x_range * 0.5])
+
+        self._append_baseline_bounds(lower_bounds, upper_bounds, y_norm, x_range, n_baseline)
+        return lower_bounds, upper_bounds
+
+    def _create_bounds_with_limited_centers(self, x, y_norm, n_peaks, n_baseline, initial_centers, shift_range):
+        lower_bounds, upper_bounds = [], []
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        x_range = x_max - x_min
+        max_shift = float(shift_range * np.mean(np.diff(x)))
+        y_top = 2.0 * max(float(np.max(y_norm)), 1e-3)
+
+        for i in range(n_peaks):
+            c_init = float(initial_centers[i])
+            low_c = max(x_min, c_init - max_shift)
+            high_c = min(x_max, c_init + max_shift)
+            if high_c <= low_c:
+                high_c = low_c + 1e-6
+            lower_bounds.extend([0.0, low_c, x_range * 0.001])
+            upper_bounds.extend([y_top, high_c, x_range * 0.5])
+
+        self._append_baseline_bounds(lower_bounds, upper_bounds, y_norm, x_range, n_baseline)
+        return lower_bounds, upper_bounds
+
+    def _check_improvement(self, prev_metrics, curr_metrics, tolerance=1e-4):
+        if prev_metrics is None or 'R²' not in prev_metrics or 'R²' not in curr_metrics:
+            return True
+        return (curr_metrics.get('R²', 0.0) - prev_metrics.get('R²', 0.0)) > tolerance
+
+    def _run_curve_fit(self, model_func, p0, lower_bounds, upper_bounds, method,
+                       maxfev, xtol, ftol, gtol, allow_lm=False):
+        p0_safe = np.clip(np.array(p0, dtype=float), lower_bounds, upper_bounds)
+        use_method = method if (method != 'lm' or allow_lm) else 'trf'
+
+        if use_method == 'lm':
+            popt, pcov = curve_fit(
+                model_func, self.x, self.y_norm, p0=p0_safe,
+                method='lm', maxfev=maxfev, xtol=xtol, ftol=ftol, gtol=gtol
+            )
+            n_baseline = self._get_n_baseline_params()
+            n_peaks = (len(popt) - n_baseline) // 3
+            x_range = float(np.max(self.x) - np.min(self.x))
+            for i in range(n_peaks):
+                popt[3 * i] = max(0.0, popt[3 * i])
+                popt[3 * i + 1] = np.clip(popt[3 * i + 1], np.min(self.x), np.max(self.x))
+                popt[3 * i + 2] = np.clip(abs(popt[3 * i + 2]), x_range * 0.001, x_range * 0.5)
+            return popt, pcov
+
+        return curve_fit(
+            model_func, self.x, self.y_norm, p0=p0_safe,
+            bounds=(lower_bounds, upper_bounds),
+            method=use_method, maxfev=maxfev, xtol=xtol, ftol=ftol, gtol=gtol
+        )
+
+    def fit(self, initial_params=None, method='trf', maxfev=5000,
             fit_quality='balanced', last_popt=None, progress_callback=None,
             use_iterative_refinement=True):
-        """
-        Perform fitting with iterative refinement (Stage 1: fixed centers, 
-        Stage 2: limited centers, Stage 3: free centers).
-        
-        Args:
-            use_iterative_refinement: If True, use 3-stage optimization.
-                                     If False, use single-stage optimization.
-        """
+        """Perform 3-stage or single-stage Gaussian deconvolution"""
         if initial_params is None:
             _, _, initial_params, _ = self.auto_detect_peaks()
-        
+
         if len(initial_params) == 0:
             if progress_callback:
                 progress_callback(1.0, "No peaks detected!")
             return False
-        
+
         n_peaks = len(initial_params) // 3
         n_baseline = self._get_n_baseline_params()
-        
-        # Extract initial centers
-        initial_centers = [initial_params[3*i + 1] for i in range(n_peaks)]
-        
-        # Use last good parameters if available
+        initial_centers = [initial_params[3 * i + 1] for i in range(n_peaks)]
+
         if last_popt is not None and not use_iterative_refinement:
             expected_len = n_peaks * 3 + n_baseline
             if len(last_popt) == expected_len:
-                initial_params = last_popt.copy()
+                initial_params = list(last_popt)
             else:
                 initial_params = self._prepare_initial_params(initial_params, n_baseline)
         else:
             initial_params = self._prepare_initial_params(initial_params, n_baseline)
-        
-        # Set tolerances based on fit quality
+
         if fit_quality == 'fast':
             xtol, ftol, gtol = 1e-3, 1e-3, 1e-3
-            maxfev_stage = min(maxfev // 3, 2000)
+            maxfev_stage = max(1000, maxfev // 3)
         elif fit_quality == 'balanced':
             xtol, ftol, gtol = 1e-5, 1e-5, 1e-5
-            maxfev_stage = min(maxfev // 3, 3000)
-        else:  # precise
+            maxfev_stage = max(2000, maxfev // 2)
+        else:
             xtol, ftol, gtol = 1e-8, 1e-8, 1e-8
-            maxfev_stage = min(maxfev // 3, 4000)
-        
-        # Define the model function for curve_fit
+            maxfev_stage = max(4000, maxfev)
+
         def model_func(x, *params):
             if n_baseline == 0:
                 return GaussianModel.multi_gaussian(x, *params)
-            else:
-                peak_params = params[:n_peaks*3]
-                baseline_params = params[n_peaks*3:]
-                return GaussianModel.multi_gaussian_with_baseline(
-                    x, n_peaks, peak_params, baseline_params, self.baseline_method
-                )
-        
-        # If not using iterative refinement, do single-stage fit
+            peak_p = params[: n_peaks * 3]
+            base_p = params[n_peaks * 3 :]
+            return GaussianModel.multi_gaussian_with_baseline(
+                x, n_peaks, peak_p, base_p, self.baseline_method
+            )
+
         if not use_iterative_refinement:
-            lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
-            
-            for i in range(len(initial_params)):
-                initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
-            
-            try:
-                if progress_callback:
-                    progress_callback(0.3, "Initializing fit...")
-                
-                if progress_callback:
-                    progress_callback(0.5, "Running curve_fit...")
-                
-                popt, pcov = curve_fit(
-                    model_func,
-                    self.x,
-                    self.y_norm,
-                    p0=initial_params,
-                    bounds=(lower_bounds, upper_bounds),
-                    method=method,
-                    maxfev=maxfev,
-                    xtol=xtol,
-                    ftol=ftol,
-                    gtol=gtol
-                )
-                
-                if progress_callback:
-                    progress_callback(0.8, "Calculating components...")
-                
-                return self._process_fit_result(popt, n_peaks, n_baseline, progress_callback)
-                
-            except Exception as e:
-                if progress_callback:
-                    progress_callback(1.0, f"Fit failed: {e}")
-                return False
-        
-        # ITERATIVE REFINEMENT - 3 STAGES
-        current_params = initial_params.copy()
-        prev_metrics = None
-        stage_results = []
-        
-        # Stage 1: Fixed centers (only amplitudes and sigmas vary)
+            return self._fallback_fit(
+                model_func, initial_params, n_peaks, n_baseline,
+                method, maxfev, xtol, ftol, gtol, progress_callback
+            )
+
+        current_params = np.array(initial_params, dtype=float)
+        best_r2 = -np.inf
+
+        # Stage 1: Fixed centers
         if progress_callback:
-            progress_callback(0.1, "Stage 1/3: Optimizing amplitudes and widths (centers fixed)...")
-        
+            progress_callback(0.15, "Stage 1/3: Optimizing amplitudes and widths (centers fixed)...")
         try:
-            lower_bounds_fixed, upper_bounds_fixed = self._create_bounds_with_fixed_centers(
+            lb1, ub1 = self._create_bounds_with_fixed_centers(
                 self.x, self.y_norm, n_peaks, n_baseline, initial_centers
             )
-            
-            for i in range(len(current_params)):
-                current_params[i] = np.clip(current_params[i], lower_bounds_fixed[i], upper_bounds_fixed[i])
-            
-            popt_stage1, _ = curve_fit(
-                model_func,
-                self.x,
-                self.y_norm,
-                p0=current_params,
-                bounds=(lower_bounds_fixed, upper_bounds_fixed),
-                method=method,
-                maxfev=maxfev_stage,
-                xtol=xtol,
-                ftol=ftol,
-                gtol=gtol
+            popt1, _ = self._run_curve_fit(
+                model_func, current_params, lb1, ub1, method,
+                maxfev_stage, xtol, ftol, gtol, allow_lm=False
             )
-            
-            current_params = popt_stage1.copy()
-            
-            # Calculate metrics for stage 1
-            fit_y_norm_stage1 = model_func(self.x, *current_params)
-            metrics_stage1 = FitQualityAnalyzer.calculate_metrics(
-                self.y_norm, fit_y_norm_stage1, len(current_params)
-            )
-            stage_results.append(('Stage 1 (fixed centers)', metrics_stage1))
-            prev_metrics = metrics_stage1
-            
-            if progress_callback:
-                progress_callback(0.3, f"Stage 1 complete. R² = {metrics_stage1.get('R²', 0):.6f}")
-            
+            current_params = popt1.copy()
+            m1 = FitQualityAnalyzer.calculate_metrics(self.y_norm, model_func(self.x, *current_params), len(current_params))
+            best_r2 = m1.get('R²', -np.inf)
         except Exception as e:
-            if progress_callback:
-                progress_callback(0.3, f"Stage 1 failed: {e}")
-            # Fall back to regular fit
-            return self._fallback_fit(model_func, initial_params, n_peaks, n_baseline, 
-                                      method, maxfev, xtol, ftol, gtol, progress_callback)
-        
-        # Stage 2: Limited centers (±3 points)
+            logging.warning(f"Stage 1 failed: {e}")
+            return self._fallback_fit(
+                model_func, initial_params, n_peaks, n_baseline,
+                method, maxfev, xtol, ftol, gtol, progress_callback
+            )
+
+        # Stage 2: Limited shift (±3 grid points)
         if progress_callback:
-            progress_callback(0.4, "Stage 2/3: Refining peak positions (limited shift)...")
-        
+            progress_callback(0.5, "Stage 2/3: Refining peak positions (limited shift)...")
         try:
-            # Extract updated centers from stage 1
-            updated_centers = [current_params[3*i + 1] for i in range(n_peaks)]
-            
-            lower_bounds_limited, upper_bounds_limited = self._create_bounds_with_limited_centers(
+            updated_centers = [current_params[3 * i + 1] for i in range(n_peaks)]
+            lb2, ub2 = self._create_bounds_with_limited_centers(
                 self.x, self.y_norm, n_peaks, n_baseline, updated_centers, shift_range=3
             )
-            
-            for i in range(len(current_params)):
-                current_params[i] = np.clip(current_params[i], lower_bounds_limited[i], upper_bounds_limited[i])
-            
-            popt_stage2, _ = curve_fit(
-                model_func,
-                self.x,
-                self.y_norm,
-                p0=current_params,
-                bounds=(lower_bounds_limited, upper_bounds_limited),
-                method=method,
-                maxfev=maxfev_stage,
-                xtol=xtol,
-                ftol=ftol,
-                gtol=gtol
+            popt2, _ = self._run_curve_fit(
+                model_func, current_params, lb2, ub2, method,
+                maxfev_stage, xtol, ftol, gtol, allow_lm=False
             )
-            
-            current_params = popt_stage2.copy()
-            
-            # Calculate metrics for stage 2
-            fit_y_norm_stage2 = model_func(self.x, *current_params)
-            metrics_stage2 = FitQualityAnalyzer.calculate_metrics(
-                self.y_norm, fit_y_norm_stage2, len(current_params)
-            )
-            stage_results.append(('Stage 2 (limited centers)', metrics_stage2))
-            
-            # Check if improvement is significant
-            if not self._check_improvement(prev_metrics, metrics_stage2):
-                if progress_callback:
-                    progress_callback(0.6, "Stage 2: No significant improvement, stopping early.")
-            else:
-                prev_metrics = metrics_stage2
-            
-            if progress_callback:
-                progress_callback(0.6, f"Stage 2 complete. R² = {metrics_stage2.get('R²', 0):.6f}")
-            
+            m2 = FitQualityAnalyzer.calculate_metrics(self.y_norm, model_func(self.x, *popt2), len(popt2))
+            if m2.get('R²', -np.inf) >= best_r2:
+                current_params = popt2.copy()
+                best_r2 = m2.get('R²', best_r2)
         except Exception as e:
-            if progress_callback:
-                progress_callback(0.6, f"Stage 2 failed: {e}, continuing with stage 1 results...")
-        
+            logging.warning(f"Stage 2 failed: {e}")
+
         # Stage 3: Full freedom
         if progress_callback:
-            progress_callback(0.7, "Stage 3/3: Final optimization (full freedom)...")
-        
+            progress_callback(0.8, "Stage 3/3: Final optimization...")
         try:
-            lower_bounds_free, upper_bounds_free = self._create_bounds(
-                self.x, self.y_norm, n_peaks, n_baseline
+            lb3, ub3 = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
+            popt3, _ = self._run_curve_fit(
+                model_func, current_params, lb3, ub3, method,
+                maxfev_stage, xtol, ftol, gtol, allow_lm=True
             )
-            
-            for i in range(len(current_params)):
-                current_params[i] = np.clip(current_params[i], lower_bounds_free[i], upper_bounds_free[i])
-            
-            popt_stage3, _ = curve_fit(
-                model_func,
-                self.x,
-                self.y_norm,
-                p0=current_params,
-                bounds=(lower_bounds_free, upper_bounds_free),
-                method=method,
-                maxfev=maxfev_stage,
-                xtol=xtol,
-                ftol=ftol,
-                gtol=gtol
-            )
-            
-            current_params = popt_stage3.copy()
-            
-            # Calculate metrics for stage 3
-            fit_y_norm_stage3 = model_func(self.x, *current_params)
-            metrics_stage3 = FitQualityAnalyzer.calculate_metrics(
-                self.y_norm, fit_y_norm_stage3, len(current_params)
-            )
-            stage_results.append(('Stage 3 (full freedom)', metrics_stage3))
-            
-            if progress_callback:
-                progress_callback(0.9, f"Stage 3 complete. R² = {metrics_stage3.get('R²', 0):.6f}")
-            
+            m3 = FitQualityAnalyzer.calculate_metrics(self.y_norm, model_func(self.x, *popt3), len(popt3))
+            if m3.get('R²', -np.inf) >= best_r2 - 1e-6:
+                current_params = popt3.copy()
         except Exception as e:
-            if progress_callback:
-                progress_callback(0.9, f"Stage 3 failed: {e}, using stage 2 results...")
-        
-        # Log stage results for debugging
-        if self.show_warnings:
-            print("\n=== Iterative Refinement Results ===")
-            for stage_name, metrics in stage_results:
-                print(f"{stage_name}: R² = {metrics.get('R²', 0):.8f}, RMSE = {metrics.get('RMSE', 0):.2e}")
-        
-        # Process final result
-        if progress_callback:
-            progress_callback(0.95, "Calculating components...")
-        
+            logging.warning(f"Stage 3 failed: {e}")
+
         return self._process_fit_result(current_params, n_peaks, n_baseline, progress_callback)
-    
+
     def _process_fit_result(self, popt, n_peaks, n_baseline, progress_callback=None):
-        """
-        Process fit result: extract components, calculate metrics, store results.
-        
-        Args:
-            popt: optimized parameters from curve_fit
-            n_peaks: number of peaks
-            n_baseline: number of baseline parameters
-            progress_callback: optional callback for progress updates
-        
-        Returns:
-            bool: True if successful
-        """
-        # Calculate fit in normalized space
         def model_func(x, *params):
             if n_baseline == 0:
                 return GaussianModel.multi_gaussian(x, *params)
-            else:
-                peak_params = params[:n_peaks*3]
-                baseline_params = params[n_peaks*3:]
-                return GaussianModel.multi_gaussian_with_baseline(
-                    x, n_peaks, peak_params, baseline_params, self.baseline_method
-                )
-        
+            return GaussianModel.multi_gaussian_with_baseline(
+                x, n_peaks, params[: n_peaks * 3], params[n_peaks * 3 :], self.baseline_method
+            )
+
         fit_y_norm = model_func(self.x, *popt)
-        # Calculate fit in original space
         fit_y_original = fit_y_norm * self.y_max
-        
-        # Extract components
+
+        peak_params = popt[: n_peaks * 3]
+        baseline_params_norm = popt[n_peaks * 3 :] if n_baseline > 0 else []
+        # Переводим параметры базовой линии в физические единицы (Омы)
+        baseline_params = [float(p * self.y_max) for p in baseline_params_norm]
+
         components = []
-        peak_params = popt[:n_peaks*3]
-        baseline_params = popt[n_peaks*3:] if n_baseline > 0 else []
-        
         for i in range(n_peaks):
-            amp_norm = peak_params[3*i]
-            cen = peak_params[3*i + 1]
-            sigma = abs(peak_params[3*i + 2])
-            
+            amp_norm = float(peak_params[3 * i])
+            cen = float(peak_params[3 * i + 1])
+            sigma = float(abs(peak_params[3 * i + 2]))
+
             amp = amp_norm * self.y_max
-            area = GaussianModelDeconv.calculate_area(amp_norm, sigma) * self.y_max
-            
-            component_y_norm = GaussianModelDeconv.gaussian(self.x, amp_norm, cen, sigma)
-            
-            # Calculate center in linear space
-            if self.use_log_x:
-                cen_linear = 10**cen
-            else:
-                cen_linear = cen
-            
+            area = GaussianModel.calculate_area(amp, sigma, use_log_x=self.use_log_x)
+            component_y_norm = GaussianModel.gaussian(self.x, amp_norm, cen, sigma)
+            cen_linear = float(10**cen) if self.use_log_x else cen
+
             components.append({
                 'id': i + 1,
                 'amp_norm': amp_norm,
@@ -2710,79 +2487,56 @@ class GaussianDeconvolver:
                 'sigma_log': sigma,
                 'fwhm': GaussianModel.calculate_fwhm(sigma),
                 'area': area,
-                'fraction': 0,
+                'fraction': 0.0,
                 'y_norm': component_y_norm,
                 'source': 'auto'
             })
-        
-        # Calculate fractions
-        total_area = sum([c['area'] for c in components])
+
+        total_area = sum(c['area'] for c in components)
         for c in components:
-            c['fraction'] = c['area'] / total_area if total_area > 0 else 0
-            c['fraction_percent'] = c['fraction'] * 100
-        
-        # Store results
+            c['fraction'] = c['area'] / total_area if total_area > 0 else 0.0
+            c['fraction_percent'] = c['fraction'] * 100.0
+
         self.popt = popt
         self.components = components
         self.baseline_params = baseline_params
         self.fit_y_norm = fit_y_norm
         self.fit_y_original = fit_y_original
         self.total_area = total_area
-        
-        # Calculate quality metrics
         self.quality_metrics = FitQualityAnalyzer.calculate_metrics(
             self.y_norm, self.fit_y_norm, len(popt)
         )
-        
+
         if progress_callback:
             progress_callback(1.0, "Fit complete!")
-        
+
         return True
-    
-    def _fallback_fit(self, model_func, initial_params, n_peaks, n_baseline, 
+
+    def _fallback_fit(self, model_func, initial_params, n_peaks, n_baseline,
                       method, maxfev, xtol, ftol, gtol, progress_callback):
-        """Fallback to regular fit if iterative refinement fails"""
         try:
-            lower_bounds, upper_bounds = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
-            
-            for i in range(len(initial_params)):
-                initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
-            
-            popt, _ = curve_fit(
-                model_func,
-                self.x,
-                self.y_norm,
-                p0=initial_params,
-                bounds=(lower_bounds, upper_bounds),
-                method=method,
-                maxfev=maxfev,
-                xtol=xtol,
-                ftol=ftol,
-                gtol=gtol
+            lb, ub = self._create_bounds(self.x, self.y_norm, n_peaks, n_baseline)
+            popt, _ = self._run_curve_fit(
+                model_func, initial_params, lb, ub, method,
+                maxfev, xtol, ftol, gtol, allow_lm=True
             )
-            
             return self._process_fit_result(popt, n_peaks, n_baseline, progress_callback)
-            
         except Exception as e:
             if progress_callback:
                 progress_callback(1.0, f"Fallback fit failed: {e}")
             return False
-    
+
     def create_deconvolution_result(self) -> DeconvolutionResult:
-        """Create result container from current components with peaks sorted by frequency (high to low)"""
-        # Sort components by characteristic frequency (high to low) and reassign IDs
         components_with_freq = []
         for c in self.components:
-            freq = 1.0 / (2 * np.pi * c['cen_linear'])
+            freq = 1.0 / (2.0 * np.pi * c['cen_linear'])
             components_with_freq.append((freq, c))
-        
-        # Sort by frequency descending (high to low)
-        components_with_freq.sort(key=lambda x: x[0], reverse=True)
-        
-        # Create peaks with new IDs in sorted order
+
+        components_with_freq.sort(key=lambda item: item[0], reverse=True)
+
         peaks = []
         for new_id, (freq, c) in enumerate(components_with_freq, start=1):
-            peak = GaussianPeak(
+            peaks.append(GaussianPeak(
                 id=new_id,
                 center=c['cen_linear'],
                 center_log=c['cen_log'],
@@ -2796,69 +2550,29 @@ class GaussianDeconvolver:
                 source=c.get('source', 'auto'),
                 y_norm=c['y_norm'],
                 characteristic_frequency=freq
-            )
-            peaks.append(peak)
-        
-        # Use original y_original values
-        y_original_restored = self.y_original.copy()
-        
-        # Calculate total area from components (should be close to drt_integral)
-        total_component_area = sum([p.area for p in peaks])
-        
-        print(f"Original DRT integral: {self.drt_integral:.6f} Ω")
-        print(f"Total area from deconvolution: {total_component_area:.6f} Ω")
-        print(f"Ratio (should be ~1.0): {total_component_area/self.drt_integral:.4f}")
-        
-        # Reorder fit_y_original according to sorted peaks if needed for consistent display
-        # For fit_y_original, we need to keep it as is (it's the total fit, not per-peak)
-        
+            ))
+
         return DeconvolutionResult(
             peaks=peaks,
             fit_y_norm=self.fit_y_norm if self.fit_y_norm is not None else np.zeros_like(self.x),
             fit_y_original=self.fit_y_original if self.fit_y_original is not None else None,
             x=self.x,
             y_norm=self.y_norm,
-            y_original=y_original_restored,
+            y_original=self.y_original.copy(),
             x_linear=self.x_linear,
             use_log_x=self.use_log_x,
             use_log_y=self.use_log_y,
             quality_metrics=self.quality_metrics,
             baseline_params=self.baseline_params,
             baseline_method=self.baseline_method,
-            total_area=self.drt_integral,  # Use the original DRT integral as total area
-            max_amplitude=max([p.amplitude for p in peaks]) if peaks else 0
+            total_area=self.drt_integral,
+            max_amplitude=max([p.amplitude for p in peaks]) if peaks else 0.0
         )
-        
+
     def calculate_peak_area(self, amplitude: float, sigma: float, is_log_scale: bool = True) -> float:
-        """
-        Calculate area under Gaussian peak.
-        
-        For peaks in log space: area = amplitude * sigma * sqrt(2π)
-        This area corresponds to contribution to polarization resistance in Ω.
-        
-        Args:
-            amplitude: Peak amplitude in original units (Ω)
-            sigma: Standard deviation in log space
-            is_log_scale: Whether X is in log scale (should be True for DRT)
-            
-        Returns:
-            Area under peak (Ω)
-        """
-        if is_log_scale:
-            # For log-scale X, area = amplitude * sigma * sqrt(2π)
-            # This integrates over d(ln τ)
-            return amplitude * sigma * np.sqrt(2 * np.pi)
-        else:
-            # For linear scale (not typical for DRT)
-            return amplitude * sigma * np.sqrt(2 * np.pi)
-    
+        return GaussianModel.calculate_area(amplitude, sigma, use_log_x=is_log_scale)
+
     def get_total_resistance(self) -> float:
-        """
-        Get total polarization resistance from DRT integral.
-        
-        Returns:
-            float: Total polarization resistance in Ω
-        """
         return self.drt_integral
 
 
@@ -3844,19 +3558,32 @@ def step1_data_loading():
         im_z = None
         
         if input_method == "Upload File":
-            uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv', 'xlsx', 'dat', 'z', 'mpt'])
-            if uploaded_file:
-                try:
-                    df = pd.read_csv(uploaded_file, nrows=5)
-                    st.subheader("Column Mapping")
-                    col_freq = st.selectbox("Frequency column", df.columns)
-                    col_re = st.selectbox("Re(Z) column", df.columns)
-                    col_im = st.selectbox("-Im(Z) column", df.columns)
-                    
-                    if st.button("📥 Load Data", type="primary", use_container_width=True):
-                        freq, re_z, im_z = load_data(uploaded_file, col_freq, col_re, col_im)
-                        if freq is not None:
-                            st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
+                    uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv', 'xlsx', 'dat', 'z', 'mpt'])
+                    if uploaded_file:
+                        try:
+                            df = _read_eis_dataframe(uploaded_file, nrows=5)
+                            cols = list(df.columns)
+                            st.subheader("Column Mapping")
+                            col_freq = st.selectbox("Frequency column", cols, index=0)
+                            col_re = st.selectbox("Re(Z) column", cols, index=min(1, len(cols) - 1))
+                            col_im = st.selectbox("Imaginary column", cols, index=min(2, len(cols) - 1))
+                            sign_mode = st.radio(
+                                "Imaginary column sign convention:",
+                                ["Auto-detect", "Column is -Im(Z) (capacitive > 0)", "Column is Im(Z) (capacitive < 0)"],
+                                horizontal=True
+                            )
+                            invert_map = {
+                                "Auto-detect": None,
+                                "Column is -Im(Z) (capacitive > 0)": False,
+                                "Column is Im(Z) (capacitive < 0)": True
+                            }
+        
+                            if st.button("📥 Load Data", type="primary", use_container_width=True):
+                                freq, re_z, im_z = load_data(uploaded_file, col_freq, col_re, col_im)
+                                if freq is not None:
+                                    st.session_state.app_state.impedance_data = ImpedanceData(
+                                        freq, re_z, im_z, invert_imag=invert_map[sign_mode]
+                                    )
                             st.session_state.app_state.data_loaded = True
                             # Initialize selection state
                             if 'selected_point_idx' not in st.session_state:
@@ -3997,7 +3724,9 @@ def step1_data_loading():
         @st.cache_data(ttl=60, show_spinner=False)
         def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, n_points, original_len):
             """Cache plots to prevent rerender on slider movement"""
-            temp_data = ImpedanceData(np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple))
+            temp_data = ImpedanceData(
+                np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple), invert_imag=False
+            )
             fig_nyquist = plot_nyquist_matplotlib(temp_data, highlight_idx=point_idx)
             fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx)
             return fig_nyquist, fig_bode
@@ -4124,16 +3853,16 @@ def step2_drt_analysis():
                     try:
                         # Handle data discarding if needed
                         if induct_mode == "Discard Inductive Data":
-                            # Discard points with positive -Im(Z)
-                            mask = -data.im_z > 0  # -Im(Z) > 0 indicates inductive behavior
-                            n_discarded = np.sum(mask)
+                            # Индуктивные точки имеют data.im_z < 0 (так как data.im_z хранит -Im(Z))
+                            mask = data.im_z < 0
+                            n_discarded = int(np.sum(mask))
                             if n_discarded > 0:
                                 st.info(f"Discarding {n_discarded} inductive data points")
-                                # Create temporary data object with discarded points
                                 temp_data = ImpedanceData(
                                     data.freq[~mask],
                                     data.re_z[~mask],
-                                    data.im_z[~mask]
+                                    data.im_z[~mask],
+                                    invert_imag=False
                                 )
                             else:
                                 temp_data = data
@@ -4399,7 +4128,15 @@ def step3_gaussian_deconvolution():
     
     # Create deconvolver if not exists OR if DRT result has changed (check by memory address or timestamp)
     # We force recreation when drt_result is new (which happens after recalculation in Step 2)
-    if st.session_state.app_state.deconvolver is None:
+    existing_dec = st.session_state.app_state.deconvolver
+    settings_changed = (
+        existing_dec is not None and (
+            existing_dec.baseline_method != st.session_state.app_state.baseline_method
+            or existing_dec.smoothing_level != st.session_state.app_state.smoothing_level
+            or existing_dec.preprocessor.clip_negative != st.session_state.app_state.clip_negative
+        )
+    )
+    if existing_dec is None or settings_changed:
         deconvolver = GaussianDeconvolver(
             x_linear=drt_result.tau_grid,
             y_original=gamma_original,  # Используем оригинальные ненормированные значения
@@ -4649,8 +4386,7 @@ def step3_gaussian_deconvolution():
                                 if st.session_state.app_state.initial_peak_params:
                                     start_idx = i * 3
                                     del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
-                                st.success(f"Peak {i+1} removed")
-                                st.rerun()
+                                st.session_state.app_state.last_popt = None
                                 st.success(f"Peak {i+1} removed")
                                 st.rerun()
                 
@@ -4802,12 +4538,12 @@ def step4_results():
                     bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
         
         plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-        
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
         buf.seek(0)
+
+        st.pyplot(fig)
+        plt.close(fig)
         st.download_button("📥 Download Deconvolution Plot (PNG)", 
                           data=buf,
                           file_name=f"deconvolution_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
@@ -4892,7 +4628,7 @@ def step4_results():
                 'Amplitude (norm)': f"{peak.amplitude_norm:.4f}",
                 'Sigma (log)': f"{peak.sigma_log:.4f}",
                 'FWHM': f"{peak.fwhm:.4f}",
-                'Area (Ω·s)': f"{peak.area:.4e}",
+                'Area (Ω)': f"{peak.area:.4e}",
                 'Fraction (%)': f"{peak.fraction_percent:.2f}",
                 'Source': peak.source
             })
@@ -5356,25 +5092,29 @@ def show_step_indicator():
             "Show warnings", 
             value=st.session_state.app_state.show_warnings
         )
+        smooth_opts = ['none', 'light', 'medium', 'strong', 'adaptive']
         st.session_state.app_state.smoothing_level = st.selectbox(
             "Smoothing",
-            options=['none', 'light', 'medium', 'strong', 'adaptive'],
-            index=0
+            options=smooth_opts,
+            index=smooth_opts.index(st.session_state.app_state.smoothing_level)
         )
+        base_opts = ['none', 'constant', 'linear', 'quadratic']
         st.session_state.app_state.baseline_method = st.selectbox(
             "Baseline correction",
-            options=['none', 'constant', 'linear', 'quadratic'],
-            index=0
+            options=base_opts,
+            index=base_opts.index(st.session_state.app_state.baseline_method)
         )
+        method_opts = ['trf', 'dogbox', 'lm']
         st.session_state.app_state.fitting_method = st.selectbox(
             "Fitting method",
-            options=['trf', 'dogbox', 'lm'],
-            index=0
+            options=method_opts,
+            index=method_opts.index(st.session_state.app_state.fitting_method)
         )
+        qual_opts = ['fast', 'balanced', 'precise']
         st.session_state.app_state.fit_quality = st.selectbox(
             "Fit quality",
-            options=['fast', 'balanced', 'precise'],
-            index=1
+            options=qual_opts,
+            index=qual_opts.index(st.session_state.app_state.fit_quality)
         )
         st.session_state.app_state.preview_mode = st.checkbox(
             "Preview mode (no fitting)",
