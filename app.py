@@ -3556,7 +3556,7 @@ def step1_data_loading():
         freq = None
         re_z = None
         im_z = None
-        
+
         if input_method == "Upload File":
                     uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv', 'xlsx', 'dat', 'z', 'mpt'])
                     if uploaded_file:
@@ -3584,16 +3584,13 @@ def step1_data_loading():
                                     st.session_state.app_state.impedance_data = ImpedanceData(
                                         freq, re_z, im_z, invert_imag=invert_map[sign_mode]
                                     )
-                            st.session_state.app_state.data_loaded = True
-                            # Initialize selection state
-                            if 'selected_point_idx' not in st.session_state:
-                                st.session_state.selected_point_idx = 0
-                            if 'freq_range_idx' not in st.session_state:
-                                st.session_state.freq_range_idx = (0, len(freq) - 1)
-                            st.success(f"✅ Loaded {len(freq)} data points")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
+                                    st.session_state.app_state.data_loaded = True
+                                    st.session_state.selected_point_idx = 0
+                                    st.session_state.freq_range_idx = (0, len(freq) - 1)
+                                    st.success(f"✅ Loaded {len(freq)} data points")
+                                    st.rerun()
+                        except Exception as e:
+                            st.error(f"Error reading file: {e}")
         else:
             freq, re_z, im_z = manual_data_entry()
             if freq is not None:
