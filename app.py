@@ -760,20 +760,19 @@ class DRTCore:
         if len(residuals) < 3:
             return len(residuals) // 2
         
-        log_res = np.log(residuals + 1e-12)
-        log_sol = np.log(solution_norms + 1e-12)
+        log_res = np.log(residuals + 1e-10)
+        log_sol = np.log(solution_norms + 1e-10)
         
-        dx = np.gradient(log_res)
-        dy = np.gradient(log_sol)
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
+        dlog_res = np.gradient(log_res)
+        dlog_sol = np.gradient(log_sol)
         
-        # Истинная формула кривизны L-кривой (максимум положительного изгиба угла)
-        denom = (dx**2 + dy**2 + 1e-12) ** 1.5
-        curvature = (dx * ddy - dy * ddx) / denom
+        if len(dlog_res) < 2 or len(dlog_sol) < 2:
+            return len(residuals) // 2
         
-        if len(curvature) > 2:
-            return int(np.argmax(np.abs(curvature[1:-1])) + 1)
+        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
+        
+        if len(curvature) > 0:
+            return np.argmax(curvature) + 1
         return len(residuals) // 2
     
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
@@ -834,9 +833,8 @@ class DRTCore:
         omega = 2 * np.pi * self.frequencies
         
         # Create extended matrix: [K_real; K_imag] with extra column for L
-        # Поскольку Z_target содержит -self.Z_imag = +Im(Z), а Im(j*omega*L) = +omega*L, знак +omega!
         K_base = np.vstack([K_real, K_imag])
-        L_column = np.concatenate([np.zeros(self.N), omega])
+        L_column = np.concatenate([np.zeros(self.N), -omega])
         K_extended = np.column_stack([K_base, L_column])
         
         return K_extended, K_real, K_imag
@@ -864,7 +862,7 @@ class DRTCore:
         
         # Reconstruct impedance
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
         
         # Calculate relative error
         Z_original = self.Z_real + 1j * self.Z_imag
@@ -1155,7 +1153,7 @@ class TikhonovDRT(DRTCore):
         """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
         return Z_rec_real, Z_rec_imag
 
 
