@@ -3710,6 +3710,13 @@ def step1_data_loading():
                     data.apply_frequency_range(f_min, f_max)
                     st.session_state.selected_point_idx = 0
                     st.session_state.freq_range_idx = (0, data.n_points - 1)
+                    # Сбрасываем старые результаты DRT и деконволюции, так как длина спектра изменилась
+                    st.session_state.app_state.drt_calculated = False
+                    st.session_state.app_state.drt_result = None
+                    st.session_state.app_state.drt_solver = None
+                    st.session_state.app_state.deconvolver = None
+                    st.session_state.app_state.deconv_result = None
+                    st.session_state.app_state.deconv_calculated = False
                     st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
                     st.rerun()
             
@@ -3966,15 +3973,21 @@ def step2_drt_analysis():
                 st.warning(f"⚠️ DRT integral verification: {integral:.4f} Ω (ratio = {ratio:.4f})")
             
             # Reconstruct impedance from DRT for validation
-            if solver is not None:
+            if solver is not None and len(solver.frequencies) == data.n_points and np.allclose(solver.frequencies, data.freq):
+                val_data = solver.data
                 Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
                 
                 # Calculate reconstruction error
-                Z_original = data.Z
+                Z_original = val_data.Z
                 Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
-                error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
+                error_percent = np.abs((Z_original - Z_reconstructed) / (np.abs(Z_original) + 1e-10)) * 100
                 mean_error = np.mean(error_percent)
                 max_error = np.max(error_percent)
+            elif solver is not None and len(solver.frequencies) != data.n_points:
+                st.warning("⚠️ Диапазон частот или число точек были изменены на Шаге 1. Нажмите **«🚀 Run DRT Analysis»**, чтобы пересчитать DRT для новых данных.")
+                solver = None
+
+            if solver is not None:
                 
                 st.info(f"""
                 **Reconstruction Quality:**
