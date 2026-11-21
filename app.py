@@ -3622,10 +3622,10 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                               data: ImpedanceData,
                               title: str = "Experimental vs Sequential RC Model") -> plt.Figure:
     """
-    Plot experimental impedance spectrum with sequential RC model.
-    Each Gaussian peak corresponds to one RC element.
-    Elements are connected in series: R∞ → RC₁ → RC₂ → ... → RCₙ
-    Inductance L is added in series before R∞ if present.
+    Plot experimental impedance spectrum with sequential distributed RC (Gaussian DRT) model.
+    Each Gaussian peak corresponds to one distributed relaxation process integrated over the Debye kernel:
+        Z_i(ω) = ∫ G_i(log10 τ) / (1 + iωτ) d(log10 τ)
+    Elements are connected in series: L → R∞ → Process₁ → Process₂ → ... → Processₙ.
     
     IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
     Legend placed outside plot area.
@@ -3642,7 +3642,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     im_exp = data.im_z
     freq_exp = data.freq
     
-    # Sort by frequency for consistent ordering
+    # Sort by frequency for consistent ordering (low to high)
     sort_idx_exp = np.argsort(freq_exp)
     re_exp_sorted = re_exp[sort_idx_exp]
     im_exp_sorted = im_exp[sort_idx_exp]
@@ -3652,104 +3652,127 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=3, linewidth=1,
             color='#1f77b4', alpha=0.7, label='Experimental', zorder=1)
     
-    # Get peaks sorted by characteristic frequency (high to low) - they are already sorted by ID
+    # Determine unified R_inf starting point:
+    # If inductive behavior causes -Im(Z) to cross zero, find exact zero-crossing for alignment;
+    # otherwise use drt_result.R_inf
+    R_inf_start = drt_result.R_inf
+    for i in range(len(im_exp_sorted) - 1):
+        if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
+            t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
+            R_inf_start = float(re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i]))
+            break
+    
+    # Get peaks sorted by characteristic frequency (high to low) - already sorted by ID
     peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
     
-    # Calculate RC model
-    omega = 2 * np.pi * freq_exp_sorted
+    # Helper function: exact impedance of a Gaussian DRT peak via numerical quadrature
+    def calc_gaussian_process_impedance(omega_arr: np.ndarray, peak: GaussianPeak) -> np.ndarray:
+        sigma = max(float(peak.sigma_log), 1e-6)
+        center_log = float(peak.center_log)
+        
+        # If peak is extremely narrow, fallback to ideal Debye RC element
+        if sigma < 1e-4:
+            return peak.area / (1.0 + 1j * omega_arr * peak.center)
+        
+        # Dense grid covering ±5 sigma in log10(tau) space (captures >99.9999% of peak area)
+        u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
+        tau_sub = 10.0 ** u_grid
+        
+        # Normalized Gaussian weights whose integral over u_grid equals peak.area (R_i)
+        gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
+        profile_area = np.trapezoid(gauss_profile, u_grid)
+        g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
+        
+        # Vectorized Debye kernel matrix: shape (len(omega_arr), len(u_grid))
+        denom = 1.0 + 1j * np.outer(omega_arr, tau_sub)
+        integrand = g_weights[np.newaxis, :] / denom
+        
+        return np.trapezoid(integrand, u_grid, axis=1)
     
-    # Start with R∞ and inductance
-    Z_total = np.zeros_like(omega, dtype=complex)
-    Z_total += drt_result.R_inf  # R∞
-    Z_total += 1j * omega * drt_result.L  # Inductance contribution
+    # Dense frequency grid over experimental range for smooth Total Model curve
+    f_min_exp = max(np.min(freq_exp_sorted), 1e-12)
+    f_max_exp = np.max(freq_exp_sorted)
+    freq_model_dense = np.logspace(np.log10(f_min_exp), np.log10(f_max_exp), 500)
+    omega_model = 2.0 * np.pi * freq_model_dense
     
-    # Store cumulative resistance for plotting individual RC elements
-    cumulative_R = drt_result.R_inf
+    # Start Total Model with unified R∞ and inductance L
+    Z_total = np.full_like(omega_model, R_inf_start, dtype=complex)
+    if drt_result.L > 0:
+        # Note: data.im_z stores -Im(Z), so inductive reactance +j*omega*L gives negative -Im(Z)
+        Z_total += 1j * omega_model * drt_result.L
+    
+    # Store cumulative resistance for plotting individual process arcs
+    cumulative_R = R_inf_start
     rc_curves = []
     
     # Define consistent color mapping
-    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    colors = plt.cm.Set3(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
     color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     
-    # Add each RC element
+    # Add each distributed process
     for peak in peaks_sorted:
         R_i = peak.area
         tau_i = peak.center
-        # RC element: Z_i = R_i / (1 + iωτ_i)
-        Z_i = R_i / (1 + 1j * omega * tau_i)
-        Z_total += Z_i
+        f_char = peak.get_characteristic_frequency()
         
-        # Store for individual curve plotting
+        # 1. Contribution to Total Model on experimental frequency range
+        Z_i_total = calc_gaussian_process_impedance(omega_model, peak)
+        Z_total += Z_i_total
+        
+        # 2. Individual depressed arc on a wide frequency grid around f_char so the arc closes cleanly on real axis
+        span_decades = max(4.0, 5.0 * peak.sigma_log + 2.5)
+        f_arc = np.logspace(np.log10(f_char) - span_decades, np.log10(f_char) + span_decades, 300)
+        omega_arc = 2.0 * np.pi * f_arc
+        Z_i_arc = calc_gaussian_process_impedance(omega_arc, peak)
+        
         cumulative_R_prev = cumulative_R
         cumulative_R += R_i
         
-        # The individual RC element contribution as a separate curve
-        Z_individual = cumulative_R_prev + Z_i
+        Z_individual = cumulative_R_prev + Z_i_arc
         rc_curves.append({
             'id': peak.id,
             'R': R_i,
             'tau': tau_i,
-            'f_char': peak.get_characteristic_frequency(),
+            'f_char': f_char,
             'Z': Z_individual,
             'start_R': cumulative_R_prev,
             'end_R': cumulative_R
         })
     
-    # Calculate total model impedance (real and -imag)
+    # Calculate total model impedance (Re(Z) and -Im(Z))
     re_model = np.real(Z_total)
-    im_model = -np.imag(Z_total)  # -Im(Z) for plotting (positive = capacitive, negative = inductive)
+    im_model = -np.imag(Z_total)  # positive = capacitive (above x-axis), negative = inductive (below x-axis)
     
     # Plot total model
-    ax.plot(re_model, im_model, 'r--', linewidth=1.5,
+    ax.plot(re_model, im_model, 'r--', linewidth=1.6,
             label='Total Model', zorder=3)
     
-    # Plot individual RC element curves (sequential semicircles)
+    # Plot individual distributed process curves (depressed semicircles)
     for curve in rc_curves:
         color = color_map[curve['id']]
         re_curve = np.real(curve['Z'])
-        im_curve = -np.imag(curve['Z'])  # -Im(Z) for plotting
-        ax.plot(re_curve, im_curve, '-', linewidth=1.2, color=color,
+        im_curve = -np.imag(curve['Z'])
+        ax.plot(re_curve, im_curve, '-', linewidth=1.3, color=color,
                label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω',
                zorder=2)
         
-        # Mark start and end points of each semicircle
+        # Mark start and end points of each process on real axis
         ax.plot(curve['start_R'], 0, 's', color=color, markersize=4,
-               markeredgecolor='black', markeredgewidth=0.5)
+               markeredgecolor='black', markeredgewidth=0.5, zorder=4)
         ax.plot(curve['end_R'], 0, 'o', color=color, markersize=4,
-               markeredgecolor='black', markeredgewidth=0.5)
+               markeredgecolor='black', markeredgewidth=0.5, zorder=4)
     
-    # For R∞ with inductive behavior: find the point where -Im(Z) crosses zero
-    # This is the true high-frequency limit when inductive tail is present
-    R_inf_actual = None
-    
-    # Find zero crossing of -Im(Z) (where sign changes from positive to negative)
-    zero_crossing_idx = None
-    for i in range(len(im_exp_sorted) - 1):
-        if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
-            # Linear interpolation to find exact zero crossing
-            t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
-            zero_crossing_idx = i
-            R_inf_actual = re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i])
-            break
-    
-    # If no zero crossing found (no inductive behavior), use highest frequency point
-    if R_inf_actual is None:
-        highest_freq_idx = -1
-        R_inf_actual = re_exp_sorted[highest_freq_idx]
-    
-    # Mark R∞ point with actual intersection point
-    ax.plot(R_inf_actual, 0, '^', color='red', markersize=6,
-           markeredgecolor='black', markeredgewidth=0.8, label=f'R∞ = {R_inf_actual:.4f} Ω')
+    # Mark unified R∞ point (now strictly coincides with the start square of Process 1)
+    ax.plot(R_inf_start, 0, '^', color='red', markersize=6,
+           markeredgecolor='black', markeredgewidth=0.8,
+           label=f'R∞ = {R_inf_start:.4f} Ω', zorder=5)
     
     # Add inductance annotation if present
     if drt_result.L > 0:
-        # Find high frequency region for inductance annotation
         high_freq_mask = freq_exp_sorted > 0.1 * np.max(freq_exp_sorted)
         if np.any(high_freq_mask):
-            # Find points with negative -Im(Z) (inductive behavior)
             inductive_mask = im_exp_sorted < 0
             if np.any(inductive_mask):
-                # Find the most negative point for annotation
                 most_negative_idx = np.argmin(im_exp_sorted)
                 ax.annotate(f'L = {drt_result.L:.3e} H',
                            xy=(re_exp_sorted[most_negative_idx], im_exp_sorted[most_negative_idx]),
@@ -3762,71 +3785,53 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     # Mark final total resistance
     if deconv_result is not None and deconv_result.peaks:
         sum_peak_areas = sum([p.area for p in deconv_result.peaks])
-        total_R = drt_result.R_inf + sum_peak_areas
+        total_R = R_inf_start + sum_peak_areas
     else:
-        total_R = drt_result.R_inf + drt_result.R_pol
+        total_R = R_inf_start + drt_result.R_pol
     ax.plot(total_R, 0, 'd', color='darkred', markersize=6,
-           markeredgecolor='black', markeredgewidth=0.8, label=f'Total R = {total_R:.4f} Ω')
+           markeredgecolor='black', markeredgewidth=0.8,
+           label=f'Total R = {total_R:.4f} Ω', zorder=5)
     
     # Add horizontal line at y=0 for reference
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
     
-    # Add shading for inductive region (below x-axis)
-    y_min_current, y_max_current = ax.get_ylim()
-    if y_min_current < 0:
-        ax.fill_between([np.min(re_exp_sorted), np.max(re_exp_sorted)], y_min_current, 0,
-                        alpha=0.1, color='red', label='Inductive region')
+    # Set y-axis limits to show inductive tail as a small portion (1/5 of positive range)
+    all_re = np.concatenate([re_exp_sorted, [R_inf_start, total_R]])
+    x_span = np.max(all_re) - np.min(all_re)
+    x_pad = x_span * 0.05 if x_span > 0 else 0.1
+    ax.set_xlim(np.min(all_re) - x_pad, np.max(all_re) + x_pad)
+    
+    positive_exp = im_exp_sorted[im_exp_sorted >= 0]
+    positive_mod = im_model[im_model >= 0]
+    pos_max = max(
+        np.max(positive_exp) if len(positive_exp) > 0 else 0.0,
+        np.max(positive_mod) if len(positive_mod) > 0 else 0.0
+    )
+    
+    if np.any(im_exp_sorted < 0) and pos_max > 0:
+        negative_min = np.min(im_exp_sorted[im_exp_sorted < 0])
+        y_max_data = pos_max * 1.15
+        y_min_data = -pos_max / 5.0
+        if negative_min < y_min_data:
+            y_min_data = max(negative_min * 0.8, -pos_max / 3.0)
+        ax.set_ylim(y_min_data, y_max_data)
+        
+        # Add shading for inductive region (below x-axis)
+        ax.fill_between([np.min(all_re) - x_pad, np.max(all_re) + x_pad], y_min_data, 0,
+                        alpha=0.1, color='red', label='Inductive region', zorder=0)
+    elif pos_max > 0:
+        ax.set_ylim(-pos_max * 0.05, pos_max * 1.15)
     
     ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=10)
     ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=10)
-    # No title - removed as requested
     # Place legend outside the plot area
     ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=6, frameon=True, edgecolor='black', ncol=1)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
-    # Set y-axis limits to show inductive tail as a small portion (1/5 of positive range)
-    if np.any(im_exp_sorted < 0):
-        # Find positive values (capacitive part)
-        positive_mask = im_exp_sorted >= 0
-        negative_mask = im_exp_sorted < 0
-        
-        if np.any(positive_mask) and np.any(negative_mask):
-            # Get the maximum positive value
-            positive_max = np.max(im_exp_sorted[positive_mask])
-            
-            # Get the minimum negative value (most negative)
-            negative_min = np.min(im_exp_sorted[negative_mask])
-            
-            # Set y-axis limits:
-            # Upper limit: 10% above the maximum positive value
-            y_max_data = positive_max * 1.1
-            
-            # Lower limit: extend only 1/5 of positive range below zero
-            # This makes the inductive tail visible but not dominant
-            y_min_data = -positive_max / 5
-            
-            # But if the actual negative data goes beyond this, we need to show at least some of it
-            if negative_min < y_min_data:
-                # Still limit to 1/3 of positive range maximum
-                y_min_data = max(negative_min * 0.8, -positive_max / 3)
-            
-            ax.set_ylim(y_min_data, y_max_data)
-            
-        else:
-            # Only negative values (unlikely for typical EIS)
-            y_min_data = np.min(im_exp_sorted) * 1.1
-            y_max_data = np.max(im_exp_sorted) * 1.1
-            ax.set_ylim(y_min_data, y_max_data)
-    else:
-        # No inductive behavior
-        y_min_data = np.min(im_exp_sorted) * 0.9 if np.min(im_exp_sorted) > 0 else np.min(im_exp_sorted) * 1.1
-        y_max_data = np.max(im_exp_sorted) * 1.1
-        ax.set_ylim(y_min_data, y_max_data)
-    
     plt.tight_layout()
     return fig
-
+                                  
 # ============================================================================
 # Step 1: Data Loading and Preprocessing
 # ============================================================================
