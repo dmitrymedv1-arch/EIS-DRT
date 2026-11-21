@@ -498,6 +498,7 @@ class AppState:
     pending_remove: Optional[int] = None
     pending_split: Optional[Tuple[int, float]] = None
     manual_peak_position: Optional[float] = None
+    deconv_tau_range_idx: Optional[Tuple[int, int]] = None
     deconv_parameters: Dict[str, Any] = field(default_factory=dict)
     deconv_calculated: bool = False
     
@@ -4197,6 +4198,7 @@ def step2_drt_analysis():
                         st.session_state.app_state.initial_peak_params = None
                         st.session_state.app_state.manual_peaks = []
                         st.session_state.app_state.residuals_peaks = []
+                        st.session_state.app_state.deconv_tau_range_idx = None
                         
                         # Display summary
                         st.success("✅ DRT calculation complete!")
@@ -4379,7 +4381,6 @@ def step2_drt_analysis():
 # ============================================================================
 # Step 3: Gaussian Deconvolution of DRT Peaks
 # ============================================================================
-
 def step3_gaussian_deconvolution():
     """Step 3: Perform Gaussian deconvolution on DRT peaks"""
     st.header("📈 Step 3: Gaussian Deconvolution of DRT Peaks")
@@ -4393,16 +4394,28 @@ def step3_gaussian_deconvolution():
     
     drt_result = st.session_state.app_state.drt_result
     
-    # Prepare data for deconvolution - используем оригинальные ненормированные значения
-    log_tau = np.log10(drt_result.tau_grid)
-    gamma_original = drt_result.gamma  # Оригинальные ненормированные значения
+    # Полные исходные массивы DRT (включая возможные хвосты)
+    full_tau = drt_result.tau_grid
+    full_gamma = drt_result.gamma
+    n_total_tau = len(full_tau)
     
-    # Create deconvolver if not exists OR if DRT result has changed (check by memory address or timestamp)
-    # We force recreation when drt_result is new (which happens after recalculation in Step 2)
+    # Инициализация диапазона фитинга по индексам точек сетки tau
+    if (st.session_state.app_state.deconv_tau_range_idx is None or 
+        st.session_state.app_state.deconv_tau_range_idx[0] < 0 or
+        st.session_state.app_state.deconv_tau_range_idx[1] >= n_total_tau):
+        st.session_state.app_state.deconv_tau_range_idx = (0, n_total_tau - 1)
+    
+    curr_min_idx, curr_max_idx = st.session_state.app_state.deconv_tau_range_idx
+    
+    # Срез данных строго внутри выбранной области фитинга (без хвостов)
+    cropped_tau = full_tau[curr_min_idx:curr_max_idx + 1]
+    cropped_gamma = full_gamma[curr_min_idx:curr_max_idx + 1]
+    
+    # Create deconvolver if not exists OR after range/DRT update
     if st.session_state.app_state.deconvolver is None:
         deconvolver = GaussianDeconvolver(
-            x_linear=drt_result.tau_grid,
-            y_original=gamma_original,  # Используем оригинальные ненормированные значения
+            x_linear=cropped_tau,
+            y_original=cropped_gamma,  # Используем обрезанные оригинальные ненормированные значения
             use_log_x=True,
             use_log_y=False,
             clip_negative=st.session_state.app_state.clip_negative,
@@ -4412,7 +4425,7 @@ def step3_gaussian_deconvolution():
         )
         st.session_state.app_state.deconvolver = deconvolver
         
-        # Auto-detect peaks immediately on entry
+        # Auto-detect peaks immediately on entry or range change
         with st.spinner("Auto-detecting peaks..."):
             peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
                 sensitivity=st.session_state.app_state.sensitivity,
@@ -4423,12 +4436,52 @@ def step3_gaussian_deconvolution():
             st.session_state.app_state.initial_peak_params = initial_params
             st.session_state.app_state.manual_peaks = []
             st.session_state.app_state.residuals_peaks = []
+            st.session_state.app_state.last_popt = None
     
     deconvolver = st.session_state.app_state.deconvolver
     
     col1, col2 = st.columns([1, 1.5])
     
     with col1:
+        st.subheader("✂️ Fitting Region (Exclude Tails)")
+        
+        range_min_idx, range_max_idx = st.slider(
+            "Select τ fitting range (by point index)",
+            min_value=0,
+            max_value=n_total_tau - 1,
+            value=(curr_min_idx, curr_max_idx),
+            step=1,
+            help="Move left/right sliders to exclude regularization tails from peak detection and Gaussian fitting"
+        )
+        
+        # Проверка минимального числа точек для стабильной работы фильтра Савицкого-Голея и curve_fit
+        if range_max_idx - range_min_idx < 10:
+            st.warning("⚠️ Please select at least 10 points for reliable fitting.")
+        elif (range_min_idx, range_max_idx) != (curr_min_idx, curr_max_idx):
+            st.session_state.app_state.deconv_tau_range_idx = (range_min_idx, range_max_idx)
+            st.session_state.app_state.deconvolver = None
+            st.session_state.app_state.manual_peak_position = None
+            st.rerun()
+        
+        tau_start = full_tau[curr_min_idx]
+        tau_end = full_tau[curr_max_idx]
+        f_low = 1.0 / (2 * np.pi * tau_end)
+        f_high = 1.0 / (2 * np.pi * tau_start)
+        
+        st.caption(
+            f"**Active τ:** `{tau_start:.2e}` – `{tau_end:.2e}` s  \n"
+            f"**Active f:** `{f_low:.2e}` – `{f_high:.2e}` Hz  \n"
+            f"**Points in fit:** {curr_max_idx - curr_min_idx + 1} / {n_total_tau}"
+        )
+        
+        if (curr_min_idx, curr_max_idx) != (0, n_total_tau - 1):
+            if st.button("🔄 Reset Fitting Range", use_container_width=True):
+                st.session_state.app_state.deconv_tau_range_idx = (0, n_total_tau - 1)
+                st.session_state.app_state.deconvolver = None
+                st.session_state.app_state.manual_peak_position = None
+                st.rerun()
+        
+        st.markdown("---")
         st.subheader("🔍 Peak Detection Parameters")
         
         sensitivity = st.slider("Sensitivity", 0.001, 0.1, 
@@ -4455,7 +4508,7 @@ def step3_gaussian_deconvolution():
         st.markdown("---")
         st.subheader("Manual Peak Addition")
         
-        # Get number of data points for point selection
+        # Get number of data points in active region for point selection
         n_points = len(deconvolver.x_linear)
         
         # Create slider by point index (1-based for user-friendly)
@@ -4464,7 +4517,7 @@ def step3_gaussian_deconvolution():
                                max_value=n_points,
                                value=n_points // 2,
                                step=1,
-                               help="Select point index (1 to {}) to add peak at that position".format(n_points))
+                               help="Select point index (1 to {}) inside active region to add peak at that position".format(n_points))
         
         # Convert index to actual τ value
         manual_position = deconvolver.x_linear[point_index - 1]
@@ -4587,20 +4640,37 @@ def step3_gaussian_deconvolution():
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
-            # Отображаем оригинальные ненормированные значения DRT
+            # Визуализация отсекаемых хвостов серым фоном и пунктиром
+            is_cropped = (curr_min_idx > 0) or (curr_max_idx < n_total_tau - 1)
+            if is_cropped:
+                ax.plot(full_tau, full_gamma, 'o--', markersize=2.5, linewidth=1, 
+                        alpha=0.35, color='#7f8c8d', label='Excluded Tails', zorder=1)
+                if curr_min_idx > 0:
+                    ax.axvspan(full_tau[0], tau_start, color='#e2e8f0', alpha=0.65, zorder=0)
+                    ax.axvline(x=tau_start, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
+                if curr_max_idx < n_total_tau - 1:
+                    ax.axvspan(tau_end, full_tau[-1], color='#e2e8f0', alpha=0.65, zorder=0)
+                    ax.axvline(x=tau_end, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
+            
+            # Отображаем активную область DRT оригинального масштаба
             ax.plot(deconvolver.x_linear, deconvolver.y_original, 
-                   'o-', markersize=3, linewidth=1, alpha=0.7, 
-                   label='DRT Data (original scale)', color='black', zorder=1)
+                   'o-', markersize=3, linewidth=1.2, alpha=0.85, 
+                   label='DRT Data (active region)', color='black', zorder=2)
             
             source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
+            peaks_legend_added = False
             for idx, info in enumerate(st.session_state.app_state.peak_info):
                 source = info.get('source', 'auto')
                 color = source_colors.get(source, '#2ca02c')
+                peak_label = 'Detected Peaks' if not peaks_legend_added else "_nolegend_"
+                peaks_legend_added = True
+                
                 # Используем y_original для отображения
-                ax.plot(info['x_linear'], info.get('y_original', info.get('y', 0)), 'o', 
+                y_val = info.get('y_original', info.get('y', 0))
+                ax.plot(info['x_linear'], y_val, 'o', 
                        markersize=8, markeredgecolor='darkred', 
-                       markerfacecolor=color, zorder=3)
-                ax.text(info['x_linear'], info.get('y_original', info.get('y', 0)) * 1.05, 
+                       markerfacecolor=color, label=peak_label, zorder=4)
+                ax.text(info['x_linear'], y_val * 1.05, 
                        f'τ={info["x_linear"]:.2e}s', ha='center', 
                        fontsize=8, rotation=45)
             
@@ -4608,18 +4678,25 @@ def step3_gaussian_deconvolution():
                 idx = np.argmin(np.abs(deconvolver.x_linear - st.session_state.app_state.manual_peak_position))
                 y_at_position = deconvolver.y_original[idx]
                 ax.axvline(x=st.session_state.app_state.manual_peak_position, 
-                          color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                          color='red', linestyle='--', linewidth=1.5, alpha=0.7, zorder=3)
                 ax.plot(st.session_state.app_state.manual_peak_position, y_at_position, 
-                       'ro', markersize=10)
+                       'ro', markersize=10, zorder=5)
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
-            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')  # Изменено с (norm.) на (Ω)
-            # No title - removed as requested
-            ax.legend(['DRT Data (original scale)', 'Detected Peaks'], loc='upper left')  # Изменено loc на upper left
+            ax.set_ylabel('γ(τ) (Ω)', fontweight='bold')
+            ax.legend(loc='upper left')
             ax.grid(True, alpha=0.3, linestyle='--')
             
             st.pyplot(fig)
             plt.close()
+            
+            # Подсказка с пересчитанным интегралом сопротивления без учета хвостов
+            full_integral = drt_result.get_integral()
+            active_integral = deconvolver.drt_integral
+            st.caption(
+                f"💡 **Active region $R_{{pol}}$ integral:** `{active_integral:.4f} Ω` "
+                f"(Full spectrum integral with tails: `{full_integral:.4f} Ω`)"
+            )
             
             # Peak info table with delete buttons
             if st.session_state.app_state.peak_info:
@@ -4651,20 +4728,18 @@ def step3_gaussian_deconvolution():
                                     del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
                                 st.success(f"Peak {i+1} removed")
                                 st.rerun()
-                                st.success(f"Peak {i+1} removed")
-                                st.rerun()
                 
                 st.markdown("---")
                 
                 # Additional statistics
-                col1, col2, col3 = st.columns(3)
-                with col1:
+                col1_stat, col2_stat, col3_stat = st.columns(3)
+                with col1_stat:
                     auto_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', 'auto') == 'auto')
                     st.metric("Auto-detected", auto_count)
-                with col2:
+                with col2_stat:
                     manual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'manual')
                     st.metric("Manually added", manual_count)
-                with col3:
+                with col3_stat:
                     residual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'residuals')
                     st.metric("From residuals", residual_count)
         
@@ -4674,7 +4749,6 @@ def step3_gaussian_deconvolution():
             st.metric("R²", f"{result.quality_metrics.get('R²', 0):.4f}")
             st.metric("Number of Peaks", len(result.peaks))
             st.metric("Total Area", f"{result.total_area:.4e}")
-
 
 # ============================================================================
 # Step 4: Results and Export
