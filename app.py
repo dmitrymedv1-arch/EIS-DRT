@@ -3288,6 +3288,50 @@ def calculate_peak_characteristics(peak: GaussianPeak) -> Dict[str, float]:
     
     return {'fmax_hz': fmax_hz, 'c_farad': c_farad}
 
+
+def calculate_rq_parameters(peak: GaussianPeak) -> Dict[str, float]:
+    """
+    Calculate equivalent ZARC (parallel R||Q) parameters (R_i, Q_i, alpha_i)
+    for a distributed Gaussian DRT peak.
+    """
+    R_i = float(peak.area)
+    tau_i = float(peak.center)
+    sigma = max(float(peak.sigma_log), 1e-6)
+    center_log = float(peak.center_log)
+    
+    if R_i <= 0 or tau_i <= 0:
+        return {'R_i': 0.0, 'Q_i': 0.0, 'alpha_i': 1.0}
+    
+    # For very narrow Gaussian peak, process is an ideal capacitor (alpha = 1, Q = C = tau/R)
+    if sigma < 1e-4:
+        alpha_i = 1.0
+    else:
+        # Evaluate exact apex height (-Im(Z)) at characteristic frequency omega_0 = 1/tau_i
+        # At omega_0 = 1/tau_i: -Im(1 / (1 + i*omega_0*tau)) = (tau/tau_i) / (1 + (tau/tau_i)^2)
+        u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
+        ratio = 10.0 ** (u_grid - center_log)  # tau / tau_i
+        
+        gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
+        profile_area = np.trapezoid(gauss_profile, u_grid)
+        
+        if profile_area > 0:
+            # Normalized apex height h_max / R_i
+            kernel_apex = ratio / (1.0 + ratio ** 2)
+            norm_apex = np.trapezoid(gauss_profile * kernel_apex, u_grid) / profile_area
+            # Exact ZARC relation: h_max / R_i = 0.5 * tan(pi * alpha / 4)
+            alpha_i = float(np.clip((4.0 / np.pi) * np.arctan(2.0 * norm_apex), 1e-4, 1.0))
+        else:
+            alpha_i = 1.0
+    
+    # CPE parameter Q_i from tau_i^alpha_i = R_i * Q_i  (units: F·s^(alpha-1) = S·s^alpha)
+    Q_i = (tau_i ** alpha_i) / R_i
+    
+    return {
+        'R_i': R_i,
+        'Q_i': float(Q_i),
+        'alpha_i': alpha_i
+    }
+
 def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str = "Original Impedance Spectrum") -> plt.Figure:
     """
     Plot original Nyquist spectrum with proper sign handling:
@@ -5191,20 +5235,35 @@ def step4_results():
             st.warning("No deconvolution results available")
         
         st.markdown("***")  # Separator
-        
-        # Graph 2.4 - Experimental vs Sequential RC Model
-        st.markdown("**2.4 Experimental vs Sequential RC Model**")
+
+        # Graph 2.4 - Experimental vs Sequential RQ Model
+        st.markdown("**2.4 Experimental vs Sequential RQ (ZARC) Model**")
         if deconv_result is not None and drt_result is not None and data is not None:
             fig4 = plot_sequential_rc_model(deconv_result, drt_result, data,
-                                             "Experimental vs Sequential RC Model")
+                                             "Experimental vs Sequential RQ Model")
             st.pyplot(fig4)
             plt.close(fig4)
+            
+            # Display R_i, Q_i, alpha_i table directly under Graph 2.4
+            if deconv_result.peaks:
+                st.markdown("**Equivalent RQ (ZARC) Parameters per Process:**")
+                rq_rows = []
+                for peak in sorted(deconv_result.peaks, key=lambda p: p.id):
+                    rq = calculate_rq_parameters(peak)
+                    rq_rows.append({
+                        'Process': f"Process {peak.id}",
+                        'R_i (Ω)': f"{rq['R_i']:.4e}",
+                        'Q_i (F·s^(α-1))': f"{rq['Q_i']:.4e}",
+                        'α_i': f"{rq['alpha_i']:.4f}"
+                    })
+                rq_df = pd.DataFrame(rq_rows)
+                st.dataframe(rq_df, use_container_width=True, hide_index=True)
             
             buf4 = io.BytesIO()
             fig4.savefig(buf4, format='png', dpi=300, bbox_inches='tight')
             buf4.seek(0)
             st.download_button("📥 Download", data=buf4,
-                              file_name=f"sequential_rc_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                              file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                               mime="image/png", key="download_model")
         else:
             st.warning("Insufficient data for model comparison")
