@@ -540,16 +540,108 @@ if 'app_state' not in st.session_state:
 # Data Loading and Validation (from EIS code)
 # ============================================================================
 
+def parse_uploaded_dataframe(file, nrows: Optional[int] = None) -> pd.DataFrame:
+    """
+    Universally read uploaded EIS file (.txt, .csv, .dat, .z, .mpt, .xlsx)
+    with automatic separator and header detection.
+    """
+    file.seek(0)
+    filename = getattr(file, 'name', '').lower()
+    
+    # Handle Excel files
+    if filename.endswith('.xlsx') or filename.endswith('.xls'):
+        df_raw = pd.read_excel(file, header=None, nrows=nrows)
+    else:
+        raw_bytes = file.read()
+        file.seek(0)
+        try:
+            text = raw_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            text = raw_bytes.decode('latin-1', errors='ignore')
+        
+        # Filter out empty lines and comment lines starting with #
+        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith('#')]
+        if not lines:
+            raise ValueError("Uploaded file is empty.")
+        
+        if nrows is not None:
+            lines = lines[:nrows + 1]
+        
+        # Detect delimiter from first data line
+        sample_line = lines[-1]
+        if '\t' in sample_line:
+            sep = r'\t+'
+        elif ';' in sample_line:
+            sep = ';'
+        elif ',' in sample_line:
+            # Check if comma is used as column separator (at least 2 commas) vs decimal comma
+            if sample_line.count(',') >= 2 and len(sample_line.split()) == 1:
+                sep = ','
+            elif sample_line.count(',') >= 2 and ('\t' not in sample_line):
+                sep = ','
+            else:
+                sep = r'\s+'
+                lines = [l.replace(',', '.') for l in lines]
+        else:
+            sep = r'\s+'
+        
+        df_raw = pd.read_csv(io.StringIO('\n'.join(lines)), sep=sep, header=None, engine='python')
+    
+    # Drop completely empty columns
+    df_raw = df_raw.dropna(axis=1, how='all')
+    
+    # Auto-detect whether the first row is a text header or numeric data
+    first_row = df_raw.iloc[0]
+    is_header = False
+    for val in first_row:
+        try:
+            float(str(val).replace(',', '.'))
+        except ValueError:
+            is_header = True
+            break
+    
+    if is_header:
+        headers = [str(col).strip() for col in df_raw.iloc[0]]
+        # Deduplicate column names if needed
+        seen = {}
+        unique_headers = []
+        for h in headers:
+            if h in seen:
+                seen[h] += 1
+                unique_headers.append(f"{h}_{seen[h]}")
+            else:
+                seen[h] = 0
+                unique_headers.append(h)
+        df = df_raw.iloc[1:].copy()
+        df.columns = unique_headers
+    else:
+        # Assign clean default column names so the first data point is NOT lost
+        default_names = ['Column 1 (Freq)', 'Column 2 (Re Z)', 'Column 3 (Im Z)']
+        cols = []
+        for idx in range(df_raw.shape[1]):
+            cols.append(default_names[idx] if idx < 3 else f"Column {idx + 1}")
+        df = df_raw.copy()
+        df.columns = cols
+    
+    df = df.reset_index(drop=True)
+    if nrows is not None:
+        df = df.head(nrows)
+    return df
+
+
 def load_data(file, freq_col, re_col, im_col) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Load impedance data from uploaded file."""
     if file is not None:
         try:
-            df = pd.read_csv(file)
+            df = parse_uploaded_dataframe(file)
             if freq_col in df.columns and re_col in df.columns and im_col in df.columns:
-                freq = df[freq_col].values.astype(float)
-                re_z = df[re_col].values.astype(float)
-                # Загружаем как есть - инверсия будет в ImpedanceData.__post_init__
-                im_z = df[im_col].values.astype(float)
+                # Convert safely to numeric and drop non-numeric rows if any exist in the middle
+                sub = df[[freq_col, re_col, im_col]].apply(
+                    lambda s: pd.to_numeric(s.astype(str).str.replace(',', '.', regex=False), errors='coerce')
+                ).dropna()
+                freq = sub[freq_col].values.astype(float)
+                re_z = sub[re_col].values.astype(float)
+                im_z = sub[im_col].values.astype(float)
                 return freq, re_z, im_z
         except Exception as e:
             st.error(f"Error loading file: {e}")
@@ -3908,11 +4000,13 @@ def step1_data_loading():
             uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv', 'xlsx', 'dat', 'z', 'mpt'])
             if uploaded_file:
                 try:
-                    df = pd.read_csv(uploaded_file, nrows=5)
+                    df = parse_uploaded_dataframe(uploaded_file, nrows=5)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
                     st.subheader("Column Mapping")
-                    col_freq = st.selectbox("Frequency column", df.columns)
-                    col_re = st.selectbox("Re(Z) column", df.columns)
-                    col_im = st.selectbox("-Im(Z) column", df.columns)
+                    n_cols = len(df.columns)
+                    col_freq = st.selectbox("Frequency column", df.columns, index=0)
+                    col_re = st.selectbox("Re(Z) column", df.columns, index=min(1, n_cols - 1))
+                    col_im = st.selectbox("-Im(Z) column", df.columns, index=min(2, n_cols - 1))
                     
                     if st.button("📥 Load Data", type="primary", use_container_width=True):
                         freq, re_z, im_z = load_data(uploaded_file, col_freq, col_re, col_im)
