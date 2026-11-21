@@ -2108,7 +2108,7 @@ class GaussianDeconvolver:
         peaks1, _ = find_peaks(y_smooth, height=height_threshold, distance=min_distance)
         peaks2 = DerivativeAnalyzer.find_peaks_by_derivatives(self.x, y_smooth, dy, d2y, sensitivity)
 
-        all_peaks = sorted(set(np.concatenate([peaks1, peaks2])).astype(int))
+        all_peaks = sorted({int(p) for p in np.concatenate([peaks1, peaks2])})
 
         filtered_peaks = []
         dx_mean = np.mean(np.diff(self.x))
