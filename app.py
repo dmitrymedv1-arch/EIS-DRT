@@ -5235,10 +5235,17 @@ def step4_results():
     with tab4:
         st.subheader("Normalized Gaussian Deconvolution Result")
         
-        fig, (ax, ax_res) = plt.subplots(
-            2, 1, figsize=(12, 9), sharex=True,
-            gridspec_kw={'height_ratios': [3, 1.2], 'hspace': 0.08}
+        fig = plt.figure(figsize=(12, 9))
+        gs = fig.add_gridspec(
+            2, 2,
+            height_ratios=[3, 1.2],
+            width_ratios=[1, 0.025],
+            hspace=0.08,
+            wspace=0.03
         )
+        ax = fig.add_subplot(gs[0, 0])
+        ax_res = fig.add_subplot(gs[1, 0], sharex=ax)
+        cax = fig.add_subplot(gs[1, 1])
         
         # Make axis tick labels black
         for axis in (ax, ax_res):
