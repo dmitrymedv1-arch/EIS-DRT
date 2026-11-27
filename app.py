@@ -5441,9 +5441,21 @@ def step4_results():
         - **2.4** - Comparison of experimental data with sequential RC model (each semicircle represents one relaxation process)
         """)
     
-       
+        
     with tab6:
         st.subheader("Export Results")
+        
+        export_format = st.radio(
+            "Select export format:",
+            options=["CSV (comma-separated)", "TXT (tab-separated)"],
+            horizontal=True,
+            key="export_format_selector"
+        )
+        is_txt = export_format.startswith("TXT")
+        file_ext = "txt" if is_txt else "csv"
+        file_sep = "\t" if is_txt else ","
+        file_mime = "text/plain" if is_txt else "text/csv"
+        fmt_label = "TXT" if is_txt else "CSV"
         
         col1, col2 = st.columns(2)
         
@@ -5473,12 +5485,12 @@ def step4_results():
                 })
             
             peaks_df = pd.DataFrame(peaks_data)
-            csv_peaks = peaks_df.to_csv(index=False)
+            data_peaks = peaks_df.to_csv(index=False, sep=file_sep)
             st.download_button(
-                "📥 Export Peaks as CSV",
-                data=csv_peaks,
-                file_name=f"deconvolution_peaks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
+                f"📥 Export Peaks as {fmt_label}",
+                data=data_peaks,
+                file_name=f"deconvolution_peaks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_ext}",
+                mime=file_mime,
                 use_container_width=True
             )
             
@@ -5521,12 +5533,12 @@ def step4_results():
                 'Residuals_Ohm': residuals
             })
             
-            csv_fit = fit_data.to_csv(index=False)
+            data_fit = fit_data.to_csv(index=False, sep=file_sep)
             st.download_button(
-                "📥 Export Fitting Data as CSV",
-                data=csv_fit,
-                file_name=f"deconvolution_fit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
+                f"📥 Export Fitting Data as {fmt_label}",
+                data=data_fit,
+                file_name=f"deconvolution_fit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_ext}",
+                mime=file_mime,
                 use_container_width=True
             )
 
@@ -5548,12 +5560,12 @@ def step4_results():
                 )) / max_amp_exp
                 norm_dict[f'Peak_{peak.id}_norm'] = y_comp_norm
             
-            csv_norm = pd.DataFrame(norm_dict).to_csv(index=False)
+            data_norm = pd.DataFrame(norm_dict).to_csv(index=False, sep=file_sep)
             st.download_button(
-                "📥 Export Normalized Deconvolution as CSV",
-                data=csv_norm,
-                file_name=f"deconvolution_normalized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
+                f"📥 Export Normalized Deconvolution as {fmt_label}",
+                data=data_norm,
+                file_name=f"deconvolution_normalized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_ext}",
+                mime=file_mime,
                 use_container_width=True
             )
 
@@ -5575,12 +5587,12 @@ def step4_results():
                 )
                 freq_deconv_dict[f'Peak_{peak.id}_Ohm'] = y_comp_f
             
-            csv_freq_deconv = pd.DataFrame(freq_deconv_dict).to_csv(index=False)
+            data_freq_deconv = pd.DataFrame(freq_deconv_dict).to_csv(index=False, sep=file_sep)
             st.download_button(
-                "📥 Export 2.2 Deconvolution vs Frequency as CSV",
-                data=csv_freq_deconv,
-                file_name=f"deconvolution_vs_freq_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
+                f"📥 Export 2.2 Deconvolution vs Frequency as {fmt_label}",
+                data=data_freq_deconv,
+                file_name=f"deconvolution_vs_freq_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_ext}",
+                mime=file_mime,
                 use_container_width=True
             )
 
@@ -5636,12 +5648,12 @@ def step4_results():
                 }
                 rq_export_dict.update(process_cols)
                 
-                csv_rq_model = pd.DataFrame(rq_export_dict).to_csv(index=False)
+                data_rq_model = pd.DataFrame(rq_export_dict).to_csv(index=False, sep=file_sep)
                 st.download_button(
-                    "📥 Export 2.4 Sequential RQ Model as CSV",
-                    data=csv_rq_model,
-                    file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
+                    f"📥 Export 2.4 Sequential RQ Model as {fmt_label}",
+                    data=data_rq_model,
+                    file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_ext}",
+                    mime=file_mime,
                     use_container_width=True
                 )
         
