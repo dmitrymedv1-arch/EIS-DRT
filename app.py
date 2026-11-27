@@ -5592,9 +5592,9 @@ def step4_results():
                 mime=file_mime,
                 use_container_width=True
             )
-
+            
             # --- Export Normalized Gaussian Deconvolution Result ---
-            st.markdown("**Export Normalized Deconvolution Data** *(Normalized spectrum + Total Fit + Peaks)*")
+            st.markdown("**Export Normalized Deconvolution Data** *(Normalized spectrum + Total Fit + Residuals + Peaks)*")
             
             peaks_sorted_exp = sorted(deconv_result.peaks, key=lambda p: p.id)
             max_amp_exp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
@@ -5603,7 +5603,8 @@ def step4_results():
             norm_dict = {
                 'tau_s': deconv_result.x_linear,
                 'gamma_tau_norm': deconv_result.y_original / max_amp_exp,
-                'Total_Fit_norm': fit_values / max_amp_exp
+                'Total_Fit_norm': fit_values / max_amp_exp,
+                'Residuals_norm': residuals / max_amp_exp
             }
             for peak in peaks_sorted_exp:
                 y_comp_norm = (peak.amplitude * GaussianModelDeconv.gaussian(
