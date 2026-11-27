@@ -5365,7 +5365,7 @@ def step4_results():
         )
         
         # Colorbar aligned with residual subplot
-        cbar = fig.colorbar(sc, ax=ax_res, pad=0.015, aspect=12)
+        cbar = fig.colorbar(sc, cax=cax)
         cbar.set_label('Δ (norm)', fontsize=9, fontweight='bold')
         cbar.ax.tick_params(labelsize=8, colors='black')
         
