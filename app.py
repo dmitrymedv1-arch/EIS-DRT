@@ -3015,7 +3015,8 @@ def format_with_superscript(number: float) -> str:
 
 def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
                            im_rec: Optional[np.ndarray] = None, title: str = "Nyquist Plot",
-                           highlight_idx: Optional[int] = None) -> plt.Figure:
+                           highlight_idx: Optional[int] = None,
+                           freq_range_idx: Optional[Tuple[int, int]] = None) -> plt.Figure:
     """Create publication-quality Nyquist plot"""
     fig, ax = plt.subplots(figsize=(9, 7))
     
@@ -3024,8 +3025,25 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
     ax.xaxis.label.set_color('black')
     ax.yaxis.label.set_color('black')
     
-    ax.plot(data.re_z, data.im_z, 'o-', markersize=5, linewidth=1.8, 
-            label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
+    is_cropped = (
+        freq_range_idx is not None and 
+        (freq_range_idx[0] > 0 or freq_range_idx[1] < data.n_points - 1)
+    )
+    
+    if is_cropped:
+        f_min_i, f_max_i = freq_range_idx
+        ax.plot(data.re_z, data.im_z, 'o--', markersize=4, linewidth=1.0,
+                alpha=0.35, color='#7f8c8d', label='Excluded', zorder=1)
+        ax.plot(data.re_z[f_min_i:f_max_i + 1], data.im_z[f_min_i:f_max_i + 1],
+                'o-', markersize=5, linewidth=1.8, label='Experimental (active)',
+                color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8, zorder=2)
+        ax.plot([data.re_z[f_min_i], data.re_z[f_max_i]],
+                [data.im_z[f_min_i], data.im_z[f_max_i]],
+                's', markersize=7, color='#4a5568', markeredgecolor='black',
+                label='Range bounds', zorder=3)
+    else:
+        ax.plot(data.re_z, data.im_z, 'o-', markersize=5, linewidth=1.8, 
+                label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
     
     if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
         ax.plot(data.re_z[highlight_idx], data.im_z[highlight_idx], 'ro', 
@@ -3056,7 +3074,8 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
 
 def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = None, 
                          im_rec: Optional[np.ndarray] = None,
-                         highlight_idx: Optional[int] = None) -> plt.Figure:
+                         highlight_idx: Optional[int] = None,
+                         freq_range_idx: Optional[Tuple[int, int]] = None) -> plt.Figure:
     """Create publication-quality Bode plot with highlight point"""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
     
@@ -3068,9 +3087,29 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     ax2.xaxis.label.set_color('black')
     ax2.yaxis.label.set_color('black')
     
+    is_cropped = (
+        freq_range_idx is not None and 
+        (freq_range_idx[0] > 0 or freq_range_idx[1] < data.n_points - 1)
+    )
+    
     mag = data.Z_mod
-    ax1.loglog(data.freq, mag, 'o-', markersize=5, linewidth=1.8, 
-               label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
+    if is_cropped:
+        f_min_i, f_max_i = freq_range_idx
+        f_start, f_end = data.freq[f_min_i], data.freq[f_max_i]
+        if f_min_i > 0:
+            ax1.axvspan(data.freq[0], f_start, color='#e2e8f0', alpha=0.65, zorder=0)
+            ax1.axvline(x=f_start, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
+        if f_max_i < data.n_points - 1:
+            ax1.axvspan(f_end, data.freq[-1], color='#e2e8f0', alpha=0.65, zorder=0)
+            ax1.axvline(x=f_end, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
+        ax1.loglog(data.freq, mag, 'o--', markersize=4, linewidth=1.0,
+                   alpha=0.35, color='#7f8c8d', label='Excluded', zorder=1)
+        ax1.loglog(data.freq[f_min_i:f_max_i + 1], mag[f_min_i:f_max_i + 1],
+                   'o-', markersize=5, linewidth=1.8, label='Experimental (active)',
+                   color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8, zorder=2)
+    else:
+        ax1.loglog(data.freq, mag, 'o-', markersize=5, linewidth=1.8, 
+                   label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
     
     if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
         ax1.loglog(data.freq[highlight_idx], mag[highlight_idx], 'ro', 
@@ -3091,8 +3130,23 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
     ax1.yaxis.set_major_formatter(ScalarFormatter(useMathText=False))
     
     phase = data.phase
-    ax2.semilogx(data.freq, phase, 'o-', markersize=5, linewidth=1.8,
-                 label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
+    if is_cropped:
+        f_min_i, f_max_i = freq_range_idx
+        f_start, f_end = data.freq[f_min_i], data.freq[f_max_i]
+        if f_min_i > 0:
+            ax2.axvspan(data.freq[0], f_start, color='#e2e8f0', alpha=0.65, zorder=0)
+            ax2.axvline(x=f_start, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
+        if f_max_i < data.n_points - 1:
+            ax2.axvspan(f_end, data.freq[-1], color='#e2e8f0', alpha=0.65, zorder=0)
+            ax2.axvline(x=f_end, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
+        ax2.semilogx(data.freq, phase, 'o--', markersize=4, linewidth=1.0,
+                     alpha=0.35, color='#7f8c8d', label='Excluded', zorder=1)
+        ax2.semilogx(data.freq[f_min_i:f_max_i + 1], phase[f_min_i:f_max_i + 1],
+                     'o-', markersize=5, linewidth=1.8, label='Experimental (active)',
+                     color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8, zorder=2)
+    else:
+        ax2.semilogx(data.freq, phase, 'o-', markersize=5, linewidth=1.8,
+                     label='Experimental', color='#1f77b4', markeredgecolor='white', markeredgewidth=0.8)
     
     if highlight_idx is not None and 0 <= highlight_idx < data.n_points:
         ax2.semilogx(data.freq[highlight_idx], phase[highlight_idx], 'ro', 
@@ -4150,13 +4204,11 @@ def step1_data_loading():
         
         # Create plots with caching to prevent rerender on slider move
         @st.cache_data(ttl=60, show_spinner=False)
-        def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, n_points, original_len):
+        def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, freq_range_idx, n_points, original_len):
             """Cache plots to prevent rerender on slider movement"""
-            # Передаем -np.array(im_tuple), так как ImpedanceData.__post_init__ инвертирует знак,
-            # либо используем автоопределение в обновленном ImpedanceData ниже:
             temp_data = ImpedanceData(np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple), auto_convention=False)
-            fig_nyquist = plot_nyquist_matplotlib(temp_data, highlight_idx=point_idx)
-            fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx)
+            fig_nyquist = plot_nyquist_matplotlib(temp_data, highlight_idx=point_idx, freq_range_idx=freq_range_idx)
+            fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx, freq_range_idx=freq_range_idx)
             return fig_nyquist, fig_bode
         
         # Convert data to tuples for caching
@@ -4168,6 +4220,7 @@ def step1_data_loading():
         fig_nyquist, fig_bode = cached_plots(
             freq_tuple, re_tuple, im_tuple, 
             st.session_state.selected_point_idx,
+            st.session_state.freq_range_idx,
             data.n_points, len(data.original_freq)
         )
         
