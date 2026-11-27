@@ -105,6 +105,98 @@ def apply_modern_scientific_style():
 
 apply_modern_scientific_style()
 
+
+def get_plot_style() -> Dict[str, Any]:
+    """Return current publication plot style settings from session_state."""
+    default_style = {
+        "font_family": "serif",
+        "fs_label": 12,
+        "fs_tick": 10,
+        "fs_legend": 10,
+        "lw": 2.0,
+        "ms": 5,
+        "show_grid": True,
+        "tick_dir": "in",
+        "axes_bg": "white",
+        "cmap": "Set3",
+        "dpi": 600,
+    }
+    if "plot_style" not in st.session_state:
+        st.session_state.plot_style = default_style.copy()
+    return st.session_state.plot_style
+
+
+def apply_publication_plot_style(style: Dict[str, Any]):
+    """Apply user-selected publication plot settings to matplotlib rcParams."""
+    font_family = style.get("font_family", "serif")
+    plt.rcParams.update({
+        "font.family": font_family,
+        "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "font.sans-serif": ["Arial", "DejaVu Sans"],
+        "font.size": style["fs_tick"],
+        "axes.labelsize": style["fs_label"],
+        "axes.labelweight": "bold",
+        "axes.titlesize": style["fs_label"] + 1,
+        "axes.titleweight": "bold",
+        "axes.facecolor": style["axes_bg"],
+        "axes.edgecolor": "black",
+        "axes.linewidth": 1.2,
+        "axes.grid": style["show_grid"],
+        "grid.alpha": 0.3,
+        "grid.linestyle": "--",
+        "xtick.color": "black",
+        "ytick.color": "black",
+        "xtick.labelsize": style["fs_tick"],
+        "ytick.labelsize": style["fs_tick"],
+        "xtick.direction": style["tick_dir"],
+        "ytick.direction": style["tick_dir"],
+        "legend.fontsize": style["fs_legend"],
+        "legend.frameon": True,
+        "legend.framealpha": 0.92,
+        "legend.edgecolor": "black",
+        "lines.linewidth": style["lw"],
+        "lines.markersize": style["ms"],
+        "figure.dpi": 150,
+        "savefig.dpi": style["dpi"],
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.08,
+    })
+
+
+def render_plot_with_download(fig: plt.Figure, filename_base: str, key_prefix: str = ""):
+    """Display matplotlib figure with PNG (high-DPI) and SVG vector download buttons."""
+    style = get_plot_style()
+    dpi = style["dpi"]
+    st.pyplot(fig)
+
+    buf_png = io.BytesIO()
+    fig.savefig(buf_png, format="png", dpi=dpi, bbox_inches="tight")
+    png_bytes = buf_png.getvalue()
+
+    buf_svg = io.BytesIO()
+    fig.savefig(buf_svg, format="svg", bbox_inches="tight")
+    svg_bytes = buf_svg.getvalue()
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        f"⬇️ PNG ({dpi} DPI)",
+        data=png_bytes,
+        file_name=f"{filename_base}_{ts}.png",
+        mime="image/png",
+        key=f"png_{key_prefix}_{filename_base}",
+        use_container_width=True,
+    )
+    c2.download_button(
+        "⬇️ SVG (Vector)",
+        data=svg_bytes,
+        file_name=f"{filename_base}_{ts}.svg",
+        mime="image/svg+xml",
+        key=f"svg_{key_prefix}_{filename_base}",
+        use_container_width=True,
+    )
+    plt.close(fig)
+
 # Custom CSS for modern matte effects
 st.markdown("""
 <style>
@@ -3054,11 +3146,11 @@ def plot_nyquist_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = 
         ax.plot(re_rec, im_rec, 's-', markersize=4, linewidth=1.2,
                 label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=14)
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=14)
-    # No title - removed as requested
-    ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black', fontsize=12)
-    ax.grid(True, alpha=0.3, linestyle='--')
+    style = get_plot_style()
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
+    ax.legend(loc='best', frameon=True, framealpha=0.9, edgecolor='black')
+    ax.grid(style["show_grid"], alpha=0.3, linestyle='--')
     
     # Scientific formatting
     ax.ticklabel_format(style='scientific', scilimits=(-2, 2))
@@ -3120,10 +3212,11 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax1.loglog(data.freq, mag_rec, 's-', markersize=4, linewidth=1.2,
                    label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax1.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14)
-    ax1.set_ylabel("|Z| / Ohm", fontweight='bold', fontsize=14)
-    ax1.legend(loc='best', fontsize=12)
-    ax1.grid(True, alpha=0.3, linestyle='--')
+    style = get_plot_style()
+    ax1.set_xlabel("Frequency / Hz", fontweight='bold')
+    ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
+    ax1.legend(loc='best')
+    ax1.grid(style["show_grid"], alpha=0.3, linestyle='--')
     
     # Scientific formatting for log axes
     ax1.xaxis.set_major_formatter(ScalarFormatter(useMathText=False))
@@ -3157,10 +3250,10 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
         ax2.semilogx(data.freq, phase_rec, 's-', markersize=4, linewidth=1.2,
                      label='Reconstructed', color='#ff7f0e', alpha=0.8, markeredgecolor='white', markeredgewidth=0.5)
     
-    ax2.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=14)
-    ax2.set_ylabel("Phase / deg", fontweight='bold', fontsize=14)
-    ax2.legend(loc='best', fontsize=12)
-    ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.set_xlabel("Frequency / Hz", fontweight='bold')
+    ax2.set_ylabel("Phase / deg", fontweight='bold')
+    ax2.legend(loc='best')
+    ax2.grid(style["show_grid"], alpha=0.3, linestyle='--')
     ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
     
     # Scientific formatting - отключаем LaTeX
@@ -3707,7 +3800,9 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
     log_tau_dense = -np.log10(2 * np.pi * freqs_dense)  # log10(τ) = -log10(2πf)
     
     # Define consistent color mapping based on peak ID
-    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    style = get_plot_style()
+    cmap = plt.get_cmap(style["cmap"])
+    colors = cmap(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
     color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     
     # Plot individual Gaussian components
@@ -3736,12 +3831,10 @@ def plot_deconvolution_vs_frequency(deconv_result: DeconvolutionResult, drt_resu
     # Invert x-axis (high frequency to left)
     ax.invert_xaxis()
     
-    ax.set_xlabel("Frequency / Hz", fontweight='bold', fontsize=10)
-    ax.set_ylabel("γ(τ) / Ohm", fontweight='bold', fontsize=10)
-    # No title - removed as requested
-    # Place legend outside the plot area
-    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=7, frameon=True, edgecolor='black')
-    ax.grid(True, alpha=0.3, linestyle='--', which='both')
+    ax.set_xlabel("Frequency / Hz", fontweight='bold')
+    ax.set_ylabel("γ(τ) / Ohm", fontweight='bold')
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), frameon=True, edgecolor='black')
+    ax.grid(style["show_grid"], alpha=0.3, linestyle='--', which='both')
     
     # Add quality metrics
     if deconv_result.quality_metrics:
@@ -3778,8 +3871,9 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
     areas = [p.area for p in peaks_sorted]
     fractions_percent = [p.fraction_percent for p in peaks_sorted]
     
-    # Define consistent color mapping
-    colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+    style = get_plot_style()
+    cmap = plt.get_cmap(style["cmap"])
+    colors = cmap(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
     color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     colors_sorted = [color_map[p.id] for p in peaks_sorted]
     
@@ -3906,8 +4000,9 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     cumulative_R = R_inf_start
     rc_curves = []
     
-    # Define consistent color mapping
-    colors = plt.cm.Set3(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
+    style = get_plot_style()
+    cmap = plt.get_cmap(style["cmap"])
+    colors = cmap(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
     color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
     
     # Add each distributed process
@@ -4023,11 +4118,10 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     elif pos_max > 0:
         ax.set_ylim(-pos_max * 0.05, pos_max * 1.15)
     
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold', fontsize=10)
-    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold', fontsize=10)
-    # Place legend outside the plot area
-    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=6, frameon=True, edgecolor='black', ncol=1)
-    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+    ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), frameon=True, edgecolor='black', ncol=1)
+    ax.grid(style["show_grid"], alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
     
     plt.tight_layout()
@@ -4204,8 +4298,9 @@ def step1_data_loading():
         
         # Create plots with caching to prevent rerender on slider move
         @st.cache_data(ttl=60, show_spinner=False)
-        def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, freq_range_idx, n_points, original_len):
+        def cached_plots(freq_tuple, re_tuple, im_tuple, point_idx, freq_range_idx, n_points, original_len, style_items):
             """Cache plots to prevent rerender on slider movement"""
+            apply_publication_plot_style(dict(style_items))
             temp_data = ImpedanceData(np.array(freq_tuple), np.array(re_tuple), np.array(im_tuple), auto_convention=False)
             fig_nyquist = plot_nyquist_matplotlib(temp_data, highlight_idx=point_idx, freq_range_idx=freq_range_idx)
             fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx, freq_range_idx=freq_range_idx)
@@ -4215,13 +4310,15 @@ def step1_data_loading():
         freq_tuple = tuple(data.freq)
         re_tuple = tuple(data.re_z)
         im_tuple = tuple(data.im_z)
+        style_items = tuple(sorted(get_plot_style().items()))
         
         # Get cached plots
         fig_nyquist, fig_bode = cached_plots(
             freq_tuple, re_tuple, im_tuple, 
             st.session_state.selected_point_idx,
             st.session_state.freq_range_idx,
-            data.n_points, len(data.original_freq)
+            data.n_points, len(data.original_freq),
+            style_items
         )
         
         # Display plots
@@ -5018,8 +5115,8 @@ def step4_results():
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
-        # Define consistent color mapping
-        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        style = get_plot_style()
+        colors = plt.get_cmap(style["cmap"])(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
         color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
         
         if deconv_result.peaks:
@@ -5086,16 +5183,7 @@ def step4_results():
                     bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
         
         plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-        
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-        buf.seek(0)
-        st.download_button("📥 Download Deconvolution Plot (PNG)", 
-                          data=buf,
-                          file_name=f"deconvolution_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                          mime="image/png")
+        render_plot_with_download(fig, "deconvolution_plot", key_prefix="tab1")
     
     with tab2:
         st.subheader("Area Distribution Analysis")
@@ -5275,7 +5363,8 @@ def step4_results():
             x_dense_log = x_dense
             x_data_eval = deconv_result.x_linear
         
-        colors = plt.cm.Set3(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
+        style = get_plot_style()
+        colors = plt.get_cmap(style["cmap"])(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
         color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
         
         if deconv_result.peaks:
@@ -5381,12 +5470,10 @@ def step4_results():
             bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.85, edgecolor='gray')
         )
         
-        st.pyplot(fig)
-        plt.close(fig)
+        render_plot_with_download(fig, "normalized_deconvolution", key_prefix="tab4")
         
         st.caption(f"Normalized to maximum value γ_max = {max_amp:.4e} Ω")
     
-    # NEW TAB 5: Output Graphs - Vertical layout with separators
     with tab5:
         st.subheader("📊 Output Graphs")
         st.markdown("Comprehensive visualization of impedance spectroscopy analysis results")
@@ -5395,16 +5482,7 @@ def step4_results():
         st.markdown("**2.1 Original Impedance Spectrum**")
         if data is not None:
             fig1 = plot_original_nyquist_with_frequency_labels(data, "Original Nyquist Spectrum")
-            st.pyplot(fig1)
-            plt.close(fig1)
-            
-            # Download button for this graph
-            buf1 = io.BytesIO()
-            fig1.savefig(buf1, format='png', dpi=300, bbox_inches='tight')
-            buf1.seek(0)
-            st.download_button("📥 Download", data=buf1,
-                              file_name=f"original_nyquist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                              mime="image/png", key="download_orig")
+            render_plot_with_download(fig1, "original_nyquist", key_prefix="tab5")
         else:
             st.warning("No impedance data available")
         
@@ -5414,16 +5492,8 @@ def step4_results():
         st.markdown("**2.2 Gaussian Deconvolution vs Frequency**")
         if deconv_result is not None:
             fig2 = plot_deconvolution_vs_frequency(deconv_result, drt_result, 
-                                                    "DRT Deconvolution vs Frequency")
-            st.pyplot(fig2)
-            plt.close(fig2)
-            
-            buf2 = io.BytesIO()
-            fig2.savefig(buf2, format='png', dpi=300, bbox_inches='tight')
-            buf2.seek(0)
-            st.download_button("📥 Download", data=buf2,
-                              file_name=f"deconvolution_vs_freq_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                              mime="image/png", key="download_deconv_freq")
+                                                   "DRT Deconvolution vs Frequency")
+            render_plot_with_download(fig2, "deconvolution_vs_freq", key_prefix="tab5")
         else:
             st.warning("No deconvolution results available")
         
@@ -5433,16 +5503,8 @@ def step4_results():
         st.markdown("**2.3 Peak Area Distribution (Resistance Contributions)**")
         if deconv_result is not None:
             fig3 = plot_peak_area_distribution_with_values(deconv_result, drt_result,
-                                                            "Resistance Distribution by Process")
-            st.pyplot(fig3)
-            plt.close(fig3)
-            
-            buf3 = io.BytesIO()
-            fig3.savefig(buf3, format='png', dpi=300, bbox_inches='tight')
-            buf3.seek(0)
-            st.download_button("📥 Download", data=buf3,
-                              file_name=f"resistance_distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                              mime="image/png", key="download_dist")
+                                                           "Resistance Distribution by Process")
+            render_plot_with_download(fig3, "resistance_distribution", key_prefix="tab5")
         else:
             st.warning("No deconvolution results available")
         
@@ -5452,9 +5514,8 @@ def step4_results():
         st.markdown("**2.4 Experimental vs Sequential RQ (ZARC) Model**")
         if deconv_result is not None and drt_result is not None and data is not None:
             fig4 = plot_sequential_rc_model(deconv_result, drt_result, data,
-                                             "Experimental vs Sequential RQ Model")
-            st.pyplot(fig4)
-            plt.close(fig4)
+                                            "Experimental vs Sequential RQ Model")
+            render_plot_with_download(fig4, "sequential_rq_model", key_prefix="tab5")
             
             # Display R_i, Q_i, alpha_i, C_i, f_i table directly under Graph 2.4
             if deconv_result.peaks:
@@ -5472,13 +5533,6 @@ def step4_results():
                     })
                 rq_df = pd.DataFrame(rq_rows)
                 st.dataframe(rq_df, use_container_width=True, hide_index=True)
-            
-            buf4 = io.BytesIO()
-            fig4.savefig(buf4, format='png', dpi=300, bbox_inches='tight')
-            buf4.seek(0)
-            st.download_button("📥 Download", data=buf4,
-                              file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                              mime="image/png", key="download_model")
         else:
             st.warning("Insufficient data for model comparison")
         
@@ -5486,12 +5540,11 @@ def step4_results():
         st.markdown("---")
         st.markdown("""
         **Graph Explanations:**
-        - **2.1** - Original impedance spectrum with marked extreme and decade frequency points
-        - **2.2** - DRT deconvolution results plotted against frequency (high to low)
-        - **2.3** - Bar chart showing resistance contribution (Area in Ω) and percentage for each process
-        - **2.4** - Comparison of experimental data with sequential RC model (each semicircle represents one relaxation process)
+- **2.1** - Original impedance spectrum with marked extreme and decade frequency points
+- **2.2** - DRT deconvolution results plotted against frequency (high to low)
+- **2.3** - Bar chart showing resistance contribution (Area in Ω) and percentage for each process
+- **2.4** - Comparison of experimental data with sequential RQ (ZARC) model (each depressed semicircle represents one relaxation process)
         """)
-    
         
     with tab6:
         st.subheader("Export Results")
@@ -5797,7 +5850,7 @@ Number of Peaks: {len(deconv_result.peaks)}
 # ============================================================================
 
 def show_step_indicator():
-    """Display step indicator in sidebar"""
+    """Display step indicator and settings in sidebar"""
     # Add logo at the top of sidebar
     try:
         from PIL import Image
@@ -5827,7 +5880,56 @@ def show_step_indicator():
     
     st.sidebar.markdown("---")
     
-    # Settings expander
+    # Publication Plot Settings expander
+    style = get_plot_style()
+    with st.sidebar.expander("🎨 Publication Plot Settings", expanded=False):
+        font_choice = st.selectbox(
+            "Font family",
+            options=["serif", "sans-serif"],
+            index=0 if style["font_family"] == "serif" else 1,
+            help="serif = Times New Roman, sans-serif = Arial"
+        )
+        fs_label = st.slider("Axis label font size", 8, 18, int(style["fs_label"]))
+        fs_tick = st.slider("Tick label font size", 7, 16, int(style["fs_tick"]))
+        fs_legend = st.slider("Legend font size", 6, 16, int(style["fs_legend"]))
+        lw = st.slider("Line width", 1.0, 4.0, float(style["lw"]), 0.25)
+        ms = st.slider("Marker size", 2, 10, int(style["ms"]))
+        show_grid = st.checkbox("Show grid lines", value=bool(style["show_grid"]))
+        tick_dir = st.radio(
+            "Tick direction",
+            options=["in", "out"],
+            index=0 if style["tick_dir"] == "in" else 1,
+            horizontal=True
+        )
+        axes_bg = st.radio(
+            "Plot background",
+            options=["white", "#f8f9fa"],
+            index=0 if style["axes_bg"] == "white" else 1,
+            horizontal=True
+        )
+        cmap_options = ["Set3", "tab10", "Dark2", "viridis", "plasma", "coolwarm", "turbo"]
+        cmap_idx = cmap_options.index(style["cmap"]) if style["cmap"] in cmap_options else 0
+        cmap = st.selectbox("Peak / Process colormap", options=cmap_options, index=cmap_idx)
+        dpi = st.selectbox("Export PNG DPI", options=[300, 600, 900], index=[300, 600, 900].index(style["dpi"]))
+
+        st.session_state.plot_style = {
+            "font_family": font_choice,
+            "fs_label": fs_label,
+            "fs_tick": fs_tick,
+            "fs_legend": fs_legend,
+            "lw": lw,
+            "ms": ms,
+            "show_grid": show_grid,
+            "tick_dir": tick_dir,
+            "axes_bg": axes_bg,
+            "cmap": cmap,
+            "dpi": dpi,
+        }
+
+    # Apply publication style globally to matplotlib
+    apply_publication_plot_style(st.session_state.plot_style)
+    
+    # Global Settings expander
     with st.sidebar.expander("⚙️ Global Settings", expanded=False):
         st.session_state.app_state.clip_negative = st.checkbox(
             "Clip negative values", 
