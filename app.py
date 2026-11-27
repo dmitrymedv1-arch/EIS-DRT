@@ -167,6 +167,9 @@ def render_plot_with_download(fig: plt.Figure, filename_base: str, key_prefix: s
     """Display matplotlib figure with PNG (high-DPI) and SVG vector download buttons."""
     style = get_plot_style()
     dpi = style["dpi"]
+    if not style["show_grid"]:
+        for axis in fig.axes:
+            axis.grid(False, which="both")
     st.pyplot(fig)
 
     buf_png = io.BytesIO()
