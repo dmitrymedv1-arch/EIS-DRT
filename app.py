@@ -5441,13 +5441,14 @@ def step4_results():
         - **2.4** - Comparison of experimental data with sequential RC model (each semicircle represents one relaxation process)
         """)
     
+       
     with tab6:
         st.subheader("Export Results")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("**Export Peak Data**")
+            st.markdown("**Export Peak Data** *(for Complete Dataset table)*")
             
             # Create peaks DataFrame with Fmax and C columns
             peaks_data = []
@@ -5481,7 +5482,7 @@ def step4_results():
                 use_container_width=True
             )
             
-            st.markdown("**Export Fitting Data**")
+            st.markdown("**Export Fitting Data** *(from Gaussian Deconvolution Result)*")
             
             if deconv_result.fit_y_original is not None:
                 fit_values = deconv_result.fit_y_original
@@ -5528,6 +5529,121 @@ def step4_results():
                 mime="text/csv",
                 use_container_width=True
             )
+
+            # --- Export Normalized Gaussian Deconvolution Result ---
+            st.markdown("**Export Normalized Deconvolution Data** *(Normalized spectrum + Total Fit + Peaks)*")
+            
+            peaks_sorted_exp = sorted(deconv_result.peaks, key=lambda p: p.id)
+            max_amp_exp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
+            x_eval = np.log10(np.maximum(deconv_result.x_linear, 1e-15)) if deconv_result.use_log_x else deconv_result.x_linear
+            
+            norm_dict = {
+                'tau_s': deconv_result.x_linear,
+                'gamma_tau_norm': deconv_result.y_original / max_amp_exp,
+                'Total_Fit_norm': fit_values / max_amp_exp
+            }
+            for peak in peaks_sorted_exp:
+                y_comp_norm = (peak.amplitude * GaussianModelDeconv.gaussian(
+                    x_eval, 1.0, peak.center_log, peak.sigma_log
+                )) / max_amp_exp
+                norm_dict[f'Peak_{peak.id}_norm'] = y_comp_norm
+            
+            csv_norm = pd.DataFrame(norm_dict).to_csv(index=False)
+            st.download_button(
+                "📥 Export Normalized Deconvolution as CSV",
+                data=csv_norm,
+                file_name=f"deconvolution_normalized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+            # --- Export 2.2 Gaussian Deconvolution vs Frequency ---
+            st.markdown("**Export 2.2 Deconvolution vs Frequency** *(Spectrum + Total Fit + Peaks)*")
+            
+            freqs_deconv = 1.0 / (2.0 * np.pi * deconv_result.x_linear)
+            sort_idx_f = np.argsort(freqs_deconv)[::-1]  # high to low, as on Graph 2.2
+            log_tau_f = np.log10(np.maximum(deconv_result.x_linear[sort_idx_f], 1e-15))
+            
+            freq_deconv_dict = {
+                'Frequency_Hz': freqs_deconv[sort_idx_f],
+                'gamma_tau_Ohm': deconv_result.y_original[sort_idx_f],
+                'Total_Fit_Ohm': fit_values[sort_idx_f]
+            }
+            for peak in peaks_sorted_exp:
+                y_comp_f = peak.amplitude * GaussianModelDeconv.gaussian(
+                    log_tau_f, 1.0, peak.center_log, peak.sigma_log
+                )
+                freq_deconv_dict[f'Peak_{peak.id}_Ohm'] = y_comp_f
+            
+            csv_freq_deconv = pd.DataFrame(freq_deconv_dict).to_csv(index=False)
+            st.download_button(
+                "📥 Export 2.2 Deconvolution vs Frequency as CSV",
+                data=csv_freq_deconv,
+                file_name=f"deconvolution_vs_freq_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+            # --- Export 2.4 Experimental vs Sequential RQ (ZARC) Model ---
+            if data is not None and drt_result is not None:
+                st.markdown("**Export 2.4 Sequential RQ (ZARC) Model** *(Experimental + Total Model + Processes)*")
+                
+                sort_idx_exp = np.argsort(data.freq)
+                freq_exp_s = data.freq[sort_idx_exp]
+                re_exp_s = data.re_z[sort_idx_exp]
+                im_exp_s = data.im_z[sort_idx_exp]
+                omega_exp_s = 2.0 * np.pi * freq_exp_s
+                
+                R_inf_start = drt_result.R_inf
+                for i in range(len(im_exp_s) - 1):
+                    if im_exp_s[i] >= 0 and im_exp_s[i + 1] < 0:
+                        t = -im_exp_s[i] / (im_exp_s[i + 1] - im_exp_s[i])
+                        R_inf_start = float(re_exp_s[i] + t * (re_exp_s[i + 1] - re_exp_s[i]))
+                        break
+                
+                Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
+                if drt_result.L > 0:
+                    Z_total_exp += 1j * omega_exp_s * drt_result.L
+                
+                process_cols = {}
+                cumulative_R = R_inf_start
+                for peak in peaks_sorted_exp:
+                    sigma = max(float(peak.sigma_log), 1e-6)
+                    center_log = float(peak.center_log)
+                    if sigma < 1e-4:
+                        Z_i = peak.area / (1.0 + 1j * omega_exp_s * peak.center)
+                    else:
+                        u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
+                        tau_sub = 10.0 ** u_grid
+                        gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
+                        profile_area = np.trapezoid(gauss_profile, u_grid)
+                        g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
+                        denom = 1.0 + 1j * np.outer(omega_exp_s, tau_sub)
+                        Z_i = np.trapezoid(g_weights[np.newaxis, :] / denom, u_grid, axis=1)
+                    
+                    Z_total_exp += Z_i
+                    Z_indiv = cumulative_R + Z_i
+                    process_cols[f'Re_Process_{peak.id}_Ohm'] = np.real(Z_indiv)
+                    process_cols[f'NegIm_Process_{peak.id}_Ohm'] = -np.imag(Z_indiv)
+                    cumulative_R += peak.area
+                
+                rq_export_dict = {
+                    'Frequency_Hz': freq_exp_s,
+                    'Re_Exp_Ohm': re_exp_s,
+                    'NegIm_Exp_Ohm': im_exp_s,
+                    'Re_Total_Model_Ohm': np.real(Z_total_exp),
+                    'NegIm_Total_Model_Ohm': -np.imag(Z_total_exp)
+                }
+                rq_export_dict.update(process_cols)
+                
+                csv_rq_model = pd.DataFrame(rq_export_dict).to_csv(index=False)
+                st.download_button(
+                    "📥 Export 2.4 Sequential RQ Model as CSV",
+                    data=csv_rq_model,
+                    file_name=f"sequential_rq_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
         
         with col2:
             st.markdown("**Generate Report**")
