@@ -5231,18 +5231,24 @@ def step4_results():
                 integral, ratio = drt_result.verify_integral()
                 st.metric("Integral Ratio", f"{ratio:.3f}")
     
+        
     with tab4:
         st.subheader("Normalized Gaussian Deconvolution Result")
         
-        fig, ax = plt.subplots(figsize=(12, 7))
+        fig, (ax, ax_res) = plt.subplots(
+            2, 1, figsize=(12, 9), sharex=True,
+            gridspec_kw={'height_ratios': [3, 1.2], 'hspace': 0.08}
+        )
         
         # Make axis tick labels black
-        ax.tick_params(axis='both', colors='black')
-        ax.xaxis.label.set_color('black')
-        ax.yaxis.label.set_color('black')
+        for axis in (ax, ax_res):
+            axis.tick_params(axis='both', colors='black')
+            axis.xaxis.label.set_color('black')
+            axis.yaxis.label.set_color('black')
         
         if deconv_result.use_log_x:
             ax.set_xscale('log')
+            ax_res.set_xscale('log')
         
         max_amp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
         y_original_norm = deconv_result.y_original / max_amp
@@ -5255,12 +5261,14 @@ def step4_results():
             x_max = np.max(deconv_result.x_linear)
             x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 2000)
             x_dense_log = np.log10(x_dense)
+            x_data_eval = np.log10(np.maximum(deconv_result.x_linear, 1e-15))
         else:
             x_dense = np.linspace(np.min(deconv_result.x_linear), 
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
+            x_data_eval = deconv_result.x_linear
         
-        colors = plt.cm.Set3(np.linspace(0, 1, len(deconv_result.peaks)))
+        colors = plt.cm.Set3(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
         color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
         
         if deconv_result.peaks:
@@ -5289,49 +5297,85 @@ def step4_results():
                                   deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
                 ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
+        # Calculate normalized total fit at dense grid and at exact data points
         if deconv_result.fit_y_original is not None:
             from scipy.interpolate import interp1d
-            fit_y_original_norm = deconv_result.fit_y_original / max_amp
-            interp_func = interp1d(deconv_result.x_linear, fit_y_original_norm, 
+            fit_at_data_norm = deconv_result.fit_y_original / max_amp
+            interp_func = interp1d(deconv_result.x_linear, fit_at_data_norm, 
                                    kind='cubic', fill_value='extrapolate')
             y_total_norm_interp = interp_func(x_dense)
             ax.plot(x_dense, y_total_norm_interp, 'r--', linewidth=2.5, label='Total Fit (normalized)', zorder=3)
-        elif deconv_result.peaks:
+        else:
             y_total_norm = np.zeros_like(x_dense)
+            fit_at_data_norm = np.zeros_like(deconv_result.x_linear, dtype=float)
             for peak in deconv_result.peaks:
                 y_total_norm += (peak.amplitude * GaussianModelDeconv.gaussian(
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
+                )) / max_amp
+                fit_at_data_norm += (peak.amplitude * GaussianModelDeconv.gaussian(
+                    x_data_eval, 1.0, peak.center_log, peak.sigma_log
                 )) / max_amp
             
             if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
                 if deconv_result.baseline_method == 'constant':
                     y_total_norm += deconv_result.baseline_params[0] / max_amp
+                    fit_at_data_norm += deconv_result.baseline_params[0] / max_amp
                 elif deconv_result.baseline_method == 'linear':
                     y_total_norm += (deconv_result.baseline_params[0] + 
                                     deconv_result.baseline_params[1] * x_dense_log) / max_amp
+                    fit_at_data_norm += (deconv_result.baseline_params[0] + 
+                                        deconv_result.baseline_params[1] * x_data_eval) / max_amp
                 elif deconv_result.baseline_method == 'quadratic':
                     y_total_norm += (deconv_result.baseline_params[0] + 
                                     deconv_result.baseline_params[1] * x_dense_log +
                                     deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
+                    fit_at_data_norm += (deconv_result.baseline_params[0] + 
+                                        deconv_result.baseline_params[1] * x_data_eval +
+                                        deconv_result.baseline_params[2] * x_data_eval**2) / max_amp
             
             ax.plot(x_dense, y_total_norm, 'r--', linewidth=2.5, label='Total Fit (normalized)', zorder=3)
         
-        ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
         ax.set_ylabel('Normalized Intensity (γ(τ) / γ_max)', fontweight='bold', fontsize=12)
-        # No title - removed as requested
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
+        ax.tick_params(labelbottom=False)
         
-        if deconv_result.quality_metrics:
-            metrics_text = f"R² = {deconv_result.quality_metrics.get('R²', 0):.4f}\n"
-            metrics_text += f"RMSE = {deconv_result.quality_metrics.get('RMSE', 0):.2e}"
-            ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
-                    fontsize=9, verticalalignment='top',
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='gray'))
+        # --- Residual curve with thermal color scale ---
+        residuals_norm = y_original_norm - fit_at_data_norm
+        ss_res = np.sum(residuals_norm ** 2)
+        ss_tot = np.sum((y_original_norm - np.mean(y_original_norm)) ** 2)
+        r2_norm = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        rmse_norm = float(np.sqrt(np.mean(residuals_norm ** 2)))
+        max_abs_res = max(float(np.max(np.abs(residuals_norm))), 1e-9)
         
-        plt.tight_layout()
+        ax_res.axhline(0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
+        ax_res.plot(deconv_result.x_linear, residuals_norm, '-', color='gray', alpha=0.5, linewidth=1.0, zorder=2)
+        sc = ax_res.scatter(
+            deconv_result.x_linear, residuals_norm,
+            c=residuals_norm, cmap='coolwarm',
+            vmin=-max_abs_res, vmax=max_abs_res,
+            s=28, edgecolors='black', linewidths=0.3, zorder=3
+        )
+        
+        # Colorbar aligned with residual subplot
+        cbar = fig.colorbar(sc, ax=ax_res, pad=0.015, aspect=12)
+        cbar.set_label('Δ (norm)', fontsize=9, fontweight='bold')
+        cbar.ax.tick_params(labelsize=8, colors='black')
+        
+        ax_res.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
+        ax_res.set_ylabel('Residuals\n(Data - Fit)', fontweight='bold', fontsize=10)
+        ax_res.set_ylim(-max_abs_res * 1.25, max_abs_res * 1.25)
+        ax_res.grid(True, alpha=0.3, linestyle='--')
+        
+        metrics_text = f"R² = {r2_norm:.5f}  |  RMSE = {rmse_norm:.2e}"
+        ax_res.text(
+            0.015, 0.90, metrics_text, transform=ax_res.transAxes,
+            fontsize=9, fontweight='bold', verticalalignment='top',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.85, edgecolor='gray')
+        )
+        
         st.pyplot(fig)
-        plt.close()
+        plt.close(fig)
         
         st.caption(f"Normalized to maximum value γ_max = {max_amp:.4e} Ω")
     
