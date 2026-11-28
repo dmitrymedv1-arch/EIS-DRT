@@ -3591,9 +3591,10 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
                          drt_result: DRTResult,
                          data: ImpedanceData) -> Dict[str, Any]:
     """
-    Complex Non-Linear Least Squares (CNLS) refinement of the sequential RQ (ZARC) model:
-        Z(w) = R_inf + i*w*L + sum_k [ R_k / (1 + (i*w)^alpha_k * R_k * Q_k) ]
-    Uses DRT deconvolution results as initial guesses.
+    CNLS refinement of the sequential RQ (ZARC) model with FIXED R_inf and R_i:
+        Z(w) = R_inf + i*w*L + sum_k [ R_k / (1 + (i*w*tau_k)^alpha_k) ]
+    Only semicircle depression (alpha_k), slight time-constant shift (tau_k),
+    and inductance (L, if present) are optimized.
     """
     sort_idx = np.argsort(data.freq)
     freq_exp = data.freq[sort_idx]
@@ -3601,12 +3602,12 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
     im_exp = data.im_z[sort_idx]  # -Im(Z)
     omega = 2.0 * np.pi * freq_exp
 
-    # Initial R_inf (zero-crossing if inductive, else drt_result.R_inf)
-    R_inf_init = float(drt_result.R_inf)
+    # Fixed R_inf (zero-crossing if inductive, else drt_result.R_inf)
+    R_inf_fixed = float(drt_result.R_inf)
     for i in range(len(im_exp) - 1):
         if im_exp[i] >= 0 and im_exp[i + 1] < 0:
             t = -im_exp[i] / (im_exp[i + 1] - im_exp[i])
-            R_inf_init = float(re_exp[i] + t * (re_exp[i + 1] - re_exp[i]))
+            R_inf_fixed = float(re_exp[i] + t * (re_exp[i + 1] - re_exp[i]))
             break
 
     has_L = (drt_result.L > 0) or np.any(im_exp < 0)
@@ -3614,45 +3615,41 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
 
     peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
     n_proc = len(peaks_sorted)
+    fixed_R = [max(float(peak.area), 1e-12) for peak in peaks_sorted]
 
-    # Parameter vector: [R_inf, (L if has_L), R_1, log10(Q_1), alpha_1, ...]
-    p0 = [max(R_inf_init, 1e-9)]
-    lb = [0.0]
-    ub = [max(np.max(re_exp), R_inf_init * 2.0, 1.0)]
+    # Parameter vector: [(L if has_L), log10(tau_1), alpha_1, log10(tau_2), alpha_2, ...]
+    p0, lb, ub = [], [], []
 
     if has_L:
         p0.append(L_init)
         lb.append(0.0)
         ub.append(max(L_init * 100.0, 1e-2))
 
-    R_total_est = max(np.max(re_exp) - np.min(re_exp), 1e-6)
     for peak in peaks_sorted:
         rq = calculate_rq_parameters(peak)
-        R_k = max(rq['R_i'], 1e-9)
-        Q_k = max(rq['Q_i'], 1e-15)
-        alpha_k = float(np.clip(rq['alpha_i'], 0.15, 0.999))
+        log_tau_init = float(np.log10(max(peak.center, 1e-15)))
+        alpha_init = float(np.clip(rq['alpha_i'], 0.15, 0.999))
 
-        p0.extend([R_k, np.log10(Q_k), alpha_k])
-        lb.extend([1e-9, -15.0, 0.1])
-        ub.extend([R_total_est * 3.0, 3.0, 1.0])
+        p0.extend([log_tau_init, alpha_init])
+        lb.extend([log_tau_init - 0.5, 0.1])
+        ub.extend([log_tau_init + 0.5, 1.0])
 
     def eval_z_model(params, w_arr):
         idx = 0
-        r_inf = params[idx]; idx += 1
         l_val = params[idx] if has_L else 0.0
         if has_L:
             idx += 1
 
-        Z = np.full_like(w_arr, r_inf, dtype=complex)
+        Z = np.full_like(w_arr, R_inf_fixed, dtype=complex)
         if l_val > 0:
             Z += 1j * w_arr * l_val
 
         for k in range(n_proc):
-            R_k = params[idx]
-            Q_k = 10.0 ** params[idx + 1]
-            alpha_k = params[idx + 2]
-            idx += 3
-            Z += R_k / (1.0 + ((1j * w_arr) ** alpha_k) * R_k * Q_k)
+            R_k = fixed_R[k]
+            tau_k = 10.0 ** params[idx]
+            alpha_k = params[idx + 1]
+            idx += 2
+            Z += R_k / (1.0 + (1j * w_arr * tau_k) ** alpha_k)
         return Z
 
     def residuals_func(params):
@@ -3674,21 +3671,20 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
 
     opt = res.x
     idx = 0
-    r_inf_opt = float(opt[idx]); idx += 1
     l_opt = float(opt[idx]) if has_L else 0.0
     if has_L:
         idx += 1
 
     processes = []
     for k, peak in enumerate(peaks_sorted):
-        R_k = float(opt[idx])
-        Q_k = float(10.0 ** opt[idx + 1])
-        alpha_k = float(opt[idx + 2])
-        idx += 3
+        R_k = fixed_R[k]
+        tau_k = float(10.0 ** opt[idx])
+        alpha_k = float(opt[idx + 1])
+        idx += 2
 
-        rq_prod = R_k * Q_k
-        C_k = float((rq_prod ** (1.0 / alpha_k)) / R_k) if R_k > 0 else 0.0
-        f_k = float((rq_prod ** (-1.0 / alpha_k)) / (2.0 * np.pi)) if rq_prod > 0 else 0.0
+        Q_k = float((tau_k ** alpha_k) / R_k)
+        C_k = float(tau_k / R_k)
+        f_k = float(1.0 / (2.0 * np.pi * tau_k))
 
         processes.append({
             'id': peak.id,
@@ -3699,7 +3695,7 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
             'f_i': f_k
         })
 
-    # Re-sort processes by characteristic frequency (high to low) and reassign IDs
+    # Re-sort processes by characteristic frequency (high to low)
     processes.sort(key=lambda p: p['f_i'], reverse=True)
     for new_id, p in enumerate(processes, start=1):
         p['id'] = new_id
@@ -3714,7 +3710,7 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
     rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
     return {
-        'R_inf': r_inf_opt,
+        'R_inf': R_inf_fixed,
         'L': l_opt,
         'processes': processes,
         'r2': r2,
