@@ -630,6 +630,8 @@ class AppState:
 # Initialize session state
 if 'app_state' not in st.session_state:
     st.session_state.app_state = AppState()
+if not hasattr(st.session_state.app_state, 'refined_rq_params'):
+    st.session_state.app_state.refined_rq_params = None
 
 
 # ============================================================================
