@@ -160,6 +160,9 @@ def apply_publication_plot_style(style: Dict[str, Any]):
         "savefig.dpi": style["dpi"],
         "savefig.bbox": "tight",
         "savefig.pad_inches": 0.08,
+        "text.usetex": False,
+        "text.parse_math": False,
+        "axes.formatter.use_mathtext": False,
     })
 
 
