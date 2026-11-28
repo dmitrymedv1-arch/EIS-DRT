@@ -604,6 +604,7 @@ class AppState:
     
     # Step 4: Results
     results_ready: bool = False
+    refined_rq_params: Optional[Dict[str, Any]] = None
     
     # General settings
     use_log_x: bool = True
@@ -3584,6 +3585,140 @@ def calculate_rq_parameters(peak: GaussianPeak) -> Dict[str, float]:
         'f_i': float(f_i)
     }
     
+def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
+                         drt_result: DRTResult,
+                         data: ImpedanceData) -> Dict[str, Any]:
+    """
+    Complex Non-Linear Least Squares (CNLS) refinement of the sequential RQ (ZARC) model:
+        Z(w) = R_inf + i*w*L + sum_k [ R_k / (1 + (i*w)^alpha_k * R_k * Q_k) ]
+    Uses DRT deconvolution results as initial guesses.
+    """
+    sort_idx = np.argsort(data.freq)
+    freq_exp = data.freq[sort_idx]
+    re_exp = data.re_z[sort_idx]
+    im_exp = data.im_z[sort_idx]  # -Im(Z)
+    omega = 2.0 * np.pi * freq_exp
+
+    # Initial R_inf (zero-crossing if inductive, else drt_result.R_inf)
+    R_inf_init = float(drt_result.R_inf)
+    for i in range(len(im_exp) - 1):
+        if im_exp[i] >= 0 and im_exp[i + 1] < 0:
+            t = -im_exp[i] / (im_exp[i + 1] - im_exp[i])
+            R_inf_init = float(re_exp[i] + t * (re_exp[i + 1] - re_exp[i]))
+            break
+
+    has_L = (drt_result.L > 0) or np.any(im_exp < 0)
+    L_init = max(float(drt_result.L), 1e-12) if has_L else 0.0
+
+    peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
+    n_proc = len(peaks_sorted)
+
+    # Parameter vector: [R_inf, (L if has_L), R_1, log10(Q_1), alpha_1, ...]
+    p0 = [max(R_inf_init, 1e-9)]
+    lb = [0.0]
+    ub = [max(np.max(re_exp), R_inf_init * 2.0, 1.0)]
+
+    if has_L:
+        p0.append(L_init)
+        lb.append(0.0)
+        ub.append(max(L_init * 100.0, 1e-2))
+
+    R_total_est = max(np.max(re_exp) - np.min(re_exp), 1e-6)
+    for peak in peaks_sorted:
+        rq = calculate_rq_parameters(peak)
+        R_k = max(rq['R_i'], 1e-9)
+        Q_k = max(rq['Q_i'], 1e-15)
+        alpha_k = float(np.clip(rq['alpha_i'], 0.15, 0.999))
+
+        p0.extend([R_k, np.log10(Q_k), alpha_k])
+        lb.extend([1e-9, -15.0, 0.1])
+        ub.extend([R_total_est * 3.0, 3.0, 1.0])
+
+    def eval_z_model(params, w_arr):
+        idx = 0
+        r_inf = params[idx]; idx += 1
+        l_val = params[idx] if has_L else 0.0
+        if has_L:
+            idx += 1
+
+        Z = np.full_like(w_arr, r_inf, dtype=complex)
+        if l_val > 0:
+            Z += 1j * w_arr * l_val
+
+        for k in range(n_proc):
+            R_k = params[idx]
+            Q_k = 10.0 ** params[idx + 1]
+            alpha_k = params[idx + 2]
+            idx += 3
+            Z += R_k / (1.0 + ((1j * w_arr) ** alpha_k) * R_k * Q_k)
+        return Z
+
+    def residuals_func(params):
+        Z_mod = eval_z_model(params, omega)
+        res_re = re_exp - np.real(Z_mod)
+        res_im = im_exp - (-np.imag(Z_mod))
+        return np.concatenate([res_re, res_im])
+
+    res = least_squares(
+        residuals_func,
+        x0=np.clip(p0, lb, ub),
+        bounds=(lb, ub),
+        method='trf',
+        ftol=1e-10,
+        xtol=1e-10,
+        gtol=1e-10,
+        max_nfev=10000
+    )
+
+    opt = res.x
+    idx = 0
+    r_inf_opt = float(opt[idx]); idx += 1
+    l_opt = float(opt[idx]) if has_L else 0.0
+    if has_L:
+        idx += 1
+
+    processes = []
+    for k, peak in enumerate(peaks_sorted):
+        R_k = float(opt[idx])
+        Q_k = float(10.0 ** opt[idx + 1])
+        alpha_k = float(opt[idx + 2])
+        idx += 3
+
+        rq_prod = R_k * Q_k
+        C_k = float((rq_prod ** (1.0 / alpha_k)) / R_k) if R_k > 0 else 0.0
+        f_k = float((rq_prod ** (-1.0 / alpha_k)) / (2.0 * np.pi)) if rq_prod > 0 else 0.0
+
+        processes.append({
+            'id': peak.id,
+            'R_i': R_k,
+            'Q_i': Q_k,
+            'alpha_i': alpha_k,
+            'C_i': C_k,
+            'f_i': f_k
+        })
+
+    # Re-sort processes by characteristic frequency (high to low) and reassign IDs
+    processes.sort(key=lambda p: p['f_i'], reverse=True)
+    for new_id, p in enumerate(processes, start=1):
+        p['id'] = new_id
+
+    # Fit quality metrics
+    Z_opt = eval_z_model(opt, omega)
+    y_true = np.concatenate([re_exp, im_exp])
+    y_pred = np.concatenate([np.real(Z_opt), -np.imag(Z_opt)])
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+    return {
+        'R_inf': r_inf_opt,
+        'L': l_opt,
+        'processes': processes,
+        'r2': r2,
+        'rmse': rmse,
+        'success': bool(res.success)
+    }
 
 def plot_original_nyquist_with_frequency_labels(data: ImpedanceData, title: str = "Original Impedance Spectrum") -> plt.Figure:
     """
@@ -3918,195 +4053,174 @@ def plot_peak_area_distribution_with_values(deconv_result: DeconvolutionResult,
 def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
                               drt_result: DRTResult,
                               data: ImpedanceData,
-                              title: str = "Experimental vs Sequential RC Model") -> plt.Figure:
+                              title: str = "Experimental vs Sequential RC Model",
+                              refined_rq: Optional[Dict[str, Any]] = None) -> plt.Figure:
     """
-    Plot experimental impedance spectrum with sequential distributed RC (Gaussian DRT) model.
-    Each Gaussian peak corresponds to one distributed relaxation process integrated over the Debye kernel:
-        Z_i(ω) = ∫ G_i(log10 τ) / (1 + iωτ) d(log10 τ)
-    Elements are connected in series: L → R∞ → Process₁ → Process₂ → ... → Processₙ.
-    
-    IMPORTANT: -Im(Z) values: positive = capacitive (above x-axis), negative = inductive (below x-axis)
-    Legend placed outside plot area.
+    Plot experimental impedance spectrum with sequential RQ (ZARC) model
+    and residual curve: Δ(-Im(Z)) vs Re(Z) with R² and RMSE.
     """
-    fig, ax = plt.subplots(figsize=(7, 4))
-    
-    # Make axis tick labels black
-    ax.tick_params(axis='both', colors='black')
-    ax.xaxis.label.set_color('black')
-    ax.yaxis.label.set_color('black')
-    
-    # Use original data (preserving sign of -Im(Z))
-    re_exp = data.re_z
-    im_exp = data.im_z
-    freq_exp = data.freq
-    
-    # Sort by frequency for consistent ordering (low to high)
-    sort_idx_exp = np.argsort(freq_exp)
-    re_exp_sorted = re_exp[sort_idx_exp]
-    im_exp_sorted = im_exp[sort_idx_exp]
-    freq_exp_sorted = freq_exp[sort_idx_exp]
-    
-    # Plot experimental data
+    fig = plt.figure(figsize=(8.5, 6.2))
+    gs = fig.add_gridspec(
+        2, 2,
+        height_ratios=[3, 1.2],
+        width_ratios=[1, 0.025],
+        hspace=0.08,
+        wspace=0.03
+    )
+    ax = fig.add_subplot(gs[0, 0])
+    ax_res = fig.add_subplot(gs[1, 0], sharex=ax)
+    cax = fig.add_subplot(gs[1, 1])
+
+    for axis in (ax, ax_res):
+        axis.tick_params(axis='both', colors='black')
+        axis.xaxis.label.set_color('black')
+        axis.yaxis.label.set_color('black')
+
+    sort_idx_exp = np.argsort(data.freq)
+    re_exp_sorted = data.re_z[sort_idx_exp]
+    im_exp_sorted = data.im_z[sort_idx_exp]
+    freq_exp_sorted = data.freq[sort_idx_exp]
+    omega_exp = 2.0 * np.pi * freq_exp_sorted
+
     ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=3, linewidth=1,
             color='#1f77b4', alpha=0.7, label='Experimental', zorder=1)
-    
-    # Determine unified R_inf starting point:
-    # If inductive behavior causes -Im(Z) to cross zero, find exact zero-crossing for alignment;
-    # otherwise use drt_result.R_inf
-    R_inf_start = drt_result.R_inf
-    for i in range(len(im_exp_sorted) - 1):
-        if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
-            t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
-            R_inf_start = float(re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i]))
-            break
-    
-    # Get peaks sorted by characteristic frequency (high to low) - already sorted by ID
-    peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
-    
-    # Helper function: exact impedance of a Gaussian DRT peak via numerical quadrature
-    def calc_gaussian_process_impedance(omega_arr: np.ndarray, peak: GaussianPeak) -> np.ndarray:
-        sigma = max(float(peak.sigma_log), 1e-6)
-        center_log = float(peak.center_log)
-        
-        # If peak is extremely narrow, fallback to ideal Debye RC element
-        if sigma < 1e-4:
-            return peak.area / (1.0 + 1j * omega_arr * peak.center)
-        
-        # Dense grid covering ±5 sigma in log10(tau) space (captures >99.9999% of peak area)
-        u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
-        tau_sub = 10.0 ** u_grid
-        
-        # Normalized Gaussian weights whose integral over u_grid equals peak.area (R_i)
-        gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
-        profile_area = np.trapezoid(gauss_profile, u_grid)
-        g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
-        
-        # Vectorized Debye kernel matrix: shape (len(omega_arr), len(u_grid))
-        denom = 1.0 + 1j * np.outer(omega_arr, tau_sub)
-        integrand = g_weights[np.newaxis, :] / denom
-        
-        return np.trapezoid(integrand, u_grid, axis=1)
-    
-    # Dense frequency grid over experimental range for smooth Total Model curve
+
     f_min_exp = max(np.min(freq_exp_sorted), 1e-12)
     f_max_exp = np.max(freq_exp_sorted)
     freq_model_dense = np.logspace(np.log10(f_min_exp), np.log10(f_max_exp), 500)
     omega_model = 2.0 * np.pi * freq_model_dense
-    
-    # Start Total Model with unified R∞ and inductance L
-    Z_total = np.full_like(omega_model, R_inf_start, dtype=complex)
-    if drt_result.L > 0:
-        # Note: data.im_z stores -Im(Z), so inductive reactance +j*omega*L gives negative -Im(Z)
-        Z_total += 1j * omega_model * drt_result.L
-    
-    # Store cumulative resistance for plotting individual process arcs
-    cumulative_R = R_inf_start
-    rc_curves = []
-    
+
     style = get_plot_style()
     cmap = plt.get_cmap(style["cmap"])
-    colors = cmap(np.linspace(0, 1, max(len(deconv_result.peaks), 1)))
-    color_map = {peak.id: colors[i] for i, peak in enumerate(deconv_result.peaks)}
-    
-    # Add each distributed process
-    for peak in peaks_sorted:
-        R_i = peak.area
-        tau_i = peak.center
-        f_char = peak.get_characteristic_frequency()
-        
-        # 1. Contribution to Total Model on experimental frequency range
-        Z_i_total = calc_gaussian_process_impedance(omega_model, peak)
-        Z_total += Z_i_total
-        
-        # 2. Individual depressed arc on a wide frequency grid around f_char so the arc closes cleanly on real axis
-        span_decades = max(4.0, 5.0 * peak.sigma_log + 2.5)
-        f_arc = np.logspace(np.log10(f_char) - span_decades, np.log10(f_char) + span_decades, 300)
-        omega_arc = 2.0 * np.pi * f_arc
-        Z_i_arc = calc_gaussian_process_impedance(omega_arc, peak)
-        
-        cumulative_R_prev = cumulative_R
-        cumulative_R += R_i
-        
-        Z_individual = cumulative_R_prev + Z_i_arc
-        rc_curves.append({
-            'id': peak.id,
-            'R': R_i,
-            'tau': tau_i,
-            'f_char': f_char,
-            'Z': Z_individual,
-            'start_R': cumulative_R_prev,
-            'end_R': cumulative_R
-        })
-    
-    # Calculate total model impedance (Re(Z) and -Im(Z))
+    rc_curves = []
+
+    if refined_rq is not None:
+        # --- Mode A: CNLS-refined exact ZARC model ---
+        R_inf_start = refined_rq['R_inf']
+        L_val = refined_rq['L']
+        procs = refined_rq['processes']
+        colors = cmap(np.linspace(0, 1, max(len(procs), 1)))
+        color_map = {p['id']: colors[i] for i, p in enumerate(procs)}
+
+        Z_total = np.full_like(omega_model, R_inf_start, dtype=complex)
+        Z_total_exp = np.full_like(omega_exp, R_inf_start, dtype=complex)
+        if L_val > 0:
+            Z_total += 1j * omega_model * L_val
+            Z_total_exp += 1j * omega_exp * L_val
+
+        cumulative_R = R_inf_start
+        for p in procs:
+            R_i, Q_i, alpha_i, f_char = p['R_i'], p['Q_i'], p['alpha_i'], p['f_i']
+            Z_i_dense = R_i / (1.0 + ((1j * omega_model) ** alpha_i) * R_i * Q_i)
+            Z_i_exp = R_i / (1.0 + ((1j * omega_exp) ** alpha_i) * R_i * Q_i)
+            Z_total += Z_i_dense
+            Z_total_exp += Z_i_exp
+
+            f_arc = np.logspace(np.log10(max(f_char, 1e-12)) - 5.0, np.log10(max(f_char, 1e-12)) + 5.0, 300)
+            w_arc = 2.0 * np.pi * f_arc
+            Z_i_arc = R_i / (1.0 + ((1j * w_arc) ** alpha_i) * R_i * Q_i)
+
+            cumulative_R_prev = cumulative_R
+            cumulative_R += R_i
+            rc_curves.append({
+                'id': p['id'],
+                'R': R_i,
+                'Z': cumulative_R_prev + Z_i_arc,
+                'start_R': cumulative_R_prev,
+                'end_R': cumulative_R
+            })
+        total_R = cumulative_R
+        model_label = 'Total Model (CNLS Refined)'
+    else:
+        # --- Mode B: Direct DRT Gaussian quadrature ---
+        R_inf_start = drt_result.R_inf
+        for i in range(len(im_exp_sorted) - 1):
+            if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
+                t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
+                R_inf_start = float(re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i]))
+                break
+        L_val = drt_result.L
+        peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
+        colors = cmap(np.linspace(0, 1, max(len(peaks_sorted), 1)))
+        color_map = {peak.id: colors[i] for i, peak in enumerate(peaks_sorted)}
+
+        def calc_gaussian_process_impedance(omega_arr: np.ndarray, peak: GaussianPeak) -> np.ndarray:
+            sigma = max(float(peak.sigma_log), 1e-6)
+            center_log = float(peak.center_log)
+            if sigma < 1e-4:
+                return peak.area / (1.0 + 1j * omega_arr * peak.center)
+            u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
+            tau_sub = 10.0 ** u_grid
+            gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
+            profile_area = np.trapezoid(gauss_profile, u_grid)
+            g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
+            denom = 1.0 + 1j * np.outer(omega_arr, tau_sub)
+            return np.trapezoid(g_weights[np.newaxis, :] / denom, u_grid, axis=1)
+
+        Z_total = np.full_like(omega_model, R_inf_start, dtype=complex)
+        Z_total_exp = np.full_like(omega_exp, R_inf_start, dtype=complex)
+        if L_val > 0:
+            Z_total += 1j * omega_model * L_val
+            Z_total_exp += 1j * omega_exp * L_val
+
+        cumulative_R = R_inf_start
+        for peak in peaks_sorted:
+            R_i = peak.area
+            f_char = peak.get_characteristic_frequency()
+            Z_total += calc_gaussian_process_impedance(omega_model, peak)
+            Z_total_exp += calc_gaussian_process_impedance(omega_exp, peak)
+
+            span_decades = max(4.0, 5.0 * peak.sigma_log + 2.5)
+            f_arc = np.logspace(np.log10(f_char) - span_decades, np.log10(f_char) + span_decades, 300)
+            Z_i_arc = calc_gaussian_process_impedance(2.0 * np.pi * f_arc, peak)
+
+            cumulative_R_prev = cumulative_R
+            cumulative_R += R_i
+            rc_curves.append({
+                'id': peak.id,
+                'R': R_i,
+                'Z': cumulative_R_prev + Z_i_arc,
+                'start_R': cumulative_R_prev,
+                'end_R': cumulative_R
+            })
+        total_R = cumulative_R
+        model_label = 'Total Model (DRT)'
+
     re_model = np.real(Z_total)
-    im_model = -np.imag(Z_total)  # positive = capacitive (above x-axis), negative = inductive (below x-axis)
-    
-    # Plot total model
-    ax.plot(re_model, im_model, 'r--', linewidth=1.6,
-            label='Total Model', zorder=3)
-    
-    # Plot individual distributed process curves (depressed semicircles)
+    im_model = -np.imag(Z_total)
+
+    ax.plot(re_model, im_model, 'r--', linewidth=1.6, label=model_label, zorder=3)
+
     for curve in rc_curves:
         color = color_map[curve['id']]
-        re_curve = np.real(curve['Z'])
-        im_curve = -np.imag(curve['Z'])
-        ax.plot(re_curve, im_curve, '-', linewidth=1.3, color=color,
-               label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω',
-               zorder=2)
-        
-        # Mark start and end points of each process on real axis
+        ax.plot(np.real(curve['Z']), -np.imag(curve['Z']), '-', linewidth=1.3, color=color,
+                label=f'Process {curve["id"]}: R={curve["R"]:.3e} Ω', zorder=2)
         ax.plot(curve['start_R'], 0, 's', color=color, markersize=4,
-               markeredgecolor='black', markeredgewidth=0.5, zorder=4)
+                markeredgecolor='black', markeredgewidth=0.5, zorder=4)
         ax.plot(curve['end_R'], 0, 'o', color=color, markersize=4,
-               markeredgecolor='black', markeredgewidth=0.5, zorder=4)
-    
-    # Mark unified R∞ point (now strictly coincides with the start square of Process 1)
+                markeredgecolor='black', markeredgewidth=0.5, zorder=4)
+
     ax.plot(R_inf_start, 0, '^', color='red', markersize=6,
-           markeredgecolor='black', markeredgewidth=0.8,
-           label=f'R∞ = {R_inf_start:.4f} Ω', zorder=5)
-    
-    # Add inductance annotation if present
-    if drt_result.L > 0:
-        high_freq_mask = freq_exp_sorted > 0.1 * np.max(freq_exp_sorted)
-        if np.any(high_freq_mask):
-            inductive_mask = im_exp_sorted < 0
-            if np.any(inductive_mask):
-                most_negative_idx = np.argmin(im_exp_sorted)
-                ax.annotate(f'L = {drt_result.L:.3e} H',
-                           xy=(re_exp_sorted[most_negative_idx], im_exp_sorted[most_negative_idx]),
-                           xytext=(re_exp_sorted[most_negative_idx] * 0.95, 
-                                  im_exp_sorted[most_negative_idx] * 1.5),
-                           fontsize=7,
-                           bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow', alpha=0.8),
-                           arrowprops=dict(arrowstyle='->', color='gray', linewidth=0.5))
-    
-    # Mark final total resistance
-    if deconv_result is not None and deconv_result.peaks:
-        sum_peak_areas = sum([p.area for p in deconv_result.peaks])
-        total_R = R_inf_start + sum_peak_areas
-    else:
-        total_R = R_inf_start + drt_result.R_pol
+            markeredgecolor='black', markeredgewidth=0.8,
+            label=f'R∞ = {R_inf_start:.4f} Ω', zorder=5)
     ax.plot(total_R, 0, 'd', color='darkred', markersize=6,
-           markeredgecolor='black', markeredgewidth=0.8,
-           label=f'Total R = {total_R:.4f} Ω', zorder=5)
-    
-    # Add horizontal line at y=0 for reference
+            markeredgecolor='black', markeredgewidth=0.8,
+            label=f'Total R = {total_R:.4f} Ω', zorder=5)
+
     ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
-    
-    # Set y-axis limits to show inductive tail as a small portion (1/5 of positive range)
+
     all_re = np.concatenate([re_exp_sorted, [R_inf_start, total_R]])
     x_span = np.max(all_re) - np.min(all_re)
     x_pad = x_span * 0.05 if x_span > 0 else 0.1
     ax.set_xlim(np.min(all_re) - x_pad, np.max(all_re) + x_pad)
-    
+
     positive_exp = im_exp_sorted[im_exp_sorted >= 0]
     positive_mod = im_model[im_model >= 0]
     pos_max = max(
         np.max(positive_exp) if len(positive_exp) > 0 else 0.0,
         np.max(positive_mod) if len(positive_mod) > 0 else 0.0
     )
-    
+
     if np.any(im_exp_sorted < 0) and pos_max > 0:
         negative_min = np.min(im_exp_sorted[im_exp_sorted < 0])
         y_max_data = pos_max * 1.15
@@ -4114,20 +4228,56 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
         if negative_min < y_min_data:
             y_min_data = max(negative_min * 0.8, -pos_max / 3.0)
         ax.set_ylim(y_min_data, y_max_data)
-        
-        # Add shading for inductive region (below x-axis)
         ax.fill_between([np.min(all_re) - x_pad, np.max(all_re) + x_pad], y_min_data, 0,
                         alpha=0.1, color='red', label='Inductive region', zorder=0)
     elif pos_max > 0:
         ax.set_ylim(-pos_max * 0.05, pos_max * 1.15)
-    
-    ax.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+
     ax.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
     ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), frameon=True, edgecolor='black', ncol=1)
     ax.grid(style["show_grid"], alpha=0.3, linestyle='--')
     ax.set_aspect('equal', adjustable='box')
-    
-    plt.tight_layout()
+    ax.tick_params(labelbottom=False)
+
+    # --- Residual subplot: Δ(-Im(Z)) vs Re(Z) ---
+    im_model_exp = -np.imag(Z_total_exp)
+    re_model_exp = np.real(Z_total_exp)
+    res_im = im_exp_sorted - im_model_exp
+
+    # Complex R² and RMSE (over both Re and -Im)
+    y_true_all = np.concatenate([re_exp_sorted, im_exp_sorted])
+    y_pred_all = np.concatenate([re_model_exp, im_model_exp])
+    ss_res = np.sum((y_true_all - y_pred_all) ** 2)
+    ss_tot = np.sum((y_true_all - np.mean(y_true_all)) ** 2)
+    r2_val = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    rmse_val = float(np.sqrt(np.mean((y_true_all - y_pred_all) ** 2)))
+    max_abs_res = max(float(np.max(np.abs(res_im))), 1e-9)
+
+    ax_res.axhline(0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
+    ax_res.plot(re_exp_sorted, res_im, '-', color='gray', alpha=0.5, linewidth=1.0, zorder=2)
+    sc = ax_res.scatter(
+        re_exp_sorted, res_im,
+        c=res_im, cmap='coolwarm',
+        vmin=-max_abs_res, vmax=max_abs_res,
+        s=24, edgecolors='black', linewidths=0.3, zorder=3
+    )
+
+    cbar = fig.colorbar(sc, cax=cax)
+    cbar.set_label('Δ(-Im Z) / Ω', fontsize=8, fontweight='bold')
+    cbar.ax.tick_params(labelsize=7, colors='black')
+
+    ax_res.set_xlabel("Re(Z) / Ohm", fontweight='bold')
+    ax_res.set_ylabel("Residuals\nΔ(-Im Z) / Ω", fontweight='bold', fontsize=9)
+    ax_res.set_ylim(-max_abs_res * 1.3, max_abs_res * 1.3)
+    ax_res.grid(style["show_grid"], alpha=0.3, linestyle='--')
+
+    metrics_text = f"R² = {r2_val:.5f}  |  RMSE = {rmse_val:.2e} Ω"
+    ax_res.text(
+        0.015, 0.90, metrics_text, transform=ax_res.transAxes,
+        fontsize=8, fontweight='bold', verticalalignment='top',
+        bbox=dict(boxstyle="round,pad=0.25", facecolor='white', alpha=0.85, edgecolor='gray')
+    )
+
     return fig
                                   
 # ============================================================================
@@ -4509,6 +4659,7 @@ def step2_drt_analysis():
                         st.session_state.app_state.manual_peaks = []
                         st.session_state.app_state.residuals_peaks = []
                         st.session_state.app_state.deconv_tau_range_idx = None
+                        st.session_state.app_state.refined_rq_params = None
                         
                         # Display summary
                         st.success("✅ DRT calculation complete!")
@@ -4930,6 +5081,7 @@ def step3_gaussian_deconvolution():
                             st.session_state.app_state.last_popt = deconvolver.popt
                             st.session_state.app_state.deconv_result = deconvolver.create_deconvolution_result()
                             st.session_state.app_state.deconv_calculated = True
+                            st.session_state.app_state.refined_rq_params = None
                             st.session_state.app_state.current_step = 4
                             st.success("✅ Deconvolution complete!")
                             st.rerun()
@@ -5516,13 +5668,53 @@ def step4_results():
         # Graph 2.4 - Experimental vs Sequential RQ Model
         st.markdown("**2.4 Experimental vs Sequential RQ (ZARC) Model**")
         if deconv_result is not None and drt_result is not None and data is not None:
-            fig4 = plot_sequential_rc_model(deconv_result, drt_result, data,
-                                            "Experimental vs Sequential RQ Model")
+            refined_rq = st.session_state.app_state.refined_rq_params
+
+            col_ref1, col_ref2 = st.columns([2, 1])
+            with col_ref1:
+                if st.button("🎯 Refine RQ (ZARC) Model on Experimental EIS (CNLS)",
+                             type="primary", use_container_width=True, key="btn_refine_rq"):
+                    with st.spinner("Optimizing ZARC parameters against experimental EIS..."):
+                        st.session_state.app_state.refined_rq_params = refine_rq_zarc_model(
+                            deconv_result, drt_result, data
+                        )
+                    st.rerun()
+            with col_ref2:
+                if refined_rq is not None:
+                    if st.button("🔄 Reset to DRT Model", use_container_width=True, key="btn_reset_rq"):
+                        st.session_state.app_state.refined_rq_params = None
+                        st.rerun()
+
+            if refined_rq is not None:
+                st.success(
+                    f"✅ CNLS Refinement active | R∞ = {refined_rq['R_inf']:.4f} Ω | "
+                    f"R² = {refined_rq['r2']:.5f} | RMSE = {refined_rq['rmse']:.2e} Ω"
+                )
+
+            fig4 = plot_sequential_rc_model(
+                deconv_result, drt_result, data,
+                "Experimental vs Sequential RQ Model",
+                refined_rq=refined_rq
+            )
             render_plot_with_download(fig4, "sequential_rq_model", key_prefix="tab5")
-            
+
             # Display R_i, Q_i, alpha_i, C_i, f_i table directly under Graph 2.4
-            if deconv_result.peaks:
-                st.markdown("**Equivalent RQ (ZARC) Parameters per Process:**")
+            if refined_rq is not None:
+                st.markdown("**Equivalent RQ (ZARC) Parameters per Process (CNLS Refined):**")
+                rq_rows = [
+                    {
+                        'Process': f"Process {p['id']}",
+                        'R_i (Ω)': f"{p['R_i']:.4e}",
+                        'Q_i (F·s^(α-1))': f"{p['Q_i']:.4e}",
+                        'α_i': f"{p['alpha_i']:.4f}",
+                        'C_i (F)': f"{p['C_i']:.4e}",
+                        'f_i (Hz)': f"{p['f_i']:.4e}"
+                    }
+                    for p in refined_rq['processes']
+                ]
+                st.dataframe(pd.DataFrame(rq_rows), use_container_width=True, hide_index=True)
+            elif deconv_result.peaks:
+                st.markdown("**Equivalent RQ (ZARC) Parameters per Process (from DRT):**")
                 rq_rows = []
                 for peak in sorted(deconv_result.peaks, key=lambda p: p.id):
                     rq = calculate_rq_parameters(peak)
@@ -5534,8 +5726,7 @@ def step4_results():
                         'C_i (F)': f"{rq['C_i']:.4e}",
                         'f_i (Hz)': f"{rq['f_i']:.4e}"
                     })
-                rq_df = pd.DataFrame(rq_rows)
-                st.dataframe(rq_df, use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rq_rows), use_container_width=True, hide_index=True)
         else:
             st.warning("Insufficient data for model comparison")
         
@@ -5548,6 +5739,7 @@ def step4_results():
 - **2.3** - Bar chart showing resistance contribution (Area in Ω) and percentage for each process
 - **2.4** - Comparison of experimental data with sequential RQ (ZARC) model (each depressed semicircle represents one relaxation process)
         """)
+        
         
     with tab6:
         st.subheader("Export Results")
@@ -5706,7 +5898,7 @@ def step4_results():
 
             # --- Export 2.4 Experimental vs Sequential RQ (ZARC) Model ---
             if data is not None and drt_result is not None:
-                st.markdown("**Export 2.4 Sequential RQ (ZARC) Model** *(Experimental + Total Model + Processes)*")
+                st.markdown("**Export 2.4 Sequential RQ (ZARC) Model** *(Experimental + Total Model + Residuals + Processes)*")
                 
                 sort_idx_exp = np.argsort(data.freq)
                 freq_exp_s = data.freq[sort_idx_exp]
@@ -5714,45 +5906,66 @@ def step4_results():
                 im_exp_s = data.im_z[sort_idx_exp]
                 omega_exp_s = 2.0 * np.pi * freq_exp_s
                 
-                R_inf_start = drt_result.R_inf
-                for i in range(len(im_exp_s) - 1):
-                    if im_exp_s[i] >= 0 and im_exp_s[i + 1] < 0:
-                        t = -im_exp_s[i] / (im_exp_s[i + 1] - im_exp_s[i])
-                        R_inf_start = float(re_exp_s[i] + t * (re_exp_s[i + 1] - re_exp_s[i]))
-                        break
-                
-                Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
-                if drt_result.L > 0:
-                    Z_total_exp += 1j * omega_exp_s * drt_result.L
-                
+                refined_rq = st.session_state.app_state.refined_rq_params
                 process_cols = {}
-                cumulative_R = R_inf_start
-                for peak in peaks_sorted_exp:
-                    sigma = max(float(peak.sigma_log), 1e-6)
-                    center_log = float(peak.center_log)
-                    if sigma < 1e-4:
-                        Z_i = peak.area / (1.0 + 1j * omega_exp_s * peak.center)
-                    else:
-                        u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
-                        tau_sub = 10.0 ** u_grid
-                        gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
-                        profile_area = np.trapezoid(gauss_profile, u_grid)
-                        g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
-                        denom = 1.0 + 1j * np.outer(omega_exp_s, tau_sub)
-                        Z_i = np.trapezoid(g_weights[np.newaxis, :] / denom, u_grid, axis=1)
+                
+                if refined_rq is not None:
+                    R_inf_start = refined_rq['R_inf']
+                    Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
+                    if refined_rq['L'] > 0:
+                        Z_total_exp += 1j * omega_exp_s * refined_rq['L']
                     
-                    Z_total_exp += Z_i
-                    Z_indiv = cumulative_R + Z_i
-                    process_cols[f'Re_Process_{peak.id}_Ohm'] = np.real(Z_indiv)
-                    process_cols[f'NegIm_Process_{peak.id}_Ohm'] = -np.imag(Z_indiv)
-                    cumulative_R += peak.area
+                    cumulative_R = R_inf_start
+                    for p in refined_rq['processes']:
+                        Z_i = p['R_i'] / (1.0 + ((1j * omega_exp_s) ** p['alpha_i']) * p['R_i'] * p['Q_i'])
+                        Z_total_exp += Z_i
+                        Z_indiv = cumulative_R + Z_i
+                        process_cols[f"Re_Process_{p['id']}_Ohm"] = np.real(Z_indiv)
+                        process_cols[f"NegIm_Process_{p['id']}_Ohm"] = -np.imag(Z_indiv)
+                        cumulative_R += p['R_i']
+                else:
+                    R_inf_start = drt_result.R_inf
+                    for i in range(len(im_exp_s) - 1):
+                        if im_exp_s[i] >= 0 and im_exp_s[i + 1] < 0:
+                            t = -im_exp_s[i] / (im_exp_s[i + 1] - im_exp_s[i])
+                            R_inf_start = float(re_exp_s[i] + t * (re_exp_s[i + 1] - re_exp_s[i]))
+                            break
+                    
+                    Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
+                    if drt_result.L > 0:
+                        Z_total_exp += 1j * omega_exp_s * drt_result.L
+                    
+                    cumulative_R = R_inf_start
+                    for peak in peaks_sorted_exp:
+                        sigma = max(float(peak.sigma_log), 1e-6)
+                        center_log = float(peak.center_log)
+                        if sigma < 1e-4:
+                            Z_i = peak.area / (1.0 + 1j * omega_exp_s * peak.center)
+                        else:
+                            u_grid = np.linspace(center_log - 5.0 * sigma, center_log + 5.0 * sigma, 401)
+                            tau_sub = 10.0 ** u_grid
+                            gauss_profile = np.exp(-0.5 * ((u_grid - center_log) / sigma) ** 2)
+                            profile_area = np.trapezoid(gauss_profile, u_grid)
+                            g_weights = (peak.area / profile_area) * gauss_profile if profile_area > 0 else np.zeros_like(u_grid)
+                            denom = 1.0 + 1j * np.outer(omega_exp_s, tau_sub)
+                            Z_i = np.trapezoid(g_weights[np.newaxis, :] / denom, u_grid, axis=1)
+                        
+                        Z_total_exp += Z_i
+                        Z_indiv = cumulative_R + Z_i
+                        process_cols[f'Re_Process_{peak.id}_Ohm'] = np.real(Z_indiv)
+                        process_cols[f'NegIm_Process_{peak.id}_Ohm'] = -np.imag(Z_indiv)
+                        cumulative_R += peak.area
+                
+                re_total_mod = np.real(Z_total_exp)
+                im_total_mod = -np.imag(Z_total_exp)
                 
                 rq_export_dict = {
                     'Frequency_Hz': freq_exp_s,
                     'Re_Exp_Ohm': re_exp_s,
                     'NegIm_Exp_Ohm': im_exp_s,
-                    'Re_Total_Model_Ohm': np.real(Z_total_exp),
-                    'NegIm_Total_Model_Ohm': -np.imag(Z_total_exp)
+                    'Re_Total_Model_Ohm': re_total_mod,
+                    'NegIm_Total_Model_Ohm': im_total_mod,
+                    'Residuals_NegIm_Ohm': im_exp_s - im_total_mod
                 }
                 rq_export_dict.update(process_cols)
                 
@@ -5770,6 +5983,7 @@ def step4_results():
             
             if st.button("📄 Generate Detailed Report", use_container_width=True):
                 max_amp = max([p.amplitude for p in deconv_result.peaks]) if deconv_result.peaks else 1.0
+                refined_rq = st.session_state.app_state.refined_rq_params
                 
                 report = f"""GAUSSIAN DECONVOLUTION REPORT
 {"="*80}
@@ -5816,7 +6030,7 @@ Parameters: {', '.join([f'{p:.4e}' for p in deconv_result.baseline_params])}
 
 """
                 
-                report += f"""PEAK PARAMETERS:
+                report += f"""PEAK PARAMETERS (DRT DECONVOLUTION):
 {"-"*100}
 ID    Center (s)      Fmax (Hz)       C (F)           Area (Ω·s)     Fraction(%)    
 {"-"*100}"""
@@ -5824,6 +6038,17 @@ ID    Center (s)      Fmax (Hz)       C (F)           Area (Ω·s)     Fraction(
                 for p in deconv_result.peaks:
                     char = calculate_peak_characteristics(p)
                     report += f"\n{p.id:<4} {p.center:.4e}   {char['fmax_hz']:.4e}   {char['c_farad']:.4e}   {p.area:.4e}   {p.fraction_percent:.2f}"
+                
+                if refined_rq is not None:
+                    report += f"""
+
+CNLS REFINED RQ (ZARC) MODEL PARAMETERS:
+{"-"*100}
+R∞: {refined_rq['R_inf']:.6f} Ω | L: {refined_rq['L']:.6e} H | R²: {refined_rq['r2']:.6f} | RMSE: {refined_rq['rmse']:.4e} Ω
+ID    R_i (Ω)         Q_i (F·s^(α-1)) α_i        C_i (F)         f_i (Hz)
+{"-"*100}"""
+                    for p in refined_rq['processes']:
+                        report += f"\n{p['id']:<4} {p['R_i']:.4e}   {p['Q_i']:.4e}      {p['alpha_i']:.4f}     {p['C_i']:.4e}   {p['f_i']:.4e}"
                 
                 report += f"""
 
