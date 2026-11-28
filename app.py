@@ -3591,10 +3591,11 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
                          drt_result: DRTResult,
                          data: ImpedanceData) -> Dict[str, Any]:
     """
-    CNLS refinement of the sequential RQ (ZARC) model with FIXED R_inf and R_i:
-        Z(w) = R_inf + i*w*L + sum_k [ R_k / (1 + (i*w*tau_k)^alpha_k) ]
-    Only semicircle depression (alpha_k), slight time-constant shift (tau_k),
-    and inductance (L, if present) are optimized.
+    CNLS refinement of the sequential RQ (ZARC) model with FIXED R_inf and R_i
+    on the capacitive region (-Im(Z) >= 0):
+        Z(w) = R_inf + sum_k [ R_k / (1 + (i*w*tau_k)^alpha_k) ]
+    Only semicircle depression (alpha_k) and slight time-constant shift (tau_k)
+    are optimized so that the total curve strictly starts at R_inf and matches Process 1.
     """
     sort_idx = np.argsort(data.freq)
     freq_exp = data.freq[sort_idx]
@@ -3610,21 +3611,21 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
             R_inf_fixed = float(re_exp[i] + t * (re_exp[i + 1] - re_exp[i]))
             break
 
-    has_L = (drt_result.L > 0) or np.any(im_exp < 0)
-    L_init = max(float(drt_result.L), 1e-12) if has_L else 0.0
+    # Fit strictly on capacitive points (-Im(Z) >= 0) so inductive tail does not shift the curve
+    cap_mask = im_exp >= 0
+    if np.sum(cap_mask) >= 5:
+        omega_fit = omega[cap_mask]
+        re_fit = re_exp[cap_mask]
+        im_fit = im_exp[cap_mask]
+    else:
+        omega_fit, re_fit, im_fit = omega, re_exp, im_exp
 
     peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
     n_proc = len(peaks_sorted)
     fixed_R = [max(float(peak.area), 1e-12) for peak in peaks_sorted]
 
-    # Parameter vector: [(L if has_L), log10(tau_1), alpha_1, log10(tau_2), alpha_2, ...]
+    # Parameter vector: [log10(tau_1), alpha_1, log10(tau_2), alpha_2, ...]
     p0, lb, ub = [], [], []
-
-    if has_L:
-        p0.append(L_init)
-        lb.append(0.0)
-        ub.append(max(L_init * 100.0, 1e-2))
-
     for peak in peaks_sorted:
         rq = calculate_rq_parameters(peak)
         log_tau_init = float(np.log10(max(peak.center, 1e-15)))
@@ -3635,27 +3636,18 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
         ub.extend([log_tau_init + 0.5, 1.0])
 
     def eval_z_model(params, w_arr):
-        idx = 0
-        l_val = params[idx] if has_L else 0.0
-        if has_L:
-            idx += 1
-
         Z = np.full_like(w_arr, R_inf_fixed, dtype=complex)
-        if l_val > 0:
-            Z += 1j * w_arr * l_val
-
         for k in range(n_proc):
             R_k = fixed_R[k]
-            tau_k = 10.0 ** params[idx]
-            alpha_k = params[idx + 1]
-            idx += 2
+            tau_k = 10.0 ** params[2 * k]
+            alpha_k = params[2 * k + 1]
             Z += R_k / (1.0 + (1j * w_arr * tau_k) ** alpha_k)
         return Z
 
     def residuals_func(params):
-        Z_mod = eval_z_model(params, omega)
-        res_re = re_exp - np.real(Z_mod)
-        res_im = im_exp - (-np.imag(Z_mod))
+        Z_mod = eval_z_model(params, omega_fit)
+        res_re = re_fit - np.real(Z_mod)
+        res_im = im_fit - (-np.imag(Z_mod))
         return np.concatenate([res_re, res_im])
 
     res = least_squares(
@@ -3670,17 +3662,11 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
     )
 
     opt = res.x
-    idx = 0
-    l_opt = float(opt[idx]) if has_L else 0.0
-    if has_L:
-        idx += 1
-
     processes = []
     for k, peak in enumerate(peaks_sorted):
         R_k = fixed_R[k]
-        tau_k = float(10.0 ** opt[idx])
-        alpha_k = float(opt[idx + 1])
-        idx += 2
+        tau_k = float(10.0 ** opt[2 * k])
+        alpha_k = float(opt[2 * k + 1])
 
         Q_k = float((tau_k ** alpha_k) / R_k)
         C_k = float(tau_k / R_k)
@@ -3700,9 +3686,9 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
     for new_id, p in enumerate(processes, start=1):
         p['id'] = new_id
 
-    # Fit quality metrics
-    Z_opt = eval_z_model(opt, omega)
-    y_true = np.concatenate([re_exp, im_exp])
+    # Fit quality metrics on capacitive region
+    Z_opt = eval_z_model(opt, omega_fit)
+    y_true = np.concatenate([re_fit, im_fit])
     y_pred = np.concatenate([np.real(Z_opt), -np.imag(Z_opt)])
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
@@ -3711,7 +3697,7 @@ def refine_rq_zarc_model(deconv_result: DeconvolutionResult,
 
     return {
         'R_inf': R_inf_fixed,
-        'L': l_opt,
+        'L': 0.0,
         'processes': processes,
         'r2': r2,
         'rmse': rmse,
