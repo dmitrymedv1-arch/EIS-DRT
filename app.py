@@ -4243,20 +4243,26 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     # Dense frequency grid over experimental range for smooth Total Model curve
     f_min_exp = max(np.min(freq_exp_sorted), 1e-12)
     f_max_exp = np.max(freq_exp_sorted)
-    if drt_result.L == 0 and peaks_sorted:
-        # Без индуктивности расширяем верхнюю границу, чтобы Total Model доходила ровно до R∞
-        f_max_peak = max(p.get_characteristic_frequency() for p in peaks_sorted)
-        f_max_model = max(f_max_exp, f_max_peak * 1e3)
+    if peaks_sorted:
+        f_chars = [p.get_characteristic_frequency() for p in peaks_sorted]
+        max_sigma = max(float(p.sigma_log) for p in peaks_sorted)
+        span_decades = max(4.0, 5.0 * max_sigma + 2.5)
+        f_min_model = min(f_min_exp, 10.0 ** (np.log10(min(f_chars)) - span_decades))
+        # Если есть реальный индуктивный хвост ниже оси X, не уходим выше f_max_exp (иначе ωL улетит вниз)
+        if drt_result.L > 0 and np.any(im_exp_sorted < 0):
+            f_max_model = f_max_exp
+        else:
+            f_max_model = max(f_max_exp, 10.0 ** (np.log10(max(f_chars)) + span_decades))
     else:
-        # При наличии индуктивности оставляем f_max_exp, чтобы индуктивный хвост совпадал с экспериментом
-        f_max_model = f_max_exp
-    freq_model_dense = np.logspace(np.log10(f_min_exp), np.log10(f_max_model), 500)
+        f_min_model, f_max_model = f_min_exp, f_max_exp
+
+    freq_model_dense = np.logspace(np.log10(f_min_model), np.log10(f_max_model), 800)
     omega_model = 2.0 * np.pi * freq_model_dense
     
     # Start Total Model with unified R∞ and inductance L
     Z_total = np.full_like(omega_model, R_inf_start, dtype=complex)
-    if drt_result.L > 0:
-        # Note: data.im_z stores -Im(Z), so inductive reactance +j*omega*L gives negative -Im(Z)
+    if drt_result.L > 0 and np.any(im_exp_sorted < 0):
+        # Добавляем индуктивность только если в спектре реально присутствует индуктивный хвост
         Z_total += 1j * omega_model * drt_result.L
     
     # Store cumulative resistance for plotting individual process arcs
