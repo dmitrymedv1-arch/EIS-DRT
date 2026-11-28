@@ -4211,15 +4211,7 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=3, linewidth=1,
             color='#1f77b4', alpha=0.7, label='Experimental', zorder=1)
     
-    # Determine unified R_inf starting point:
-    # If inductive behavior causes -Im(Z) to cross zero, find exact zero-crossing for alignment;
-    # otherwise use drt_result.R_inf
-    R_inf_start = drt_result.R_inf
-    for i in range(len(im_exp_sorted) - 1):
-        if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
-            t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
-            R_inf_start = float(re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i]))
-            break
+    R_inf_start = float(drt_result.R_inf)
     
     # Get peaks sorted by characteristic frequency (high to low) - already sorted by ID
     peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
@@ -4251,7 +4243,14 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     # Dense frequency grid over experimental range for smooth Total Model curve
     f_min_exp = max(np.min(freq_exp_sorted), 1e-12)
     f_max_exp = np.max(freq_exp_sorted)
-    freq_model_dense = np.logspace(np.log10(f_min_exp), np.log10(f_max_exp), 500)
+    if drt_result.L == 0 and peaks_sorted:
+        # Без индуктивности расширяем верхнюю границу, чтобы Total Model доходила ровно до R∞
+        f_max_peak = max(p.get_characteristic_frequency() for p in peaks_sorted)
+        f_max_model = max(f_max_exp, f_max_peak * 1e3)
+    else:
+        # При наличии индуктивности оставляем f_max_exp, чтобы индуктивный хвост совпадал с экспериментом
+        f_max_model = f_max_exp
+    freq_model_dense = np.logspace(np.log10(f_min_exp), np.log10(f_max_model), 500)
     omega_model = 2.0 * np.pi * freq_model_dense
     
     # Start Total Model with unified R∞ and inductance L
@@ -6004,12 +6003,7 @@ def step4_results():
                 im_exp_s = data.im_z[sort_idx_exp]
                 omega_exp_s = 2.0 * np.pi * freq_exp_s
                 
-                R_inf_start = drt_result.R_inf
-                for i in range(len(im_exp_s) - 1):
-                    if im_exp_s[i] >= 0 and im_exp_s[i + 1] < 0:
-                        t = -im_exp_s[i] / (im_exp_s[i + 1] - im_exp_s[i])
-                        R_inf_start = float(re_exp_s[i] + t * (re_exp_s[i + 1] - re_exp_s[i]))
-                        break
+                R_inf_start = float(drt_result.R_inf)
                 
                 Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
                 if drt_result.L > 0:
