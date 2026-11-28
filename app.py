@@ -166,13 +166,29 @@ def apply_publication_plot_style(style: Dict[str, Any]):
     })
 
 
+def _format_log_tick(val, pos):
+    """Format log-scale ticks with Unicode superscripts (no mathtext parser needed)."""
+    if val <= 0:
+        return ""
+    exp = np.log10(val)
+    if abs(exp - round(exp)) < 1e-6:
+        sup_map = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+        return f"10{str(int(round(exp))).translate(sup_map)}"
+    return ""
+
+
 def render_plot_with_download(fig: plt.Figure, filename_base: str, key_prefix: str = ""):
     """Display matplotlib figure with PNG (high-DPI) and SVG vector download buttons."""
     style = get_plot_style()
     dpi = style["dpi"]
-    if not style["show_grid"]:
-        for axis in fig.axes:
+    log_formatter = plt.FuncFormatter(_format_log_tick)
+    for axis in fig.axes:
+        if not style["show_grid"]:
             axis.grid(False, which="both")
+        if axis.get_xscale() == "log":
+            axis.xaxis.set_major_formatter(log_formatter)
+        if axis.get_yscale() == "log":
+            axis.yaxis.set_major_formatter(log_formatter)
     st.pyplot(fig)
 
     buf_png = io.BytesIO()
