@@ -4226,11 +4226,22 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     # --- Residual subplot: Δ(-Im(Z)) vs Re(Z) ---
     im_model_exp = -np.imag(Z_total_exp)
     re_model_exp = np.real(Z_total_exp)
-    res_im = im_exp_sorted - im_model_exp
+
+    # When L = 0 (e.g. CNLS refinement on capacitive region), evaluate residuals on -Im(Z) >= 0
+    if L_val == 0 and np.any(im_exp_sorted >= 0):
+        res_mask = im_exp_sorted >= 0
+    else:
+        res_mask = np.ones_like(im_exp_sorted, dtype=bool)
+
+    re_res_plot = re_exp_sorted[res_mask]
+    im_exp_eval = im_exp_sorted[res_mask]
+    re_mod_eval = re_model_exp[res_mask]
+    im_mod_eval = im_model_exp[res_mask]
+    res_im = im_exp_eval - im_mod_eval
 
     # Complex R² and RMSE (over both Re and -Im)
-    y_true_all = np.concatenate([re_exp_sorted, im_exp_sorted])
-    y_pred_all = np.concatenate([re_model_exp, im_model_exp])
+    y_true_all = np.concatenate([re_res_plot, im_exp_eval])
+    y_pred_all = np.concatenate([re_mod_eval, im_mod_eval])
     ss_res = np.sum((y_true_all - y_pred_all) ** 2)
     ss_tot = np.sum((y_true_all - np.mean(y_true_all)) ** 2)
     r2_val = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
@@ -4238,9 +4249,9 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     max_abs_res = max(float(np.max(np.abs(res_im))), 1e-9)
 
     ax_res.axhline(0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
-    ax_res.plot(re_exp_sorted, res_im, '-', color='gray', alpha=0.5, linewidth=1.0, zorder=2)
+    ax_res.plot(re_res_plot, res_im, '-', color='gray', alpha=0.5, linewidth=1.0, zorder=2)
     sc = ax_res.scatter(
-        re_exp_sorted, res_im,
+        re_res_plot, res_im,
         c=res_im, cmap='coolwarm',
         vmin=-max_abs_res, vmax=max_abs_res,
         s=24, edgecolors='black', linewidths=0.3, zorder=3
