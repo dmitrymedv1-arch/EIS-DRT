@@ -576,19 +576,16 @@ class AppState:
     # Current step
     current_step: int = 1
     
+    # Step 1: Data loading
     impedance_data: Optional[ImpedanceData] = None
     data_loaded: bool = False
     
-    # Step 1: Validation
-    lin_kk_result: Optional[Dict[str, Any]] = None
-
     # Step 2: DRT calculation
     drt_result: Optional[DRTResult] = None
     drt_solver: Optional[Any] = None  # Added to store solver for reconstruction
     drt_method: str = "Tikhonov Regularization (NNLS)"
     drt_parameters: Dict[str, Any] = field(default_factory=dict)
     drt_calculated: bool = False
-    rlf_poles: Optional[List[Dict[str, float]]] = None
     
     # Step 3: Gaussian deconvolution
     deconvolver: Optional[Any] = None
@@ -815,58 +812,38 @@ def manual_data_entry() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Opt
     return None, None, None
 
 
-def lin_kk_test(freq: np.ndarray, re_z: np.ndarray, im_z: np.ndarray, c_threshold: float = 0.85) -> Dict[str, Any]:
+def kramers_kronig_hilbert_transform(freq: np.ndarray, re_z: np.ndarray, im_z: np.ndarray) -> Tuple[bool, float, np.ndarray, np.ndarray]:
     """
-    Линейный тест Крамерса–Кронига (Lin-KK, Schönleber et al. 2014).
-    im_z подаётся в конвенции приложения (-Im(Z) > 0 для ёмкостной дуги).
+    Perform Kramers-Kronig validation using Hilbert transform.
+    This is the proper KK test as described in literature.
     """
-    omega = 2.0 * np.pi * freq
-    N = len(freq)
-    Z_exp_re = re_z
-    Z_exp_im = -im_z  # истинная Im(Z)
-    Z_mag = np.sqrt(Z_exp_re**2 + Z_exp_im**2) + 1e-12
-    weights = 1.0 / Z_mag
-
-    tau_min = 1.0 / np.max(omega)
-    tau_max = 1.0 / np.min(omega)
-
-    best_res = None
-    max_M = min(max(N - 3, 5), 60)
-
-    for M in range(5, max_M + 1):
-        tau_k = np.logspace(np.log10(tau_min), np.log10(tau_max), M)
-        # Матрица базиса: [R_1..R_M, R_0, L, 1/C]
-        denom = 1.0 + np.outer(omega, tau_k) ** 2
-        A_re = np.column_stack([1.0 / denom, np.ones(N), np.zeros(N), np.zeros(N)])
-        A_im = np.column_stack([-np.outer(omega, tau_k) / denom, np.zeros(N), omega, -1.0 / (omega + 1e-12)])
-
-        A = np.vstack([A_re * weights[:, None], A_im * weights[:, None]])
-        b = np.concatenate([Z_exp_re * weights, Z_exp_im * weights])
-
-        params, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-        R_k = params[:M]
-
-        sum_pos = np.sum(np.abs(R_k[R_k >= 0]))
-        sum_neg = np.sum(np.abs(R_k[R_k < 0]))
-        mu = 1.0 - (sum_neg / sum_pos) if sum_pos > 1e-15 else 0.0
-
-        Z_fit_re = A_re @ params
-        Z_fit_im = A_im @ params
-        res_re = (Z_exp_re - Z_fit_re) / Z_mag * 100.0
-        res_im = (Z_exp_im - Z_fit_im) / Z_mag * 100.0
-        max_res = float(max(np.max(np.abs(res_re)), np.max(np.abs(res_im))))
-        rms_res = float(np.sqrt(0.5 * (np.mean(res_re**2) + np.mean(res_im**2))))
-
-        best_res = {
-            "M": M, "mu": float(mu),
-            "res_re": res_re, "res_im": res_im,
-            "max_residual_pct": max_res, "rms_residual_pct": rms_res,
-            "is_valid": max_res < 1.0
-        }
-        if mu < c_threshold:
-            break
-
-    return best_res
+    try:
+        omega = 2 * np.pi * freq
+        log_omega = np.log(omega)
+        
+        # Interpolate data for Hilbert transform
+        from scipy.interpolate import interp1d
+        interp_omega = np.logspace(np.log10(omega[0]), np.log10(omega[-1]), 500)
+        interp_re = interp1d(omega, re_z, kind='cubic', fill_value='extrapolate')(interp_omega)
+        interp_im = interp1d(omega, im_z, kind='cubic', fill_value='extrapolate')(interp_omega)
+        
+        # Calculate Hilbert transform of imaginary part to predict real part
+        from scipy.signal import hilbert
+        analytic = hilbert(interp_im)
+        re_predicted = np.real(analytic)
+        
+        # Interpolate back to original frequencies
+        re_pred_original = interp1d(interp_omega, re_predicted, kind='cubic', fill_value='extrapolate')(omega)
+        
+        # Calculate residuals
+        residuals = (re_z - re_pred_original) / np.abs(re_z + 1e-10)
+        max_residual = np.max(np.abs(residuals))
+        is_valid = max_residual < 0.05
+        
+        return is_valid, max_residual, residuals, np.zeros_like(residuals)
+    except Exception as e:
+        logging.warning(f"KK Hilbert transform failed: {e}")
+        return False, 1.0, None, None
 
 
 # ============================================================================
@@ -973,15 +950,17 @@ class DRTCore:
         log_res = np.log(residuals + 1e-10)
         log_sol = np.log(solution_norms + 1e-10)
         
-        dx = np.gradient(log_res)
-        dy = np.gradient(log_sol)
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-
-        curvature = (dx * ddy - dy * ddx) / (dx**2 + dy**2 + 1e-12) ** 1.5
-        if len(curvature) > 2:
-            return int(np.argmax(curvature[1:-1]) + 1)
-        return int(np.argmax(curvature))
+        dlog_res = np.gradient(log_res)
+        dlog_sol = np.gradient(log_sol)
+        
+        if len(dlog_res) < 2 or len(dlog_sol) < 2:
+            return len(residuals) // 2
+        
+        curvature = np.abs(dlog_res[1:-1] * dlog_sol[1:-1]) / (dlog_res[1:-1]**2 + dlog_sol[1:-1]**2 + 1e-10)**1.5
+        
+        if len(curvature) > 0:
+            return np.argmax(curvature) + 1
+        return len(residuals) // 2
     
     def _build_kernel_matrix(self, tau_grid: np.ndarray, include_rl: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1035,10 +1014,14 @@ class DRTCore:
         """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         
+        # Build the combined kernel matrix
+        # For Real part: contribution from γ only (L has no real part)
+        # For Imag part: contribution from γ AND from L: -ωL
         omega = 2 * np.pi * self.frequencies
         
+        # Create extended matrix: [K_real; K_imag] with extra column for L
         K_base = np.vstack([K_real, K_imag])
-        L_column = np.concatenate([np.zeros(self.N), omega])
+        L_column = np.concatenate([np.zeros(self.N), -omega])
         K_extended = np.column_stack([K_base, L_column])
         
         return K_extended, K_real, K_imag
@@ -1066,7 +1049,7 @@ class DRTCore:
         
         # Reconstruct impedance
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
         
         # Calculate relative error
         Z_original = self.Z_real + 1j * self.Z_imag
@@ -1075,120 +1058,6 @@ class DRTCore:
         mean_error = np.mean(error_percent)
         
         return Z_rec_real, Z_rec_imag, mean_error
-
-    def _build_kernel_matrix_full(self, tau_grid: np.ndarray, include_L: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Полная матрица проектирования для совместного фитинга [gamma, R_inf] или [gamma, R_inf, L].
-        Целевой вектор: Z_target = [Z_real, -Z_imag].
-        """
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        K_base = np.vstack([K_real, K_imag])
-        R_col = np.concatenate([np.ones(self.N), np.zeros(self.N)])
-        if include_L:
-            omega = 2.0 * np.pi * self.frequencies
-            L_col = np.concatenate([np.zeros(self.N), omega])
-            K_full = np.column_stack([K_base, R_col, L_col])
-        else:
-            K_full = np.column_stack([K_base, R_col])
-        return K_full, K_real, K_imag
-
-    def _re_im_discrepancy_criterion(self, K_real: np.ndarray, K_imag: np.ndarray,
-                                     L_reg: np.ndarray, lambda_range: np.ndarray,
-                                     include_L: bool = False) -> float:
-        """
-        Автоподбор lambda методом Re-Im Discrepancy (кросс-валидация реальной и мнимой частей).
-        """
-        n_tau = K_real.shape[1]
-        omega = 2.0 * np.pi * self.frequencies
-        Z_re = self.Z_real
-        Z_im_true = -self.Z_imag  # истинная Im(Z)
-
-        # Матрицы для раздельной подгонки Re (с R_inf) и Im (с опциональным L)
-        K_re_ext = np.column_stack([K_real, np.ones(self.N)])
-        L_re = np.zeros((L_reg.shape[0], n_tau + 1))
-        L_re[:, :n_tau] = L_reg
-
-        if include_L:
-            K_im_ext = np.column_stack([K_imag, omega])
-            L_im = np.zeros((L_reg.shape[0], n_tau + 1))
-            L_im[:, :n_tau] = L_reg
-        else:
-            K_im_ext = K_imag
-            L_im = L_reg
-
-        best_lam = float(lambda_range[len(lambda_range) // 2])
-        best_score = np.inf
-
-        for lam in lambda_range:
-            try:
-                # 1. Решаем по Re(Z) -> предсказываем Im(Z)
-                x_re, _ = nnls(np.vstack([K_re_ext, lam * L_re]), np.concatenate([Z_re, np.zeros(L_re.shape[0])]))
-                g_re = x_re[:n_tau]
-                im_pred = K_imag @ g_re
-                if include_L:
-                    L_est = max(0.0, float(np.dot(omega, Z_im_true - im_pred) / (np.dot(omega, omega) + 1e-15)))
-                    im_pred = im_pred + omega * L_est
-                err_im = np.sum((im_pred - Z_im_true) ** 2)
-
-                # 2. Решаем по Im(Z) -> предсказываем Re(Z)
-                x_im, _ = nnls(np.vstack([K_im_ext, lam * L_im]), np.concatenate([Z_im_true, np.zeros(L_im.shape[0])]))
-                g_im = x_im[:n_tau]
-                re_pred_no_r0 = K_real @ g_im
-                r0_est = float(np.mean(Z_re - re_pred_no_r0))
-                err_re = np.sum((re_pred_no_r0 + r0_est - Z_re) ** 2)
-
-                score = err_re + err_im
-                if score < best_score:
-                    best_score = score
-                    best_lam = float(lam)
-            except Exception:
-                continue
-
-        return best_lam
-
-    def compute_bootstrap_std(self, result: DRTResult, n_boot: int = 25, seed: int = 42) -> np.ndarray:
-        """
-        Быстрая оценка доверительного интервала (std) методом остаточного bootstrap.
-        """
-        Z_rec_re, Z_rec_im = self.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
-        res_re = self.Z_real - Z_rec_re
-        res_im = self.Z_imag - Z_rec_im
-        sigma_re = max(float(np.std(res_re)), 1e-9)
-        sigma_im = max(float(np.std(res_im)), 1e-9)
-
-        rng = np.random.default_rng(seed)
-        samples = []
-        n_tau = len(result.tau_grid)
-        lam = result.lambda_opt if result.lambda_opt is not None else 1e-4
-
-        for _ in range(n_boot):
-            noisy_re = Z_rec_re + rng.normal(0.0, sigma_re, size=self.N)
-            noisy_im = Z_rec_im + rng.normal(0.0, sigma_im, size=self.N)
-            temp_data = ImpedanceData(self.frequencies.copy(), noisy_re, noisy_im, auto_convention=False)
-            try:
-                if isinstance(self, MaxEntropyDRT):
-                    solver = MaxEntropyDRT(temp_data, include_inductive=self.include_inductive)
-                    r = solver.compute(n_tau=n_tau, lambda_value=lam, lambda_auto=False,
-                                       lambda_l2=result.metadata.get('lambda_l2', 0.0),
-                                       include_L=self.include_inductive)
-                elif isinstance(self, ElasticNetDRT):
-                    solver = ElasticNetDRT(temp_data, regularization_order=self.regularization_order,
-                                           include_inductive=self.include_inductive)
-                    r = solver.compute(n_tau=n_tau, lambda_value=lam, lambda_auto=False,
-                                       l1_ratio=result.metadata.get('l1_ratio', 0.5),
-                                       include_L=self.include_inductive)
-                else:
-                    solver = TikhonovDRT(temp_data, regularization_order=getattr(self, 'regularization_order', 2),
-                                         include_inductive=self.include_inductive)
-                    r = solver.compute(n_tau=n_tau, lambda_value=lam, lambda_auto=False,
-                                       include_L=self.include_inductive)
-                samples.append(r.gamma)
-            except Exception:
-                continue
-
-        if len(samples) >= 3:
-            return np.std(np.vstack(samples), axis=0)
-        return np.zeros(n_tau)
 
 
 # ============================================================================
@@ -1230,93 +1099,248 @@ class TikhonovDRT(DRTCore):
             logging.warning(f"NNLS residual: {resid}")
         return x
     
-    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None,
-                lambda_criterion: str = "L-curve", include_L: bool = False) -> DRTResult:
+    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None, 
+                lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
         """
-        Регуляризация Тихонова (NNLS) с совместным фитингом R_inf (и опционально L).
-        Поддерживает автоподбор lambda по L-кривой и Re-Im Discrepancy.
+        Compute DRT using Tikhonov regularization with NNLS.
+        
+        The DRT gamma(τ) satisfies:
+        Z(ω) = R∞ + ∫ γ(τ) / (1 + iωτ) d(ln τ)
+        
+        Therefore: R_pol = ∫ γ(τ) d(ln τ)
         """
+        
+        # Create logarithmic grid of relaxation times
         tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_full, K_real, K_imag = self._build_kernel_matrix_full(tau_grid, include_L=include_L)
-        Z_target = np.concatenate([self.Z_real, -self.Z_imag])
-
-        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
-        n_total = K_full.shape[1]
-        L_ext = np.zeros((L_reg.shape[0], n_total))
-        L_ext[:, :n_tau] = L_reg
-
+        
+        # Build kernel matrices (already scaled with d(ln τ))
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
+        
+        # Target vector: subtract ohmic resistance from real part
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        K = np.vstack([K_real, K_imag])
+        
+        # Build regularization matrix
+        L = self._build_regularization_matrix(n_tau, self.regularization_order)
+        
+        lambda_opt = None
+        gamma = None
+        
         if lambda_auto:
             if lambda_range is None:
                 lambda_range = np.logspace(-8, 2, 30)
-
-            if lambda_criterion == "Re-Im Discrepancy":
-                lambda_opt = self._re_im_discrepancy_criterion(K_real, K_imag, L_reg, lambda_range, include_L=include_L)
-                A = np.vstack([K_full, lambda_opt * L_ext])
-                b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
-                x_opt = self._solve_nnls(A, b)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    # Augmented system: [K; λL] * gamma = [Z_target; 0]
+                    A = np.vstack([K, lam * L])
+                    b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+                    
+                    x = self._solve_nnls(A, b)
+                    
+                    # Calculate residual and solution norm
+                    residual = np.linalg.norm(K @ x - Z_target)
+                    sol_norm = np.linalg.norm(L @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                gamma = solutions[best_idx]
             else:
-                residuals, solution_norms, solutions = [], [], []
-                for lam in lambda_range:
-                    try:
-                        A = np.vstack([K_full, lam * L_ext])
-                        b = np.concatenate([Z_target, np.zeros(L_ext.shape[0])])
-                        x = self._solve_nnls(A, b)
-                        residuals.append(np.linalg.norm(K_full @ x - Z_target))
-                        solution_norms.append(np.linalg.norm(L_reg @ x[:n_tau]))
-                        solutions.append(x)
-                    except Exception:
-                        continue
-                if len(residuals) > 2:
-                    best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
-                    lambda_opt = float(lambda_range[best_idx])
-                    x_opt = solutions[best_idx]
-                else:
-                    lambda_opt = 1e-4
-                    x_opt = self._solve_nnls(np.vstack([K_full, lambda_opt * L_ext]),
-                                             np.concatenate([Z_target, np.zeros(L_ext.shape[0])]))
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K, lambda_opt * L])
+                b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+                gamma = self._solve_nnls(A, b)
         else:
             lambda_opt = lambda_value if lambda_value is not None else 1e-4
-            x_opt = self._solve_nnls(np.vstack([K_full, lambda_opt * L_ext]),
-                                     np.concatenate([Z_target, np.zeros(L_ext.shape[0])]))
-
-        gamma = x_opt[:n_tau]
-        self.R_inf = float(x_opt[n_tau])
-        L_value = float(x_opt[n_tau + 1]) if include_L else 0.0
-
-        gamma_corrected = gamma * np.log(10)
+            A = np.vstack([K, lambda_opt * L])
+            b = np.concatenate([Z_target, np.zeros(L.shape[0])])
+            gamma = self._solve_nnls(A, b)
+        
+        # Calculate uncertainty estimate from second derivative
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        
+        # Verify integral of DRT equals R_pol
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+        
+        # Log verification
+        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
+        
+        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
+            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
+        
+        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
+        
+        # Пересчитываем интеграл с corrected gamma
         drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-
+        
         return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma_corrected,
-            gamma_std=None,
-            method="Tikhonov Regularization (NNLS)" + (" + L" if include_L else ""),
+            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
+            method="Tikhonov Regularization (NNLS)",
+            R_inf=self.R_inf,
+            R_pol=self.R_pol,
+            L=0.0,
+            lambda_opt=lambda_opt,
+            metadata={
+                'lambda': lambda_opt,
+                'order': self.regularization_order,
+                'lambda_auto': lambda_auto,
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol
+            }
+        )
+    
+    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                                 lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None) -> DRTResult:
+        """
+        Compute DRT with inductance using the DRTtools approach.
+        
+        In this method, L is fitted as a separate parameter along with γ(τ).
+        The model is: Z(ω) = R∞ + i·2πf·L + ∫ γ(τ)/(1 + iωτ) d(ln τ)
+        
+        The extended matrix is: [K_real; K_imag] with an extra column [0; -ω] for L
+        """
+        
+        # Create logarithmic grid of relaxation times
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        
+        # Build extended kernel matrix with L column
+        K_extended, K_real, K_imag = self._build_kernel_matrix_with_inductance(tau_grid)
+        
+        # Target vector: subtract ohmic resistance from real part
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        
+        # Build regularization matrix for γ only (L is not regularized)
+        L_reg = self._build_regularization_matrix(n_tau, self.regularization_order)
+        
+        # Number of unknowns: n_tau (γ) + 1 (L)
+        n_total = n_tau + 1
+        
+        # Build extended regularization matrix: zeros for L
+        L_extended = np.zeros((L_reg.shape[0], n_total))
+        L_extended[:, :n_tau] = L_reg
+        
+        lambda_opt = None
+        gamma = None
+        L_value = None
+        
+        if lambda_auto:
+            if lambda_range is None:
+                lambda_range = np.logspace(-8, 2, 30)
+            
+            residuals = []
+            solution_norms = []
+            solutions = []
+            
+            for lam in lambda_range:
+                try:
+                    # Augmented system: [K_extended; λL_extended] * x = [Z_target; 0]
+                    A = np.vstack([K_extended, lam * L_extended])
+                    b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                    
+                    x = self._solve_nnls(A, b)
+                    
+                    # Calculate residual and solution norm
+                    residual = np.linalg.norm(K_extended @ x - Z_target)
+                    sol_norm = np.linalg.norm(L_extended @ x)
+                    
+                    residuals.append(residual)
+                    solution_norms.append(sol_norm)
+                    solutions.append(x)
+                except Exception as e:
+                    logging.warning(f"Lambda {lam} failed: {e}")
+                    continue
+            
+            if len(residuals) > 2:
+                best_idx = self._l_curve_criterion(np.array(residuals), np.array(solution_norms))
+                lambda_opt = lambda_range[best_idx]
+                x_opt = solutions[best_idx]
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+            else:
+                lambda_opt = lambda_range[0] if len(lambda_range) > 0 else 1e-4
+                A = np.vstack([K_extended, lambda_opt * L_extended])
+                b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+                x_opt = self._solve_nnls(A, b)
+                gamma = x_opt[:n_tau]
+                L_value = x_opt[-1]
+        else:
+            lambda_opt = lambda_value if lambda_value is not None else 1e-4
+            A = np.vstack([K_extended, lambda_opt * L_extended])
+            b = np.concatenate([Z_target, np.zeros(L_extended.shape[0])])
+            x_opt = self._solve_nnls(A, b)
+            gamma = x_opt[:n_tau]
+            L_value = x_opt[-1]
+        
+        # Calculate uncertainty estimate from second derivative
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.1
+        
+        # Verify integral of DRT equals R_pol
+        drt_integral = self.get_drt_integral(gamma, tau_grid)
+        
+        # Log verification
+        print(f"R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"R_pol from DRT integral: {drt_integral:.6f} Ω")
+        print(f"Ratio (should be ~1.0): {drt_integral/self.R_pol:.4f}")
+        print(f"Fitted inductance L: {L_value:.6e} H")
+        
+        if drt_integral / self.R_pol < 0.8 or drt_integral / self.R_pol > 1.2:
+            warnings.warn(f"DRT integral ({drt_integral:.4f}) does not match R_pol ({self.R_pol:.4f}). Ratio: {drt_integral/self.R_pol:.3f}")
+        
+        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
+        
+        # Recalculate integral with corrected gamma
+        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
+        
+        return DRTResult(
+            tau_grid=tau_grid,
+            gamma=gamma_corrected,
+            gamma_std=gamma_std * np.log(10),
+            method="Tikhonov Regularization with Inductance",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
             L=L_value,
             lambda_opt=lambda_opt,
             metadata={
                 'lambda': lambda_opt,
-                'lambda_criterion': lambda_criterion if lambda_auto else 'Manual',
                 'order': self.regularization_order,
                 'lambda_auto': lambda_auto,
                 'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / self.R_pol if self.R_pol > 0 else 0.0,
+                'integral_ratio': drt_integral_corrected / self.R_pol,
                 'inductance': L_value
             }
         )
-
-    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                                lambda_auto: bool = True, lambda_range: Optional[np.ndarray] = None,
-                                lambda_criterion: str = "L-curve") -> DRTResult:
-        return self.compute(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto,
-                            lambda_range=lambda_range, lambda_criterion=lambda_criterion, include_L=True)
-
+    
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reconstruct impedance from DRT and optional inductance.
+        
+        Args:
+            tau_grid: Relaxation time grid
+            gamma: DRT values
+            L: Inductance value (default 0)
+        
+        Returns:
+            Tuple of (Z_rec_real, Z_rec_imag)
+        """
         K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
         Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
         return Z_rec_real, Z_rec_imag
 
 
@@ -1325,411 +1349,147 @@ class TikhonovDRT(DRTCore):
 # ============================================================================
 
 class MaxEntropyDRT(DRTCore):
-    """
-    Энтропийная регуляризация (Py & Ciucci, 2025):
-    - аналитический градиент для L-BFGS-B;
-    - масштабная нормировка данных;
-    - совместный фитинг R_inf и L;
-    - корректная L-кривая;
-    - опциональный гибридный штраф L2 (Entropy + L2).
-    """
-
+    """Maximum Entropy method for DRT with automatic lambda selection"""
+    
     def __init__(self, data: ImpedanceData, include_inductive: bool = False):
         super().__init__(data, include_inductive)
-
-    def _build_d2_matrix(self, M: int) -> np.ndarray:
-        D2 = np.zeros((M - 2, M))
-        for i in range(M - 2):
-            D2[i, i], D2[i, i + 1], D2[i, i + 2] = 1.0, -2.0, 1.0
-        return D2
-
-    def _obj_and_grad(self, x: np.ndarray, K_full: np.ndarray, Z_norm: np.ndarray,
-                      n_tau: int, lam: float, lam_l2: float, D2: Optional[np.ndarray]) -> Tuple[float, np.ndarray]:
-        gamma = np.maximum(x[:n_tau], 1e-12)
-        residual = K_full @ x - Z_norm
-
-        # Данные + энтропийный штраф: +lam * sum(g * ln(g))
-        loss = 0.5 * np.dot(residual, residual) + lam * np.sum(gamma * np.log(gamma))
-        grad = K_full.T @ residual
-        grad[:n_tau] += lam * (np.log(gamma) + 1.0)
-
-        # Опциональный гибридный L2-штраф на вторую производную
-        if lam_l2 > 0.0 and D2 is not None:
-            d2g = D2 @ gamma
-            loss += 0.5 * lam_l2 * np.dot(d2g, d2g)
-            grad[:n_tau] += lam_l2 * (D2.T @ d2g)
-
-        return float(loss), grad
-
-    def _solve_single(self, K_full: np.ndarray, Z_norm: np.ndarray, n_tau: int,
-                      lam: float, lam_l2: float, D2: Optional[np.ndarray],
-                      x0: Optional[np.ndarray] = None) -> np.ndarray:
-        n_total = K_full.shape[1]
-        if x0 is None:
-            x0 = np.full(n_total, 1.0 / n_tau)
-            x0[n_tau] = max(self.R_inf / (np.max(np.abs(Z_norm)) + 1e-12), 1e-6)
-            if n_total > n_tau + 1:
-                x0[n_tau + 1] = 0.0
-
-        bounds = [(1e-12, None)] * n_tau + [(0.0, None)] * (n_total - n_tau)
-        res = optimize.minimize(
-            self._obj_and_grad, x0,
-            args=(K_full, Z_norm, n_tau, lam, lam_l2, D2),
-            method='L-BFGS-B',
-            jac=True,
-            bounds=bounds,
-            options={'maxiter': 1000, 'ftol': 1e-12, 'gtol': 1e-8}
-        )
-        return res.x
-
-    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                lambda_auto: bool = True, lambda_l2: float = 0.0,
-                include_L: bool = False) -> DRTResult:
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_full, K_real, K_imag = self._build_kernel_matrix_full(tau_grid, include_L=include_L)
-        Z_target = np.concatenate([self.Z_real, -self.Z_imag])
-
-        # Масштабная нормировка для инвариантности x*ln(x)
-        scale = float(max(self.R_pol, np.max(np.abs(Z_target)), 1e-6))
-        Z_norm = Z_target / scale
-        D2 = self._build_d2_matrix(n_tau) if lambda_l2 > 0.0 else None
-
-        if lambda_auto:
-            lambda_range = np.logspace(-6, 0, 25)
-            residuals, penalties, solutions = [], [], []
-            x_warm = None
-            for lam in lambda_range:
-                try:
-                    x = self._solve_single(K_full, Z_norm, n_tau, float(lam), lambda_l2, D2, x0=x_warm)
-                    x_warm = x
-                    g = np.maximum(x[:n_tau], 1e-12)
-                    residuals.append(np.linalg.norm(K_full @ x - Z_norm))
-                    # Отрицательная энтропия (убывает с ростом lambda, как ||Lx|| на L-кривой)
-                    penalties.append(float(np.sum(g * np.log(g))))
-                    solutions.append(x)
-                except Exception:
-                    continue
-
-            if len(residuals) > 2:
-                pen_arr = np.array(penalties)
-                # Сдвиг в положительную область для логарифмирования в _l_curve_criterion
-                pen_pos = pen_arr - np.min(pen_arr) + 1e-6
-                best_idx = self._l_curve_criterion(np.array(residuals), pen_pos)
-                lambda_opt = float(lambda_range[best_idx])
-                x_opt = solutions[best_idx]
-            else:
-                lambda_opt = 1e-3
-                x_opt = self._solve_single(K_full, Z_norm, n_tau, lambda_opt, lambda_l2, D2)
+    
+    def _entropy(self, gamma: np.ndarray) -> float:
+        """Calculate Shannon entropy"""
+        gamma_pos = gamma[gamma > 1e-10]
+        if len(gamma_pos) == 0:
+            return 0
+        return -np.sum(gamma_pos * np.log(gamma_pos))
+    
+    def _objective_function(self, x: np.ndarray, K: np.ndarray, Z_target: np.ndarray, lam: float) -> float:
+        """Objective function with entropy penalty"""
+        gamma = np.maximum(x, 1e-10)
+        residual = K @ gamma - Z_target
+        data_fit = 0.5 * np.sum(residual**2)
+        entropy_penalty = -lam * self._entropy(gamma)
+        return data_fit + entropy_penalty
+    
+    def _solve_for_lambda(self, K: np.ndarray, Z_target: np.ndarray, 
+                          lambda_range: np.ndarray, n_tau: int) -> Tuple[np.ndarray, float]:
+        """Solve for multiple lambda and return best based on L-curve"""
+        residuals = []
+        solutions = []
+        
+        for lam in lambda_range:
+            try:
+                x0 = np.ones(n_tau) / n_tau
+                result = optimize.minimize(
+                    self._objective_function, x0,
+                    args=(K, Z_target, lam),
+                    method='L-BFGS-B',
+                    bounds=[(1e-10, None) for _ in range(n_tau)],
+                    options={'maxiter': 500, 'disp': False}
+                )
+                gamma = result.x
+                residual = np.linalg.norm(K @ gamma - Z_target)
+                residuals.append(residual)
+                solutions.append(gamma)
+            except Exception as e:
+                logging.warning(f"Lambda {lam} failed: {e}")
+                residuals.append(1e10)
+                solutions.append(np.zeros(n_tau))
+        
+        if len(residuals) > 2:
+            best_idx = self._l_curve_criterion(np.array(residuals), np.array(lambda_range))
         else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-3
-            x_opt = self._solve_single(K_full, Z_norm, n_tau, lambda_opt, lambda_l2, D2)
-
-        # Обратное масштабирование
-        gamma = x_opt[:n_tau] * scale
-        self.R_inf = float(x_opt[n_tau] * scale)
-        L_value = float(x_opt[n_tau + 1] * scale) if include_L else 0.0
-
-        gamma_corrected = gamma * np.log(10)
+            best_idx = np.argmin(residuals)
+        
+        return solutions[best_idx], lambda_range[best_idx]
+    
+    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                lambda_auto: bool = True) -> DRTResult:
+        """Compute DRT using maximum entropy method with automatic lambda selection"""
+        
+        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
+        
+        Z_target = np.concatenate([self.Z_real - self.R_inf, -self.Z_imag])
+        K = np.vstack([K_real, K_imag])
+        
+        if lambda_auto:
+            lambda_range = np.logspace(-4, 2, 20)
+            gamma, lambda_opt = self._solve_for_lambda(K, Z_target, lambda_range, n_tau)
+        else:
+            lam = lambda_value if lambda_value is not None else 0.1
+            x0 = np.ones(n_tau) / n_tau
+            result = optimize.minimize(
+                self._objective_function, x0,
+                args=(K, Z_target, lam),
+                method='L-BFGS-B',
+                bounds=[(1e-10, None) for _ in range(n_tau)],
+                options={'maxiter': 500, 'disp': False}
+            )
+            gamma = result.x
+            lambda_opt = lam
+        
+        # Calculate uncertainty estimate from second derivative
+        gamma_std = np.abs(np.gradient(np.gradient(gamma))) * 0.15
+        
+        # Apply ln(10) correction for consistency with Tikhonov method
+        gamma_corrected = gamma * np.log(10)  # ln(10) ≈ 2.302585
+        
+        # Recalculate integral with corrected gamma
         drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-
-        method_name = "Maximum Entropy" + (" + L2" if lambda_l2 > 0 else "") + (" + L" if include_L else "")
+        
+        print(f"MaxEntropy DRT - R_pol from EIS: {self.R_pol:.6f} Ω")
+        print(f"MaxEntropy DRT - Integral (before correction): {self.get_drt_integral(gamma, tau_grid):.6f} Ω")
+        print(f"MaxEntropy DRT - Integral (after correction): {drt_integral_corrected:.6f} Ω")
+        print(f"MaxEntropy DRT - Ratio (after correction): {drt_integral_corrected/self.R_pol:.4f}")
+        
         return DRTResult(
             tau_grid=tau_grid,
             gamma=gamma_corrected,
-            gamma_std=None,
-            method=method_name,
+            gamma_std=gamma_std * np.log(10),  # также корректируем стандартное отклонение
+            method="Maximum Entropy",
             R_inf=self.R_inf,
             R_pol=self.R_pol,
-            L=L_value,
-            lambda_opt=lambda_opt,
-            metadata={
-                'lambda': lambda_opt,
-                'lambda_l2': lambda_l2,
-                'lambda_criterion': 'L-curve' if lambda_auto else 'Manual',
-                'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / self.R_pol if self.R_pol > 0 else 0.0,
-                'inductance': L_value
-            }
-        )
-
-    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                                lambda_auto: bool = True, lambda_l2: float = 0.0) -> DRTResult:
-        return self.compute(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto,
-                            lambda_l2=lambda_l2, include_L=True)
-
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
-        return Z_rec_real, Z_rec_imag
-
-# ============================================================================
-# Elastic Net DRT (L1 + L2)
-# ============================================================================
-
-class ElasticNetDRT(DRTCore):
-    """
-    Elastic Net регуляризация (L1 + L2) с аналитическим градиентом через L-BFGS-B.
-    Повышает частотное разрешение для близко расположенных пиков (Lei et al., 2024).
-    """
-
-    def __init__(self, data: ImpedanceData, regularization_order: int = 2, include_inductive: bool = False):
-        super().__init__(data, include_inductive)
-        self.regularization_order = regularization_order
-
-    def _build_reg_matrix(self, M: int) -> np.ndarray:
-        if self.regularization_order == 0:
-            return np.eye(M)
-        elif self.regularization_order == 1:
-            L = np.zeros((M - 1, M))
-            for i in range(M - 1):
-                L[i, i], L[i, i + 1] = -1.0, 1.0
-            return L
-        L = np.zeros((M - 2, M))
-        for i in range(M - 2):
-            L[i, i], L[i, i + 1], L[i, i + 2] = 1.0, -2.0, 1.0
-        return L
-
-    def _obj_and_grad(self, x: np.ndarray, K_full: np.ndarray, Z_norm: np.ndarray,
-                      n_tau: int, lam: float, l1_ratio: float, L_reg: np.ndarray) -> Tuple[float, np.ndarray]:
-        g = x[:n_tau]
-        res = K_full @ x - Z_norm
-        Lg = L_reg @ g
-
-        loss = (0.5 * np.dot(res, res)
-                + lam * l1_ratio * np.sum(g)
-                + 0.5 * lam * (1.0 - l1_ratio) * np.dot(Lg, Lg))
-
-        grad = K_full.T @ res
-        grad[:n_tau] += lam * l1_ratio + lam * (1.0 - l1_ratio) * (L_reg.T @ Lg)
-        return float(loss), grad
-
-    def _solve_single(self, K_full: np.ndarray, Z_norm: np.ndarray, n_tau: int,
-                      lam: float, l1_ratio: float, L_reg: np.ndarray,
-                      x0: Optional[np.ndarray] = None) -> np.ndarray:
-        n_total = K_full.shape[1]
-        if x0 is None:
-            x0 = np.zeros(n_total)
-        bounds = [(0.0, None)] * n_total
-        res = optimize.minimize(
-            self._obj_and_grad, x0,
-            args=(K_full, Z_norm, n_tau, lam, l1_ratio, L_reg),
-            method='L-BFGS-B',
-            jac=True,
-            bounds=bounds,
-            options={'maxiter': 1000, 'ftol': 1e-12, 'gtol': 1e-8}
-        )
-        return res.x
-
-    def compute(self, n_tau: int = 150, lambda_value: Optional[float] = None,
-                lambda_auto: bool = True, l1_ratio: float = 0.5,
-                lambda_criterion: str = "L-curve", include_L: bool = False) -> DRTResult:
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        K_full, K_real, K_imag = self._build_kernel_matrix_full(tau_grid, include_L=include_L)
-        Z_target = np.concatenate([self.Z_real, -self.Z_imag])
-        L_reg = self._build_reg_matrix(n_tau)
-
-        scale = float(max(self.R_pol, np.max(np.abs(Z_target)), 1e-6))
-        Z_norm = Z_target / scale
-
-        if lambda_auto:
-            lambda_range = np.logspace(-7, 0, 25)
-            if lambda_criterion == "Re-Im Discrepancy":
-                lambda_opt = self._re_im_discrepancy_criterion(K_real, K_imag, L_reg, lambda_range, include_L=include_L)
-                x_opt = self._solve_single(K_full, Z_norm, n_tau, lambda_opt, l1_ratio, L_reg)
-            else:
-                residuals, norms, solutions = [], [], []
-                x_warm = None
-                for lam in lambda_range:
-                    x = self._solve_single(K_full, Z_norm, n_tau, float(lam), l1_ratio, L_reg, x0=x_warm)
-                    x_warm = x
-                    g = x[:n_tau]
-                    residuals.append(np.linalg.norm(K_full @ x - Z_norm))
-                    pen = l1_ratio * np.sum(g) + (1.0 - l1_ratio) * np.linalg.norm(L_reg @ g)
-                    norms.append(float(pen))
-                    solutions.append(x)
-                best_idx = self._l_curve_criterion(np.array(residuals), np.array(norms))
-                lambda_opt = float(lambda_range[best_idx])
-                x_opt = solutions[best_idx]
-        else:
-            lambda_opt = lambda_value if lambda_value is not None else 1e-4
-            x_opt = self._solve_single(K_full, Z_norm, n_tau, lambda_opt, l1_ratio, L_reg)
-
-        gamma = x_opt[:n_tau] * scale
-        self.R_inf = float(x_opt[n_tau] * scale)
-        L_value = float(x_opt[n_tau + 1] * scale) if include_L else 0.0
-
-        gamma_corrected = gamma * np.log(10)
-        drt_integral_corrected = self.get_drt_integral(gamma_corrected, tau_grid)
-
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma_corrected,
-            gamma_std=None,
-            method=f"Elastic Net (L1={l1_ratio:.2f})" + (" + L" if include_L else ""),
-            R_inf=self.R_inf,
-            R_pol=self.R_pol,
-            L=L_value,
-            lambda_opt=lambda_opt,
-            metadata={
-                'lambda': lambda_opt,
-                'l1_ratio': l1_ratio,
-                'lambda_criterion': lambda_criterion if lambda_auto else 'Manual',
-                'order': self.regularization_order,
-                'drt_integral': drt_integral_corrected,
-                'integral_ratio': drt_integral_corrected / self.R_pol if self.R_pol > 0 else 0.0,
-                'inductance': L_value
-            }
-        )
-
-    def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
-        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
-        Z_rec_imag = -(K_imag @ gamma) / np.log(10) - 2 * np.pi * self.frequencies * L
-        return Z_rec_real, Z_rec_imag
-
-
-# ============================================================================
-# Robust Loewner Framework (RLF) - Regularization-Free DRT (Patel et al., 2025)
-# ============================================================================
-
-class RobustLoewnerDRT(DRTCore):
-    """
-    Робастный метод Лёвнера (RLF): прямая рациональная интерполяция без регуляризации.
-    Использует оптимальное усечение SVD (порог Гавиша–Донохо / ScreeNOT) и фильтрацию по AICc.
-    Нативно поддерживает индуктивные петли (отрицательные R_i).
-    """
-
-    def __init__(self, data: ImpedanceData):
-        super().__init__(data, include_inductive=True)
-        self.poles_: List[Dict[str, float]] = []
-
-    @staticmethod
-    def _optimal_svd_rank(s: np.ndarray, m: int, n: int) -> int:
-        """Оптимальное усечение сингулярных чисел для неизвестного уровня шума."""
-        if len(s) <= 2:
-            return len(s)
-        beta = min(m, n) / max(m, n)
-        omega_beta = 0.56 * beta**3 - 0.95 * beta**2 + 1.82 * beta + 1.43
-        s_med = np.median(s)
-        threshold = omega_beta * s_med
-        r_opt = int(np.sum(s > threshold))
-        return max(2, min(r_opt, len(s) - 1))
-
-    def compute(self, n_tau: int = 150) -> DRTResult:
-        omega = 2.0 * np.pi * self.frequencies
-        Z_true = self.Z_real - 1j * self.Z_imag  # истинный комплексный импеданс Z = Re + j*Im
-
-        # Чередующееся разбиение частот на левые и правые узлы + комплексно-сопряжённые пары
-        idx_l = np.arange(0, self.N, 2)
-        idx_r = np.arange(1, self.N, 2)
-        mu = np.concatenate([1j * omega[idx_l], -1j * omega[idx_l]])
-        v = np.concatenate([Z_true[idx_l], np.conj(Z_true[idx_l])])
-        lam = np.concatenate([1j * omega[idx_r], -1j * omega[idx_r]])
-        w = np.concatenate([Z_true[idx_r], np.conj(Z_true[idx_r])])
-
-        # Матрицы Лёвнера L и Ls
-        diff = mu[:, None] - lam[None, :]
-        L_mat = (v[:, None] - w[None, :]) / diff
-        Ls_mat = (mu[:, None] * v[:, None] - lam[None, :] * w[None, :]) / diff
-
-        # SVD-усечение пучка [L, Ls]
-        M_stack = np.hstack([L_mat, Ls_mat])
-        U, s, _ = np.linalg.svd(M_stack, full_matrices=False)
-        _, _, Vh = np.linalg.svd(np.vstack([L_mat, Ls_mat]), full_matrices=False)
-        r_opt = self._optimal_svd_rank(s, *M_stack.shape)
-
-        Yr = U[:, :r_opt]
-        Xr = Vh[:r_opt, :].conj().T
-
-        Er = -Yr.conj().T @ L_mat @ Xr
-        Ar = -Yr.conj().T @ Ls_mat @ Xr
-        Br = Yr.conj().T @ v
-        Cr = w @ Xr
-
-        # Обобщённая задача на собственные значения: Ar * vi = p_i * Er * vi
-        eigvals, eigvecs = linalg.eig(Ar, Er)
-        V_inv = linalg.pinv(Er @ eigvecs)
-
-        candidates = []
-        for i in range(len(eigvals)):
-            p = eigvals[i]
-            if np.abs(p) < 1e-12 or np.real(p) >= 0:
-                continue
-            # Фильтруем комплексные шумовые полюса, оставляем физические вещественные
-            if abs(np.imag(p)) / (abs(np.real(p)) + 1e-12) > 0.15:
-                continue
-            tau_i = float(-1.0 / np.real(p))
-            if not (self.tau_min * 0.01 <= tau_i <= self.tau_max * 100.0):
-                continue
-            res_i = (Cr @ eigvecs[:, i]) * (V_inv[i, :] @ Br)
-            R_i = float(np.real(res_i * tau_i))
-            if abs(R_i) < 1e-12:
-                continue
-            candidates.append({
-                'tau': tau_i,
-                'R': R_i,
-                'frequency': 1.0 / (2.0 * np.pi * tau_i),
-                'res_norm': abs(R_i / tau_i)
-            })
-
-        # Сортировка по норме вычета (Patel et al., 2025) и фильтрация по AICc
-        candidates.sort(key=lambda d: d['res_norm'], reverse=True)
-        best_aicc = np.inf
-        best_poles = candidates
-
-        for k in range(1, len(candidates) + 1):
-            sub = candidates[:k]
-            Z_pred = np.full(self.N, self.R_inf, dtype=complex)
-            for p_item in sub:
-                Z_pred += p_item['R'] / (1.0 + 1j * omega * p_item['tau'])
-            # Подгоняем омический сдвиг R_inf под текущую сумму полюсов
-            r_inf_k = float(np.mean(np.real(Z_true - (Z_pred - self.R_inf))))
-            Z_pred = Z_pred - self.R_inf + r_inf_k
-            rss = float(np.sum(np.abs(Z_true - Z_pred) ** 2))
-            denom_aic = max(self.N - k - 1, 1)
-            aicc = 2 * k + self.N * np.log(rss / self.N + 1e-15) + (2 * k * (k + 1)) / denom_aic
-            if aicc < best_aicc:
-                best_aicc = aicc
-                best_poles = sub
-                self.R_inf = r_inf_k
-
-        best_poles.sort(key=lambda d: d['tau'])
-        self.poles_ = best_poles
-
-        # Строим узкогауссову проекцию полюсов на сетку tau для совместимости со Step 3
-        tau_grid = np.logspace(np.log10(self.tau_min), np.log10(self.tau_max), n_tau)
-        log_tau = np.log10(tau_grid)
-        sigma_vis = 0.08
-        gamma = np.zeros(n_tau)
-        for p_item in best_poles:
-            if p_item['R'] > 0:
-                amp = p_item['R'] / (sigma_vis * np.sqrt(2.0 * np.pi))
-                gamma += amp * np.exp(-0.5 * ((log_tau - np.log10(p_item['tau'])) / sigma_vis) ** 2)
-
-        return DRTResult(
-            tau_grid=tau_grid,
-            gamma=gamma,
-            gamma_std=None,
-            method="Robust Loewner Framework (RLF)",
-            R_inf=self.R_inf,
-            R_pol=float(sum(p['R'] for p in best_poles if p['R'] > 0)),
             L=0.0,
-            lambda_opt=None,
+            lambda_opt=lambda_opt,
             metadata={
-                'r_opt_svd': r_opt,
-                'n_poles': len(best_poles),
-                'rlf_poles': best_poles,
-                'lambda_criterion': 'Regularization-free (ScreeNOT + AICc)'
+                'lambda': lambda_opt,
+                'drt_integral': drt_integral_corrected,
+                'integral_ratio': drt_integral_corrected / self.R_pol
             }
         )
-
+    
+    def compute_with_inductance(self, n_tau: int = 150, lambda_value: Optional[float] = None,
+                                 lambda_auto: bool = True) -> DRTResult:
+        """
+        Compute DRT with inductance using maximum entropy method.
+        Note: Full implementation would require extending the entropy framework.
+        For now, this is a placeholder that uses the standard method.
+        """
+        # For maximum entropy, the extension to include L is non-trivial
+        # This is a simplified version that just adds L after the fact
+        result = self.compute(n_tau=n_tau, lambda_value=lambda_value, lambda_auto=lambda_auto)
+        
+        # Estimate L from high frequency data
+        has_inductive = self.data.detect_inductive_behavior()
+        if has_inductive:
+            high_freq_mask = self.frequencies > 0.1 * np.max(self.frequencies)
+            if np.any(high_freq_mask):
+                omega_high = 2 * np.pi * self.frequencies[high_freq_mask]
+                imag_high = -self.Z_imag[high_freq_mask]
+                # Estimate L from slope of -Im(Z) vs ω
+                if len(omega_high) > 2:
+                    slope, _, _, _, _ = linregress(omega_high, imag_high)
+                    L_est = -slope  # Since -Im(Z) = -ωL + RC part, slope ≈ -L
+                    result.L = max(0, L_est)
+        
+        result.method = "Maximum Entropy with Inductance (estimated)"
+        return result
+    
     def reconstruct_impedance(self, tau_grid: np.ndarray, gamma: np.ndarray, L: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        omega = 2.0 * np.pi * self.frequencies
-        Z_pred = np.full(self.N, self.R_inf, dtype=complex)
-        for p_item in self.poles_:
-            Z_pred += p_item['R'] / (1.0 + 1j * omega * p_item['tau'])
-        return np.real(Z_pred), -np.imag(Z_pred)
+        """Reconstruct impedance from DRT"""
+        K_real, K_imag = self._build_kernel_matrix(tau_grid, include_rl=False)
+        Z_rec_real = self.R_inf + (K_real @ gamma) / np.log(10)
+        Z_rec_imag = -(K_imag @ gamma) / np.log(10) + 2 * np.pi * self.frequencies * L
+        return Z_rec_real, Z_rec_imag
 
 
 # ============================================================================
@@ -3510,8 +3270,7 @@ def plot_bode_matplotlib(data: ImpedanceData, re_rec: Optional[np.ndarray] = Non
 
 
 def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]] = None,
-                       title: str = "Distribution of Relaxation Times",
-                       rlf_poles: Optional[List[Dict[str, float]]] = None) -> plt.Figure:
+                       title: str = "Distribution of Relaxation Times") -> plt.Figure:
     """Create publication-quality DRT plot with both tau and frequency axes"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
@@ -3532,16 +3291,6 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
                         result.gamma + 2*result.gamma_std,
                         alpha=0.3, color='gray')  # Убран параметр label
     ax1.semilogx(result.tau_grid, result.gamma, '-', linewidth=2, color='#2ca02c', label='DRT')
-
-    if rlf_poles:
-        max_g = max(float(np.max(result.gamma)), 1e-6)
-        max_r = max([abs(p['R']) for p in rlf_poles] + [1e-6])
-        for i_p, p in enumerate(rlf_poles):
-            color_p = '#d62728' if p['R'] >= 0 else '#9467bd'
-            lbl = 'RLF poles (scaled)' if i_p == 0 else '_nolegend_'
-            h = (p['R'] / max_r) * max_g * 0.85
-            ax1.vlines(p['tau'], 0, h, colors=color_p, linestyles='--', linewidth=1.8, label=lbl)
-            ax1.plot(p['tau'], h, 'o', color=color_p, markersize=6)
     
     if peaks and len(peaks) > 0:
         peak_tau = [p['tau'] for p in peaks]
@@ -3574,16 +3323,6 @@ def plot_drt_matplotlib(result: DRTResult, peaks: Optional[List[Dict[str, Any]]]
                         gamma_sorted + 2*gamma_std_sorted,
                         alpha=0.3, color='gray')  # Убран параметр label
     ax2.semilogx(freqs_sorted, gamma_sorted, '-', linewidth=2, color='#2ca02c', label='DRT')
-
-    if rlf_poles:
-        max_g = max(float(np.max(result.gamma)), 1e-6)
-        max_r = max([abs(p['R']) for p in rlf_poles] + [1e-6])
-        for i_p, p in enumerate(rlf_poles):
-            color_p = '#d62728' if p['R'] >= 0 else '#9467bd'
-            lbl = 'RLF poles (scaled)' if i_p == 0 else '_nolegend_'
-            h = (p['R'] / max_r) * max_g * 0.85
-            ax2.vlines(p['frequency'], 0, h, colors=color_p, linestyles='--', linewidth=1.8, label=lbl)
-            ax2.plot(p['frequency'], h, 'o', color=color_p, markersize=6)
     
     if peaks and len(peaks) > 0:
         peak_freqs = [p['frequency'] for p in peaks]
@@ -4211,7 +3950,15 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     ax.plot(re_exp_sorted, im_exp_sorted, 'o-', markersize=3, linewidth=1,
             color='#1f77b4', alpha=0.7, label='Experimental', zorder=1)
     
-    R_inf_start = float(drt_result.R_inf)
+    # Determine unified R_inf starting point:
+    # If inductive behavior causes -Im(Z) to cross zero, find exact zero-crossing for alignment;
+    # otherwise use drt_result.R_inf
+    R_inf_start = drt_result.R_inf
+    for i in range(len(im_exp_sorted) - 1):
+        if im_exp_sorted[i] >= 0 and im_exp_sorted[i + 1] < 0:
+            t = -im_exp_sorted[i] / (im_exp_sorted[i + 1] - im_exp_sorted[i])
+            R_inf_start = float(re_exp_sorted[i] + t * (re_exp_sorted[i + 1] - re_exp_sorted[i]))
+            break
     
     # Get peaks sorted by characteristic frequency (high to low) - already sorted by ID
     peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
@@ -4243,26 +3990,13 @@ def plot_sequential_rc_model(deconv_result: DeconvolutionResult,
     # Dense frequency grid over experimental range for smooth Total Model curve
     f_min_exp = max(np.min(freq_exp_sorted), 1e-12)
     f_max_exp = np.max(freq_exp_sorted)
-    if peaks_sorted:
-        f_chars = [p.get_characteristic_frequency() for p in peaks_sorted]
-        max_sigma = max(float(p.sigma_log) for p in peaks_sorted)
-        span_decades = max(4.0, 5.0 * max_sigma + 2.5)
-        f_min_model = min(f_min_exp, 10.0 ** (np.log10(min(f_chars)) - span_decades))
-        # Если есть реальный индуктивный хвост ниже оси X, не уходим выше f_max_exp (иначе ωL улетит вниз)
-        if drt_result.L > 0 and np.any(im_exp_sorted < 0):
-            f_max_model = f_max_exp
-        else:
-            f_max_model = max(f_max_exp, 10.0 ** (np.log10(max(f_chars)) + span_decades))
-    else:
-        f_min_model, f_max_model = f_min_exp, f_max_exp
-
-    freq_model_dense = np.logspace(np.log10(f_min_model), np.log10(f_max_model), 800)
+    freq_model_dense = np.logspace(np.log10(f_min_exp), np.log10(f_max_exp), 500)
     omega_model = 2.0 * np.pi * freq_model_dense
     
     # Start Total Model with unified R∞ and inductance L
     Z_total = np.full_like(omega_model, R_inf_start, dtype=complex)
-    if drt_result.L > 0 and np.any(im_exp_sorted < 0):
-        # Добавляем индуктивность только если в спектре реально присутствует индуктивный хвост
+    if drt_result.L > 0:
+        # Note: data.im_z stores -Im(Z), so inductive reactance +j*omega*L gives negative -Im(Z)
         Z_total += 1j * omega_model * drt_result.L
     
     # Store cumulative resistance for plotting individual process arcs
@@ -4430,9 +4164,11 @@ def step1_data_loading():
                         if freq is not None:
                             st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
                             st.session_state.app_state.data_loaded = True
-                            st.session_state.app_state.lin_kk_result = None
-                            st.session_state.selected_point_idx = 0
-                            st.session_state.freq_range_idx = (0, len(freq) - 1)
+                            # Initialize selection state
+                            if 'selected_point_idx' not in st.session_state:
+                                st.session_state.selected_point_idx = 0
+                            if 'freq_range_idx' not in st.session_state:
+                                st.session_state.freq_range_idx = (0, len(freq) - 1)
                             st.success(f"✅ Loaded {len(freq)} data points")
                             st.rerun()
                 except Exception as e:
@@ -4442,9 +4178,10 @@ def step1_data_loading():
             if freq is not None:
                 st.session_state.app_state.impedance_data = ImpedanceData(freq, re_z, im_z)
                 st.session_state.app_state.data_loaded = True
-                st.session_state.app_state.lin_kk_result = None
-                st.session_state.selected_point_idx = 0
-                st.session_state.freq_range_idx = (0, len(freq) - 1)
+                if 'selected_point_idx' not in st.session_state:
+                    st.session_state.selected_point_idx = 0
+                if 'freq_range_idx' not in st.session_state:
+                    st.session_state.freq_range_idx = (0, len(freq) - 1)
                 st.success(f"✅ Loaded {len(freq)} data points")
                 st.rerun()
     
@@ -4452,14 +4189,14 @@ def step1_data_loading():
         st.subheader("📊 Data Format")
         st.info("""
         **Expected format:**
-- Frequency (Hz)
-- Re(Z) (Ω)
-- -Im(Z) (Ω)
+        - Frequency (Hz)
+        - Re(Z) (Ω)
+        - -Im(Z) (Ω)
         
         **Supported separators:**
-- Space
-- Comma
-- Tab
+        - Space
+        - Comma
+        - Tab
         """)
     
     if st.session_state.app_state.data_loaded and st.session_state.app_state.impedance_data:
@@ -4524,12 +4261,15 @@ def step1_data_loading():
                 if st.button("🗑️ Remove Point", use_container_width=True, key="remove_point_btn"):
                     if point_idx < data.n_points:
                         data.remove_point(point_idx)
-                        st.session_state.app_state.lin_kk_result = None
+                        # Adjust indices after removal
                         new_max = data.n_points - 1
+                        # Update selected point index
                         st.session_state.selected_point_idx = min(point_idx, new_max)
+                        # Update frequency range indices
                         current_min_idx, current_max_idx = st.session_state.freq_range_idx
                         new_min_idx = min(current_min_idx, new_max)
                         new_max_idx = min(current_max_idx, new_max)
+                        # Ensure min <= max
                         if new_min_idx > new_max_idx:
                             new_min_idx = new_max_idx
                         st.session_state.freq_range_idx = (new_min_idx, new_max_idx)
@@ -4538,7 +4278,6 @@ def step1_data_loading():
                 
                 if st.button("🔄 Reset All", use_container_width=True, key="reset_data_btn"):
                     data.reset()
-                    st.session_state.app_state.lin_kk_result = None
                     st.session_state.selected_point_idx = 0
                     st.session_state.freq_range_idx = (0, data.n_points - 1)
                     st.success("Data reset to original")
@@ -4551,7 +4290,6 @@ def step1_data_loading():
                     f_min = data.freq[f_min_idx]
                     f_max = data.freq[f_max_idx]
                     data.apply_frequency_range(f_min, f_max)
-                    st.session_state.app_state.lin_kk_result = None
                     st.session_state.selected_point_idx = 0
                     st.session_state.freq_range_idx = (0, data.n_points - 1)
                     st.success(f"Applied range: {f_min:.2e} - {f_max:.2e} Hz")
@@ -4571,59 +4309,28 @@ def step1_data_loading():
             fig_bode = plot_bode_matplotlib(temp_data, highlight_idx=point_idx, freq_range_idx=freq_range_idx)
             return fig_nyquist, fig_bode
         
+        # Convert data to tuples for caching
         freq_tuple = tuple(data.freq)
         re_tuple = tuple(data.re_z)
         im_tuple = tuple(data.im_z)
         style_items = tuple(sorted(get_plot_style().items()))
         
+        # Get cached plots
         fig_nyquist, fig_bode = cached_plots(
-            freq_tuple, re_tuple, im_tuple,
+            freq_tuple, re_tuple, im_tuple, 
             st.session_state.selected_point_idx,
             st.session_state.freq_range_idx,
             data.n_points, len(data.original_freq),
             style_items
         )
         
+        # Display plots
         col1, col2 = st.columns(2)
         with col1:
             st.pyplot(fig_nyquist)
         with col2:
             st.pyplot(fig_bode)
         plt.close('all')
-
-        # --- Lin-KK Validation ---
-        with st.expander("🧪 Kramers–Kronig Validation (Lin-KK Test)", expanded=False):
-            if st.button("▶️ Run Lin-KK Test", use_container_width=True, key="run_linkk_btn"):
-                kk_res = lin_kk_test(data.freq, data.re_z, data.im_z)
-                st.session_state.app_state.lin_kk_result = kk_res
-
-            kk_res = st.session_state.app_state.lin_kk_result
-            if kk_res is not None:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Max Residual (%)", f"{kk_res['max_residual_pct']:.2f}%")
-                c2.metric("RMS Residual (%)", f"{kk_res['rms_residual_pct']:.2f}%")
-                c3.metric("RC Elements (M) / μ", f"{kk_res['M']} / {kk_res['mu']:.2f}")
-
-                if kk_res["is_valid"]:
-                    st.success("✅ Spectrum passes Lin-KK test (residuals < 1%). Data is causal and linear.")
-                else:
-                    st.warning("⚠️ Residuals exceed 1%. Check noisy/outlier points at high or low frequencies.")
-
-                fig_kk, ax_kk = plt.subplots(figsize=(9, 3.2))
-                ax_kk.tick_params(axis='both', colors='black')
-                ax_kk.xaxis.label.set_color('black')
-                ax_kk.yaxis.label.set_color('black')
-                ax_kk.semilogx(data.freq, kk_res["res_re"], 'o-', markersize=4, label="ΔRe(Z) / |Z| (%)")
-                ax_kk.semilogx(data.freq, kk_res["res_im"], 's-', markersize=4, label="ΔIm(Z) / |Z| (%)")
-                ax_kk.axhline(1.0, color='red', linestyle='--', linewidth=1, alpha=0.6)
-                ax_kk.axhline(-1.0, color='red', linestyle='--', linewidth=1, alpha=0.6)
-                ax_kk.set_xlabel("Frequency / Hz", fontweight='bold')
-                ax_kk.set_ylabel("Residual / %", fontweight='bold')
-                ax_kk.legend(loc='best')
-                ax_kk.grid(True, alpha=0.3, linestyle='--')
-                plt.tight_layout()
-                st.pyplot(fig_kk)
-                plt.close(fig_kk)
         
         # Navigation buttons
         col_prev, col_next = st.columns(2)
@@ -4635,6 +4342,7 @@ def step1_data_loading():
             if st.button("Next: DRT Analysis ➡️", type="primary", use_container_width=True):
                 st.session_state.app_state.current_step = 2
                 st.rerun()
+
 
 # ============================================================================
 # Step 2: DRT Analysis
@@ -4656,7 +4364,7 @@ def step2_drt_analysis():
     # Auto-detect inductive behavior
     has_inductive = data.detect_inductive_behavior()
     if has_inductive:
-        st.info("🔍 **Inductive behavior detected** in the high frequency region. Consider using 'Fitting with Inductance' mode or 'Robust Loewner Framework (RLF)'.")
+        st.info("🔍 **Inductive behavior detected** in the high frequency region. Consider using 'Fitting with Inductance' mode for better results.")
     
     col1, col2 = st.columns([1, 1.5])
     
@@ -4666,9 +4374,7 @@ def step2_drt_analysis():
         analysis_method = st.selectbox(
             "DRT Calculation Method",
             ["Tikhonov Regularization (NNLS)",
-             "Maximum Entropy (Py & Ciucci)",
-             "Elastic Net (L1 + L2)",
-             "Robust Loewner Framework (RLF)"]
+             "Maximum Entropy (auto-λ)"]
         )
         
         # Auto-select inductance handling based on detection
@@ -4682,9 +4388,9 @@ def step2_drt_analysis():
             ["Fitting w/o Inductance", "Fitting with Inductance", "Discard Inductive Data"],
             index=default_induct_index,
             help="""
-- Fitting w/o Inductance: Standard DRT model without inductance
-- Fitting with Inductance: Includes L as fitting parameter: Z = R∞ + i·2πf·L + DRT
-- Discard Inductive Data: Remove points with negative -Im(Z)
+            - Fitting w/o Inductance: Standard DRT model without inductance
+            - Fitting with Inductance: Includes L as fitting parameter: Z = R∞ + i·2πf·L + DRT
+            - Discard Inductive Data: Remove points with positive -Im(Z)
             """
         )
         
@@ -4693,43 +4399,19 @@ def step2_drt_analysis():
         # Method-specific parameters
         lambda_auto = True
         lambda_value = None
-        lambda_criterion = "L-curve"
         reg_order = 2
-        l1_ratio = 0.5
-        entropy_l2 = 0.0
         
         if analysis_method == "Tikhonov Regularization (NNLS)":
             reg_order = st.selectbox("Regularization order", [0, 1, 2], index=2)
-            lambda_auto = st.checkbox("Automatic λ selection", value=True)
-            if lambda_auto:
-                lambda_criterion = st.selectbox("λ selection criterion", ["L-curve", "Re-Im Discrepancy"])
-            else:
-                lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
-        
-        elif analysis_method == "Maximum Entropy (Py & Ciucci)":
-            lambda_auto = st.checkbox("Auto-select λ (L-curve)", value=True)
+            lambda_auto = st.checkbox("Automatic λ selection (L-curve)", value=True)
             if not lambda_auto:
-                lambda_value = st.number_input("Entropy λ", value=1e-3, format="%.1e")
-            use_hybrid_l2 = st.checkbox("Hybrid Entropy + L2 smoothness", value=False)
-            if use_hybrid_l2:
-                entropy_l2 = st.number_input("L2 smoothness weight (λ_L2)", value=1e-4, format="%.1e")
-        
-        elif analysis_method == "Elastic Net (L1 + L2)":
-            reg_order = st.selectbox("L2 derivative order", [0, 1, 2], index=2)
-            l1_ratio = st.slider("L1 ratio (0 = Ridge, 1 = Lasso)", 0.0, 1.0, 0.5, 0.05)
-            lambda_auto = st.checkbox("Automatic λ selection", value=True)
-            if lambda_auto:
-                lambda_criterion = st.selectbox("λ selection criterion", ["L-curve", "Re-Im Discrepancy"])
-            else:
                 lambda_value = st.number_input("λ value", value=1e-4, format="%.1e")
         
-        elif analysis_method == "Robust Loewner Framework (RLF)":
-            st.info("ℹ️ Regularization-free method (ScreeNOT SVD + AICc). Inductance is handled natively.")
-        
-        run_bootstrap = False
-        if analysis_method != "Robust Loewner Framework (RLF)":
-            run_bootstrap = st.checkbox("Compute bootstrap confidence intervals (25 runs)", value=False)
-        overlay_rlf = st.checkbox("Overlay RLF discrete poles on DRT plot", value=False)
+        elif analysis_method == "Maximum Entropy (auto-λ)":
+            entropy_lambda_auto = st.checkbox("Auto-select λ", value=True)
+            if not entropy_lambda_auto:
+                st.session_state.app_state.drt_parameters['entropy_lambda'] = st.number_input("Entropy λ", value=0.1, format="%.2f")
+            st.session_state.app_state.drt_parameters['lambda_auto'] = entropy_lambda_auto
         
         # Store parameters
         st.session_state.app_state.drt_method = analysis_method
@@ -4738,12 +4420,7 @@ def step2_drt_analysis():
             'induct_mode': induct_mode,
             'reg_order': reg_order,
             'lambda_auto': lambda_auto,
-            'lambda_value': lambda_value,
-            'lambda_criterion': lambda_criterion,
-            'l1_ratio': l1_ratio,
-            'entropy_l2': entropy_l2,
-            'run_bootstrap': run_bootstrap,
-            'overlay_rlf': overlay_rlf
+            'lambda_value': lambda_value
         })
         
         col_prev, col_next = st.columns(2)
@@ -4757,10 +4434,12 @@ def step2_drt_analysis():
                     try:
                         # Handle data discarding if needed
                         if induct_mode == "Discard Inductive Data":
+                            # Индуктивные точки имеют отрицательный data.im_z (так как data.im_z хранит -Im(Z))
                             mask = data.im_z < 0
                             n_discarded = np.sum(mask)
                             if n_discarded > 0:
                                 st.info(f"Discarding {n_discarded} inductive data points")
+                                # Create temporary data object with discarded points
                                 temp_data = ImpedanceData(
                                     data.freq[~mask],
                                     data.re_z[~mask],
@@ -4772,66 +4451,56 @@ def step2_drt_analysis():
                         else:
                             temp_data = data
                         
+                        # Check if we have enough points after discarding
                         if len(temp_data.freq) < 3:
                             st.error("Not enough data points after discarding inductive points. Please use a different mode.")
                             return
                         
+                        # Create solver with appropriate settings
                         include_inductive = (induct_mode == "Fitting with Inductance")
                         
                         if analysis_method == "Tikhonov Regularization (NNLS)":
-                            drt_solver = TikhonovDRT(temp_data, regularization_order=reg_order,
+                            drt_solver = TikhonovDRT(temp_data, regularization_order=reg_order, 
                                                      include_inductive=include_inductive)
-                            result = drt_solver.compute(
-                                n_tau=n_tau,
-                                lambda_value=lambda_value,
-                                lambda_auto=lambda_auto,
-                                lambda_criterion=lambda_criterion,
-                                include_L=include_inductive
-                            )
+                            
+                            if include_inductive:
+                                result = drt_solver.compute_with_inductance(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_value, 
+                                    lambda_auto=lambda_auto
+                                )
+                            else:
+                                result = drt_solver.compute(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_value, 
+                                    lambda_auto=lambda_auto
+                                )
                         
-                        elif analysis_method == "Maximum Entropy (Py & Ciucci)":
+                        elif analysis_method == "Maximum Entropy (auto-λ)":
                             drt_solver = MaxEntropyDRT(temp_data, include_inductive=include_inductive)
-                            result = drt_solver.compute(
-                                n_tau=n_tau,
-                                lambda_value=lambda_value,
-                                lambda_auto=lambda_auto,
-                                lambda_l2=entropy_l2,
-                                include_L=include_inductive
-                            )
-                        
-                        elif analysis_method == "Elastic Net (L1 + L2)":
-                            drt_solver = ElasticNetDRT(temp_data, regularization_order=reg_order,
-                                                       include_inductive=include_inductive)
-                            result = drt_solver.compute(
-                                n_tau=n_tau,
-                                lambda_value=lambda_value,
-                                lambda_auto=lambda_auto,
-                                l1_ratio=l1_ratio,
-                                lambda_criterion=lambda_criterion,
-                                include_L=include_inductive
-                            )
-                        
-                        elif analysis_method == "Robust Loewner Framework (RLF)":
-                            drt_solver = RobustLoewnerDRT(temp_data)
-                            result = drt_solver.compute(n_tau=n_tau)
-                            st.session_state.app_state.rlf_poles = result.metadata.get('rlf_poles', [])
-                        
-                        # Compute bootstrap uncertainty if requested
-                        if run_bootstrap and analysis_method != "Robust Loewner Framework (RLF)":
-                            result.gamma_std = drt_solver.compute_bootstrap_std(result, n_boot=25)
-                        
-                        # Compute auxiliary RLF poles for overlay if requested
-                        if overlay_rlf and analysis_method != "Robust Loewner Framework (RLF)":
-                            rlf_aux = RobustLoewnerDRT(temp_data)
-                            rlf_res_aux = rlf_aux.compute(n_tau=n_tau)
-                            st.session_state.app_state.rlf_poles = rlf_res_aux.metadata.get('rlf_poles', [])
+                            lambda_auto_val = st.session_state.app_state.drt_parameters.get('lambda_auto', True)
+                            lambda_val = st.session_state.app_state.drt_parameters.get('entropy_lambda', None)
+                            
+                            if include_inductive:
+                                result = drt_solver.compute_with_inductance(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_val, 
+                                    lambda_auto=lambda_auto_val
+                                )
+                            else:
+                                result = drt_solver.compute(
+                                    n_tau=n_tau, 
+                                    lambda_value=lambda_val, 
+                                    lambda_auto=lambda_auto_val
+                                )
                         
                         # Store results
                         st.session_state.app_state.drt_result = result
                         st.session_state.app_state.drt_solver = drt_solver
                         st.session_state.app_state.drt_calculated = True
                         
-                        # Clear deconvolution state when DRT is recalculated
+                        # IMPORTANT: Clear deconvolution state when DRT is recalculated
+                        # This ensures Step 3 uses the updated DRT spectrum
                         st.session_state.app_state.deconvolver = None
                         st.session_state.app_state.deconv_result = None
                         st.session_state.app_state.deconv_calculated = False
@@ -4841,6 +4510,7 @@ def step2_drt_analysis():
                         st.session_state.app_state.residuals_peaks = []
                         st.session_state.app_state.deconv_tau_range_idx = None
                         
+                        # Display summary
                         st.success("✅ DRT calculation complete!")
                         if include_inductive and result.L > 0:
                             st.info(f"📊 Fitted inductance L = {result.L:.3e} H")
@@ -4872,8 +4542,7 @@ def step2_drt_analysis():
                 st.info(f"**Inductance L:** {result.L:.3e} H")
             
             if result.lambda_opt is not None:
-                crit = result.metadata.get('lambda_criterion', '')
-                st.info(f"**λ:** {result.lambda_opt:.3e} ({crit})")
+                st.info(f"**λ:** {result.lambda_opt:.3e}")
             
             # Display integral verification
             integral, ratio = result.verify_integral()
@@ -4886,7 +4555,8 @@ def step2_drt_analysis():
             if solver is not None:
                 Z_rec_real, Z_rec_imag = solver.reconstruct_impedance(result.tau_grid, result.gamma, result.L)
                 
-                Z_original = solver.Z
+                # Calculate reconstruction error
+                Z_original = data.Z
                 Z_reconstructed = Z_rec_real + 1j * Z_rec_imag
                 error_percent = np.abs((Z_original - Z_reconstructed) / (Z_original + 1e-10)) * 100
                 mean_error = np.mean(error_percent)
@@ -4898,28 +4568,32 @@ def step2_drt_analysis():
                 **Max Error:** {max_error:.2f}%
                 """)
                 
+                # Display validation plots
                 st.markdown("---")
                 st.subheader("🔍 Validation: Original vs Reconstructed Impedance")
                 
                 # Nyquist plot
                 fig_nyq, ax_nyq = plt.subplots(figsize=(8, 6))
+                # Make axis tick labels black
                 ax_nyq.tick_params(axis='both', colors='black')
                 ax_nyq.xaxis.label.set_color('black')
                 ax_nyq.yaxis.label.set_color('black')
-                ax_nyq.plot(solver.Z_real, solver.Z_imag, 'o', markersize=6,
+                ax_nyq.plot(data.re_z, data.im_z, 'o', markersize=6, 
                            label='Experimental', color='#1f77b4', alpha=0.7)
-                ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5,
+                ax_nyq.plot(Z_rec_real, Z_rec_imag, '-', linewidth=2.5, 
                            label='Reconstructed from DRT', color='#ff7f0e')
                 ax_nyq.set_xlabel("Re(Z) / Ohm", fontweight='bold')
                 ax_nyq.set_ylabel("-Im(Z) / Ohm", fontweight='bold')
+                # No title - removed as requested
                 ax_nyq.legend(loc='best', frameon=True)
                 ax_nyq.grid(True, alpha=0.3, linestyle='--')
                 ax_nyq.set_aspect('equal', adjustable='box')
                 st.pyplot(fig_nyq)
-                plt.close(fig_nyq)
+                plt.close()
                 
                 # Bode plots
                 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
+                # Make axis tick labels black
                 ax1.tick_params(axis='both', colors='black')
                 ax2.tick_params(axis='both', colors='black')
                 ax1.xaxis.label.set_color('black')
@@ -4927,22 +4601,24 @@ def step2_drt_analysis():
                 ax2.xaxis.label.set_color('black')
                 ax2.yaxis.label.set_color('black')
                 
-                mag_exp = np.sqrt(solver.Z_real**2 + solver.Z_imag**2)
+                # Magnitude plot
+                mag_exp = data.Z_mod
                 mag_rec = np.sqrt(Z_rec_real**2 + Z_rec_imag**2)
-                ax1.loglog(solver.frequencies, mag_exp, 'o', markersize=6,
+                ax1.loglog(data.freq, mag_exp, 'o', markersize=6, 
                           label='Experimental', color='#1f77b4', alpha=0.7)
-                ax1.loglog(solver.frequencies, mag_rec, '-', linewidth=2.5,
+                ax1.loglog(data.freq, mag_rec, '-', linewidth=2.5, 
                           label='Reconstructed', color='#ff7f0e')
                 ax1.set_xlabel("Frequency / Hz", fontweight='bold')
                 ax1.set_ylabel("|Z| / Ohm", fontweight='bold')
                 ax1.legend(loc='best')
                 ax1.grid(True, alpha=0.3, linestyle='--')
                 
-                phase_exp = np.arctan2(solver.Z_imag, solver.Z_real) * 180 / np.pi
+                # Phase plot
+                phase_exp = data.phase
                 phase_rec = np.arctan2(Z_rec_imag, Z_rec_real) * 180 / np.pi
-                ax2.semilogx(solver.frequencies, phase_exp, 'o', markersize=6,
+                ax2.semilogx(data.freq, phase_exp, 'o', markersize=6, 
                             label='Experimental', color='#1f77b4', alpha=0.7)
-                ax2.semilogx(solver.frequencies, phase_rec, '-', linewidth=2.5,
+                ax2.semilogx(data.freq, phase_rec, '-', linewidth=2.5, 
                             label='Reconstructed', color='#ff7f0e')
                 ax2.set_xlabel("Frequency / Hz", fontweight='bold')
                 ax2.set_ylabel("Phase / deg", fontweight='bold')
@@ -4950,25 +4626,27 @@ def step2_drt_analysis():
                 ax2.grid(True, alpha=0.3, linestyle='--')
                 ax2.axhline(y=0, color='k', linestyle='-', linewidth=0.8, alpha=0.5)
                 
+                # No overall figure title - removed as requested
                 plt.tight_layout()
                 st.pyplot(fig)
-                plt.close(fig)
+                plt.close()
                 
                 # Error plot
                 fig_err, ax_err = plt.subplots(figsize=(8, 5))
                 ax_err.tick_params(axis='both', colors='black')
                 ax_err.xaxis.label.set_color('black')
                 ax_err.yaxis.label.set_color('black')
-                ax_err.semilogx(solver.frequencies, error_percent, 'o-', markersize=5,
+                ax_err.semilogx(data.freq, error_percent, 'o-', markersize=5, 
                                linewidth=1.5, color='#d62728')
                 ax_err.set_xlabel("Frequency / Hz", fontweight='bold')
                 ax_err.set_ylabel("Relative Error / %", fontweight='bold')
+                # No title - removed as requested
                 ax_err.grid(True, alpha=0.3, linestyle='--')
-                ax_err.axhline(y=mean_error, color='gray', linestyle='--',
+                ax_err.axhline(y=mean_error, color='gray', linestyle='--', 
                               label=f'Mean Error: {mean_error:.2f}%')
                 ax_err.legend()
                 st.pyplot(fig_err)
-                plt.close(fig_err)
+                plt.close()
                 
                 # If inductance was fitted, show its contribution
                 if result.L > 0:
@@ -4979,33 +4657,24 @@ def step2_drt_analysis():
                     ax_L.tick_params(axis='both', colors='black')
                     ax_L.xaxis.label.set_color('black')
                     ax_L.yaxis.label.set_color('black')
-                    omega = 2 * np.pi * solver.frequencies
+                    omega = 2 * np.pi * data.freq
                     L_contribution = omega * result.L
-                    ax_L.loglog(solver.frequencies, L_contribution, '-', linewidth=2, color='#9467bd', label='L contribution to -Im(Z)')
+                    ax_L.loglog(data.freq, L_contribution, '-', linewidth=2, color='#9467bd', label='L contribution to -Im(Z)')
                     ax_L.set_xlabel("Frequency / Hz", fontweight='bold')
                     ax_L.set_ylabel("-ωL / Ohm", fontweight='bold')
+                    # No title - removed as requested
                     ax_L.grid(True, alpha=0.3, linestyle='--')
                     ax_L.legend()
                     st.pyplot(fig_L)
-                    plt.close(fig_L)
+                    plt.close()
             
             # DRT plot
             st.markdown("---")
             st.subheader("📈 DRT Spectrum")
             peaks = find_peaks_drt(result.tau_grid, result.gamma, prominence=0.05)
-            poles_to_show = st.session_state.app_state.rlf_poles if (
-                overlay_rlf or result.method.startswith("Robust Loewner")
-            ) else None
-            fig_drt = plot_drt_matplotlib(result, peaks, rlf_poles=poles_to_show)
+            fig_drt = plot_drt_matplotlib(result, peaks)
             st.pyplot(fig_drt)
-            plt.close(fig_drt)
-
-            if poles_to_show:
-                with st.expander("📌 RLF Discrete Poles (R_i, τ_i)", expanded=False):
-                    st.dataframe(pd.DataFrame([
-                        {"τ (s)": f"{p['tau']:.3e}", "f (Hz)": f"{p['frequency']:.3e}", "R (Ω)": f"{p['R']:.4e}"}
-                        for p in poles_to_show
-                    ]), use_container_width=True, hide_index=True)
+            plt.close()
             
             col_prev, col_next = st.columns(2)
             with col_prev:
@@ -5022,7 +4691,6 @@ def step2_drt_analysis():
 # ============================================================================
 # Step 3: Gaussian Deconvolution of DRT Peaks
 # ============================================================================
-
 def step3_gaussian_deconvolution():
     """Step 3: Perform Gaussian deconvolution on DRT peaks"""
     st.header("📈 Step 3: Gaussian Deconvolution of DRT Peaks")
@@ -5057,7 +4725,7 @@ def step3_gaussian_deconvolution():
     if st.session_state.app_state.deconvolver is None:
         deconvolver = GaussianDeconvolver(
             x_linear=cropped_tau,
-            y_original=cropped_gamma,
+            y_original=cropped_gamma,  # Используем обрезанные оригинальные ненормированные значения
             use_log_x=True,
             use_log_y=False,
             clip_negative=st.session_state.app_state.clip_negative,
@@ -5067,6 +4735,7 @@ def step3_gaussian_deconvolution():
         )
         st.session_state.app_state.deconvolver = deconvolver
         
+        # Auto-detect peaks immediately on entry or range change
         with st.spinner("Auto-detecting peaks..."):
             peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
                 sensitivity=st.session_state.app_state.sensitivity,
@@ -5095,6 +4764,7 @@ def step3_gaussian_deconvolution():
             help="Move left/right sliders to exclude regularization tails from peak detection and Gaussian fitting"
         )
         
+        # Проверка минимального числа точек для стабильной работы фильтра Савицкого-Голея и curve_fit
         if range_max_idx - range_min_idx < 10:
             st.warning("⚠️ Please select at least 10 points for reliable fitting.")
         elif (range_min_idx, range_max_idx) != (curr_min_idx, curr_max_idx):
@@ -5124,7 +4794,7 @@ def step3_gaussian_deconvolution():
         st.markdown("---")
         st.subheader("🔍 Peak Detection Parameters")
         
-        sensitivity = st.slider("Sensitivity", 0.001, 0.1,
+        sensitivity = st.slider("Sensitivity", 0.001, 0.1, 
                                value=st.session_state.app_state.sensitivity,
                                step=0.001, format="%.3f")
         min_distance = st.slider("Minimum distance between peaks", 1, 20,
@@ -5133,6 +4803,7 @@ def step3_gaussian_deconvolution():
         if sensitivity != st.session_state.app_state.sensitivity or min_distance != st.session_state.app_state.min_distance:
             st.session_state.app_state.sensitivity = sensitivity
             st.session_state.app_state.min_distance = min_distance
+            # Redetect peaks
             with st.spinner("Re-detecting peaks..."):
                 peaks, peak_info, initial_params, derivatives = deconvolver.auto_detect_peaks(
                     sensitivity=sensitivity, min_distance=min_distance
@@ -5147,8 +4818,10 @@ def step3_gaussian_deconvolution():
         st.markdown("---")
         st.subheader("Manual Peak Addition")
         
+        # Get number of data points in active region for point selection
         n_points = len(deconvolver.x_linear)
         
+        # Create slider by point index (1-based for user-friendly)
         point_index = st.slider("Select peak by point index:",
                                min_value=1,
                                max_value=n_points,
@@ -5156,8 +4829,12 @@ def step3_gaussian_deconvolution():
                                step=1,
                                help="Select point index (1 to {}) inside active region to add peak at that position".format(n_points))
         
+        # Convert index to actual τ value
         manual_position = deconvolver.x_linear[point_index - 1]
+        
+        # Display the τ value for reference
         st.info(f"Selected position: τ = {manual_position:.3e} s (point {point_index}/{n_points})")
+        
         st.session_state.app_state.manual_peak_position = manual_position
         
         col_add1, col_add2 = st.columns(2)
@@ -5166,6 +4843,7 @@ def step3_gaussian_deconvolution():
                 new_peak, new_params = deconvolver.add_manual_peak(manual_position)
                 if st.session_state.app_state.peak_info is None:
                     st.session_state.app_state.peak_info = []
+                # Assign ID for tracking
                 new_peak['id'] = len(st.session_state.app_state.peak_info) + 1
                 st.session_state.app_state.peak_info.append(new_peak)
                 if st.session_state.app_state.initial_peak_params is None:
@@ -5199,26 +4877,6 @@ def step3_gaussian_deconvolution():
                         st.rerun()
                     else:
                         st.info("No additional peaks found in residuals")
-
-        # Seed peaks from RLF poles if available
-        if st.session_state.app_state.rlf_poles:
-            if st.button("⚡ Seed Peaks from RLF Poles", use_container_width=True):
-                new_peak_info, new_params = [], []
-                tau_lo, tau_hi = float(deconvolver.x_linear[0]), float(deconvolver.x_linear[-1])
-                for p in st.session_state.app_state.rlf_poles:
-                    if p['R'] > 0 and tau_lo <= p['tau'] <= tau_hi:
-                        p_entry, p_par = deconvolver.add_manual_peak(p['tau'])
-                        p_entry['source'] = 'rlf'
-                        p_entry['id'] = len(new_peak_info) + 1
-                        new_peak_info.append(p_entry)
-                        new_params.extend(p_par)
-                if new_peak_info:
-                    st.session_state.app_state.peak_info = new_peak_info
-                    st.session_state.app_state.initial_peak_params = new_params
-                    st.success(f"Seeded {len(new_peak_info)} peaks from RLF poles")
-                    st.rerun()
-                else:
-                    st.warning("No positive RLF poles fall inside the active τ range.")
         
         st.markdown("---")
         
@@ -5230,6 +4888,7 @@ def step3_gaussian_deconvolution():
         with col_next:
             if st.button("🎯 Perform Deconvolution", type="primary", use_container_width=True):
                 with st.spinner("Performing Gaussian deconvolution..."):
+                    # Ensure peak_info is initialized
                     if st.session_state.app_state.peak_info is None or len(st.session_state.app_state.peak_info) == 0:
                         peaks, peak_info, initial_params, _ = deconvolver.auto_detect_peaks(
                             sensitivity=sensitivity, min_distance=min_distance
@@ -5238,6 +4897,7 @@ def step3_gaussian_deconvolution():
                         st.session_state.app_state.initial_peak_params = initial_params
                         st.success(f"Auto-detected {len(peak_info)} peaks")
                     
+                    # Check if we have peaks to fit
                     if st.session_state.app_state.initial_peak_params is None or len(st.session_state.app_state.initial_peak_params) == 0:
                         st.error("No peaks detected. Please adjust sensitivity or add manual peaks.")
                     else:
@@ -5248,6 +4908,7 @@ def step3_gaussian_deconvolution():
                             progress_bar.progress(progress)
                             status_text.text(message)
                         
+                        # Ensure initial_params is a list, not None
                         initial_params = st.session_state.app_state.initial_peak_params
                         if isinstance(initial_params, np.ndarray):
                             initial_params = initial_params.tolist()
@@ -5259,7 +4920,7 @@ def step3_gaussian_deconvolution():
                             fit_quality=st.session_state.app_state.fit_quality,
                             last_popt=st.session_state.app_state.last_popt,
                             progress_callback=update_progress,
-                            use_iterative_refinement=True
+                            use_iterative_refinement=True  # Enable 3-stage optimization
                         )
                         
                         progress_bar.empty()
@@ -5281,6 +4942,7 @@ def step3_gaussian_deconvolution():
         if st.session_state.app_state.peak_info is not None:
             fig, ax = plt.subplots(figsize=(10, 6))
             
+            # Make axis tick labels black
             ax.tick_params(axis='both', colors='black')
             ax.xaxis.label.set_color('black')
             ax.yaxis.label.set_color('black')
@@ -5288,9 +4950,10 @@ def step3_gaussian_deconvolution():
             if deconvolver.use_log_x:
                 ax.set_xscale('log')
             
+            # Визуализация отсекаемых хвостов серым фоном и пунктиром
             is_cropped = (curr_min_idx > 0) or (curr_max_idx < n_total_tau - 1)
             if is_cropped:
-                ax.plot(full_tau, full_gamma, 'o--', markersize=2.5, linewidth=1,
+                ax.plot(full_tau, full_gamma, 'o--', markersize=2.5, linewidth=1, 
                         alpha=0.35, color='#7f8c8d', label='Excluded Tails', zorder=1)
                 if curr_min_idx > 0:
                     ax.axvspan(full_tau[0], tau_start, color='#e2e8f0', alpha=0.65, zorder=0)
@@ -5299,11 +4962,12 @@ def step3_gaussian_deconvolution():
                     ax.axvspan(tau_end, full_tau[-1], color='#e2e8f0', alpha=0.65, zorder=0)
                     ax.axvline(x=tau_end, color='#4a5568', linestyle=':', linewidth=1.5, zorder=2)
             
-            ax.plot(deconvolver.x_linear, deconvolver.y_original,
-                   'o-', markersize=3, linewidth=1.2, alpha=0.85,
+            # Отображаем активную область DRT оригинального масштаба
+            ax.plot(deconvolver.x_linear, deconvolver.y_original, 
+                   'o-', markersize=3, linewidth=1.2, alpha=0.85, 
                    label='DRT Data (active region)', color='black', zorder=2)
             
-            source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4', 'rlf': '#9467bd'}
+            source_colors = {'auto': '#2ca02c', 'manual': '#ff7f0e', 'residuals': '#1f77b4'}
             peaks_legend_added = False
             for idx, info in enumerate(st.session_state.app_state.peak_info):
                 source = info.get('source', 'auto')
@@ -5311,20 +4975,21 @@ def step3_gaussian_deconvolution():
                 peak_label = 'Detected Peaks' if not peaks_legend_added else "_nolegend_"
                 peaks_legend_added = True
                 
+                # Используем y_original для отображения
                 y_val = info.get('y_original', info.get('y', 0))
-                ax.plot(info['x_linear'], y_val, 'o',
-                       markersize=8, markeredgecolor='darkred',
+                ax.plot(info['x_linear'], y_val, 'o', 
+                       markersize=8, markeredgecolor='darkred', 
                        markerfacecolor=color, label=peak_label, zorder=4)
-                ax.text(info['x_linear'], y_val * 1.05,
-                       f'τ={info["x_linear"]:.2e}s', ha='center',
+                ax.text(info['x_linear'], y_val * 1.05, 
+                       f'τ={info["x_linear"]:.2e}s', ha='center', 
                        fontsize=8, rotation=45)
             
             if st.session_state.app_state.manual_peak_position is not None:
                 idx = np.argmin(np.abs(deconvolver.x_linear - st.session_state.app_state.manual_peak_position))
                 y_at_position = deconvolver.y_original[idx]
-                ax.axvline(x=st.session_state.app_state.manual_peak_position,
+                ax.axvline(x=st.session_state.app_state.manual_peak_position, 
                           color='red', linestyle='--', linewidth=1.5, alpha=0.7, zorder=3)
-                ax.plot(st.session_state.app_state.manual_peak_position, y_at_position,
+                ax.plot(st.session_state.app_state.manual_peak_position, y_at_position, 
                        'ro', markersize=10, zorder=5)
             
             ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold')
@@ -5333,8 +4998,9 @@ def step3_gaussian_deconvolution():
             ax.grid(True, alpha=0.3, linestyle='--')
             
             st.pyplot(fig)
-            plt.close(fig)
+            plt.close()
             
+            # Подсказка с пересчитанным интегралом сопротивления без учета хвостов
             full_integral = drt_result.get_integral()
             active_integral = deconvolver.drt_integral
             st.caption(
@@ -5342,13 +5008,14 @@ def step3_gaussian_deconvolution():
                 f"(Full spectrum integral with tails: `{full_integral:.4f} Ω`)"
             )
             
+            # Peak info table with delete buttons
             if st.session_state.app_state.peak_info:
                 st.subheader("Peak List")
                 
                 for i, info in enumerate(st.session_state.app_state.peak_info):
                     col_a, col_b, col_c, col_d, col_e = st.columns([0.5, 2, 2, 2, 1])
                     source = info.get('source', 'auto')
-                    source_icon = "🟢" if source == 'auto' else "🟠" if source == 'manual' else "🟣" if source == 'rlf' else "🔵"
+                    source_icon = "🟢" if source == 'auto' else "🟠" if source == 'manual' else "🔵"
                     
                     with col_a:
                         st.write(f"{i+1}")
@@ -5357,12 +5024,15 @@ def step3_gaussian_deconvolution():
                     with col_c:
                         st.write(f"τ = {info['x_linear']:.4e} s")
                     with col_d:
+                        # Отображаем оригинальное значение y
                         y_value = info.get('y_original', info.get('y', 0))
                         st.write(f"γ = {y_value:.4e} Ω")
                     with col_e:
                         if st.button("🗑️", key=f"delete_peak_{i}", help=f"Delete peak {i+1}"):
                             if 0 <= i < len(st.session_state.app_state.peak_info):
+                                # Удаляем информацию о пике
                                 st.session_state.app_state.peak_info.pop(i)
+                                # Удаляем параметры пика (3 параметра на пик)
                                 if st.session_state.app_state.initial_peak_params:
                                     start_idx = i * 3
                                     del st.session_state.app_state.initial_peak_params[start_idx:start_idx + 3]
@@ -5371,6 +5041,7 @@ def step3_gaussian_deconvolution():
                 
                 st.markdown("---")
                 
+                # Additional statistics
                 col1_stat, col2_stat, col3_stat = st.columns(3)
                 with col1_stat:
                     auto_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', 'auto') == 'auto')
@@ -5379,8 +5050,8 @@ def step3_gaussian_deconvolution():
                     manual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'manual')
                     st.metric("Manually added", manual_count)
                 with col3_stat:
-                    residual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') in ('residuals', 'rlf'))
-                    st.metric("From residuals / RLF", residual_count)
+                    residual_count = sum(1 for p in st.session_state.app_state.peak_info if p.get('source', '') == 'residuals')
+                    st.metric("From residuals", residual_count)
         
         elif st.session_state.app_state.deconv_calculated and st.session_state.app_state.deconv_result:
             st.success("✅ Deconvolution completed!")
@@ -5408,6 +5079,7 @@ def step4_results():
     drt_result = st.session_state.app_state.drt_result
     data = st.session_state.app_state.impedance_data
     
+    # Navigation buttons
     col_prev, col_next = st.columns([1, 5])
     with col_prev:
         if st.button("⬅️ Back to Deconvolution", use_container_width=True):
@@ -5416,13 +5088,16 @@ def step4_results():
     
     st.markdown("---")
     
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Deconvolution Plot", "📊 Area Distribution", "📋 Complete Dataset",
+    # Tabs for different views - UPDATED: added "Output Graphs" tab
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Deconvolution Plot", "📊 Area Distribution", "📋 Complete Dataset", 
                                                    "📈 Normalized View", "📊 Output Graphs", "📥 Export"])
     
     with tab1:
         st.subheader("Gaussian Deconvolution Result")
         
         fig, ax = plt.subplots(figsize=(12, 7))
+        
+        # Make axis tick labels black
         ax.tick_params(axis='both', colors='black')
         ax.xaxis.label.set_color('black')
         ax.yaxis.label.set_color('black')
@@ -5430,7 +5105,7 @@ def step4_results():
         if deconv_result.use_log_x:
             ax.set_xscale('log')
         
-        ax.scatter(deconv_result.x_linear, deconv_result.y_original,
+        ax.scatter(deconv_result.x_linear, deconv_result.y_original, 
                    s=15, alpha=0.5, color='black', label='Original DRT Data', zorder=1)
         
         if deconv_result.use_log_x:
@@ -5439,7 +5114,7 @@ def step4_results():
             x_dense = np.logspace(np.log10(x_min), np.log10(x_max), 2000)
             x_dense_log = np.log10(x_dense)
         else:
-            x_dense = np.linspace(np.min(deconv_result.x_linear),
+            x_dense = np.linspace(np.min(deconv_result.x_linear), 
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
         
@@ -5454,7 +5129,7 @@ def step4_results():
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )
                 
-                ax.fill_between(x_dense, 0, y_component,
+                ax.fill_between(x_dense, 0, y_component, 
                                 color=color, alpha=0.3, linewidth=0)
                 ax.plot(x_dense, y_component, '-', color=color, linewidth=2,
                        label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
@@ -5467,14 +5142,14 @@ def step4_results():
                 y_baseline = deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
             elif deconv_result.baseline_method == 'quadratic':
-                y_baseline = (deconv_result.baseline_params[0] +
+                y_baseline = (deconv_result.baseline_params[0] + 
                              deconv_result.baseline_params[1] * x_dense_log +
                              deconv_result.baseline_params[2] * x_dense_log**2)
                 ax.plot(x_dense, y_baseline, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
         if deconv_result.fit_y_original is not None:
             from scipy.interpolate import interp1d
-            interp_func = interp1d(deconv_result.x_linear, deconv_result.fit_y_original,
+            interp_func = interp1d(deconv_result.x_linear, deconv_result.fit_y_original, 
                                    kind='cubic', fill_value='extrapolate')
             y_total_interp = interp_func(x_dense)
             ax.plot(x_dense, y_total_interp, 'r--', linewidth=2.5, label='Total Fit', zorder=3)
@@ -5491,7 +5166,7 @@ def step4_results():
                 elif deconv_result.baseline_method == 'linear':
                     y_total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * x_dense_log
                 elif deconv_result.baseline_method == 'quadratic':
-                    y_total += (deconv_result.baseline_params[0] +
+                    y_total += (deconv_result.baseline_params[0] + 
                                deconv_result.baseline_params[1] * x_dense_log +
                                deconv_result.baseline_params[2] * x_dense_log**2)
             
@@ -5499,6 +5174,7 @@ def step4_results():
         
         ax.set_xlabel('Relaxation Time τ (s)', fontweight='bold', fontsize=12)
         ax.set_ylabel('γ(τ) (Ω)', fontweight='bold', fontsize=12)
+        # No title - removed as requested
         ax.legend(loc='upper left', fontsize=9, frameon=True, edgecolor='black')
         ax.grid(True, alpha=0.3, linestyle='--')
         
@@ -5519,10 +5195,12 @@ def step4_results():
         
         with col1:
             fig, ax = plt.subplots(figsize=(8, 6))
+            # Make axis tick labels black
             ax.tick_params(axis='both', colors='black')
             ax.xaxis.label.set_color('black')
             ax.yaxis.label.set_color('black')
             
+            # Sort peaks by ID
             peaks_sorted = sorted(deconv_result.peaks, key=lambda p: p.id)
             peaks_ids = [f'Peak {p.id}' for p in peaks_sorted]
             fractions = [p.fraction_percent for p in peaks_sorted]
@@ -5533,6 +5211,7 @@ def step4_results():
             bars = ax.bar(peaks_ids, fractions, color=colors_sorted, edgecolor='black', alpha=0.7)
             ax.set_xlabel('Peak', fontweight='bold')
             ax.set_ylabel('Fraction (%)', fontweight='bold')
+            # No title - removed as requested
             ax.set_ylim(0, max(fractions) * 1.2 if fractions else 100)
             ax.grid(True, alpha=0.3, axis='y')
             
@@ -5544,16 +5223,17 @@ def step4_results():
             ax.tick_params(axis='x', rotation=45)
             plt.tight_layout()
             st.pyplot(fig)
-            plt.close(fig)
+            plt.close()
         
         with col2:
             fig, ax = plt.subplots(figsize=(8, 6))
             wedges, texts, autotexts = ax.pie(fractions, labels=peaks_ids, autopct='%1.1f%%',
                                                colors=colors_sorted, startangle=90,
                                                textprops={'fontweight': 'bold'})
+            # No title - removed as requested
             plt.tight_layout()
             st.pyplot(fig)
-            plt.close(fig)
+            plt.close()
         
         st.markdown("---")
         st.subheader("Summary Statistics")
@@ -5573,6 +5253,7 @@ def step4_results():
     with tab3:
         st.subheader("Complete Dataset - Peak Parameters")
         
+        # Create detailed table with Fmax and C columns
         data_rows = []
         for peak in deconv_result.peaks:
             char = calculate_peak_characteristics(peak)
@@ -5625,9 +5306,11 @@ def step4_results():
                 st.metric("Method", drt_result.method)
                 st.metric("R∞", f"{drt_result.R_inf:.4f} Ω")
             with meta_col2:
+                # Rpol should equal sum of peak areas from deconvolution
                 if deconv_result is not None and deconv_result.peaks:
                     rpol_from_peaks = sum([p.area for p in deconv_result.peaks])
                     st.metric("Rpol (sum of peak areas)", f"{rpol_from_peaks:.4f} Ω")
+                    # Also show DRT integral for reference
                     st.caption(f"DRT integral: {drt_result.R_pol:.4f} Ω")
                 else:
                     st.metric("Rpol", f"{drt_result.R_pol:.4f} Ω")
@@ -5639,6 +5322,7 @@ def step4_results():
                 integral, ratio = drt_result.verify_integral()
                 st.metric("Integral Ratio", f"{ratio:.3f}")
     
+        
     with tab4:
         st.subheader("Normalized Gaussian Deconvolution Result")
         
@@ -5654,6 +5338,7 @@ def step4_results():
         ax_res = fig.add_subplot(gs[1, 0], sharex=ax)
         cax = fig.add_subplot(gs[1, 1])
         
+        # Make axis tick labels black
         for axis in (ax, ax_res):
             axis.tick_params(axis='both', colors='black')
             axis.xaxis.label.set_color('black')
@@ -5666,7 +5351,7 @@ def step4_results():
         max_amp = max(deconv_result.y_original) if len(deconv_result.y_original) > 0 else 1.0
         y_original_norm = deconv_result.y_original / max_amp
         
-        ax.scatter(deconv_result.x_linear, y_original_norm,
+        ax.scatter(deconv_result.x_linear, y_original_norm, 
                    s=15, alpha=0.5, color='black', label='Original DRT Data (normalized)', zorder=1)
         
         if deconv_result.use_log_x:
@@ -5676,7 +5361,7 @@ def step4_results():
             x_dense_log = np.log10(x_dense)
             x_data_eval = np.log10(np.maximum(deconv_result.x_linear, 1e-15))
         else:
-            x_dense = np.linspace(np.min(deconv_result.x_linear),
+            x_dense = np.linspace(np.min(deconv_result.x_linear), 
                                   np.max(deconv_result.x_linear), 2000)
             x_dense_log = x_dense
             x_data_eval = deconv_result.x_linear
@@ -5692,7 +5377,7 @@ def step4_results():
                     x_dense_log, 1.0, peak.center_log, peak.sigma_log
                 )) / max_amp
                 
-                ax.fill_between(x_dense, 0, y_component_norm,
+                ax.fill_between(x_dense, 0, y_component_norm, 
                                 color=color, alpha=0.3, linewidth=0)
                 ax.plot(x_dense, y_component_norm, '-', color=color, linewidth=2,
                        label=f'Peak {peak.id}: {peak.fraction_percent:.1f}%', zorder=2)
@@ -5702,19 +5387,20 @@ def step4_results():
                 y_baseline_norm = deconv_result.baseline_params[0] / max_amp
                 ax.axhline(y=y_baseline_norm, color='gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
             elif deconv_result.baseline_method == 'linear':
-                y_baseline_norm = (deconv_result.baseline_params[0] +
+                y_baseline_norm = (deconv_result.baseline_params[0] + 
                                   deconv_result.baseline_params[1] * x_dense_log) / max_amp
                 ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
             elif deconv_result.baseline_method == 'quadratic':
-                y_baseline_norm = (deconv_result.baseline_params[0] +
+                y_baseline_norm = (deconv_result.baseline_params[0] + 
                                   deconv_result.baseline_params[1] * x_dense_log +
                                   deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
                 ax.plot(x_dense, y_baseline_norm, 'gray', linestyle=':', linewidth=1.5, label='Baseline', zorder=1)
         
+        # Calculate normalized total fit at dense grid and at exact data points
         if deconv_result.fit_y_original is not None:
             from scipy.interpolate import interp1d
             fit_at_data_norm = deconv_result.fit_y_original / max_amp
-            interp_func = interp1d(deconv_result.x_linear, fit_at_data_norm,
+            interp_func = interp1d(deconv_result.x_linear, fit_at_data_norm, 
                                    kind='cubic', fill_value='extrapolate')
             y_total_norm_interp = interp_func(x_dense)
             ax.plot(x_dense, y_total_norm_interp, 'r--', linewidth=2.5, label='Total Fit (normalized)', zorder=3)
@@ -5734,15 +5420,15 @@ def step4_results():
                     y_total_norm += deconv_result.baseline_params[0] / max_amp
                     fit_at_data_norm += deconv_result.baseline_params[0] / max_amp
                 elif deconv_result.baseline_method == 'linear':
-                    y_total_norm += (deconv_result.baseline_params[0] +
+                    y_total_norm += (deconv_result.baseline_params[0] + 
                                     deconv_result.baseline_params[1] * x_dense_log) / max_amp
-                    fit_at_data_norm += (deconv_result.baseline_params[0] +
+                    fit_at_data_norm += (deconv_result.baseline_params[0] + 
                                         deconv_result.baseline_params[1] * x_data_eval) / max_amp
                 elif deconv_result.baseline_method == 'quadratic':
-                    y_total_norm += (deconv_result.baseline_params[0] +
+                    y_total_norm += (deconv_result.baseline_params[0] + 
                                     deconv_result.baseline_params[1] * x_dense_log +
                                     deconv_result.baseline_params[2] * x_dense_log**2) / max_amp
-                    fit_at_data_norm += (deconv_result.baseline_params[0] +
+                    fit_at_data_norm += (deconv_result.baseline_params[0] + 
                                         deconv_result.baseline_params[1] * x_data_eval +
                                         deconv_result.baseline_params[2] * x_data_eval**2) / max_amp
             
@@ -5753,6 +5439,7 @@ def step4_results():
         ax.grid(True, alpha=0.3, linestyle='--')
         ax.tick_params(labelbottom=False)
         
+        # --- Residual curve with thermal color scale ---
         residuals_norm = y_original_norm - fit_at_data_norm
         ss_res = np.sum(residuals_norm ** 2)
         ss_tot = np.sum((y_original_norm - np.mean(y_original_norm)) ** 2)
@@ -5769,6 +5456,7 @@ def step4_results():
             s=28, edgecolors='black', linewidths=0.3, zorder=3
         )
         
+        # Colorbar aligned with residual subplot
         cbar = fig.colorbar(sc, cax=cax)
         cbar.set_label('Δ (norm)', fontsize=9, fontweight='bold')
         cbar.ax.tick_params(labelsize=8, colors='black')
@@ -5786,12 +5474,14 @@ def step4_results():
         )
         
         render_plot_with_download(fig, "normalized_deconvolution", key_prefix="tab4")
+        
         st.caption(f"Normalized to maximum value γ_max = {max_amp:.4e} Ω")
     
     with tab5:
         st.subheader("📊 Output Graphs")
         st.markdown("Comprehensive visualization of impedance spectroscopy analysis results")
         
+        # Graph 2.1 - Original Impedance Spectrum
         st.markdown("**2.1 Original Impedance Spectrum**")
         if data is not None:
             fig1 = plot_original_nyquist_with_frequency_labels(data, "Original Nyquist Spectrum")
@@ -5799,18 +5489,20 @@ def step4_results():
         else:
             st.warning("No impedance data available")
         
-        st.markdown("***")
+        st.markdown("***")  # Separator
         
+        # Graph 2.2 - Gaussian Deconvolution vs Frequency
         st.markdown("**2.2 Gaussian Deconvolution vs Frequency**")
         if deconv_result is not None:
-            fig2 = plot_deconvolution_vs_frequency(deconv_result, drt_result,
+            fig2 = plot_deconvolution_vs_frequency(deconv_result, drt_result, 
                                                    "DRT Deconvolution vs Frequency")
             render_plot_with_download(fig2, "deconvolution_vs_freq", key_prefix="tab5")
         else:
             st.warning("No deconvolution results available")
         
-        st.markdown("***")
+        st.markdown("***")  # Separator
         
+        # Graph 2.3 - Peak Area Distribution (Resistance Contributions)
         st.markdown("**2.3 Peak Area Distribution (Resistance Contributions)**")
         if deconv_result is not None:
             fig3 = plot_peak_area_distribution_with_values(deconv_result, drt_result,
@@ -5819,14 +5511,16 @@ def step4_results():
         else:
             st.warning("No deconvolution results available")
         
-        st.markdown("***")
+        st.markdown("***")  # Separator
 
+        # Graph 2.4 - Experimental vs Sequential RQ Model
         st.markdown("**2.4 Experimental vs Sequential RQ (ZARC) Model**")
         if deconv_result is not None and drt_result is not None and data is not None:
             fig4 = plot_sequential_rc_model(deconv_result, drt_result, data,
                                             "Experimental vs Sequential RQ Model")
             render_plot_with_download(fig4, "sequential_rq_model", key_prefix="tab5")
             
+            # Display R_i, Q_i, alpha_i, C_i, f_i table directly under Graph 2.4
             if deconv_result.peaks:
                 st.markdown("**Equivalent RQ (ZARC) Parameters per Process:**")
                 rq_rows = []
@@ -5845,6 +5539,7 @@ def step4_results():
         else:
             st.warning("Insufficient data for model comparison")
         
+        # Add explanatory text
         st.markdown("---")
         st.markdown("""
         **Graph Explanations:**
@@ -5874,6 +5569,7 @@ def step4_results():
         with col1:
             st.markdown("**Export Peak Data** *(for Complete Dataset table)*")
             
+            # Create peaks DataFrame with Fmax and C columns
             peaks_data = []
             for p in deconv_result.peaks:
                 char = calculate_peak_characteristics(p)
@@ -5912,21 +5608,27 @@ def step4_results():
             else:
                 fit_values = np.zeros_like(deconv_result.x_linear)
                 for i, tau in enumerate(deconv_result.x_linear):
-                    log_tau = np.log10(tau) if deconv_result.use_log_x else tau
+                    if deconv_result.use_log_x:
+                        log_tau = np.log10(tau)
+                    else:
+                        log_tau = tau
+                    
                     total = 0
                     for peak in deconv_result.peaks:
                         total += peak.amplitude * GaussianModelDeconv.gaussian(
                             log_tau, 1.0, peak.center_log, peak.sigma_log
                         )
+                    
                     if deconv_result.baseline_params and deconv_result.baseline_method != 'none':
                         if deconv_result.baseline_method == 'constant':
                             total += deconv_result.baseline_params[0]
                         elif deconv_result.baseline_method == 'linear':
                             total += deconv_result.baseline_params[0] + deconv_result.baseline_params[1] * log_tau
                         elif deconv_result.baseline_method == 'quadratic':
-                            total += (deconv_result.baseline_params[0] +
+                            total += (deconv_result.baseline_params[0] + 
                                      deconv_result.baseline_params[1] * log_tau +
                                      deconv_result.baseline_params[2] * log_tau**2)
+                    
                     fit_values[i] = total
             
             residuals = deconv_result.y_original - fit_values
@@ -5947,6 +5649,7 @@ def step4_results():
                 use_container_width=True
             )
             
+            # --- Export Normalized Gaussian Deconvolution Result ---
             st.markdown("**Export Normalized Deconvolution Data** *(Normalized spectrum + Total Fit + Residuals + Peaks)*")
             
             peaks_sorted_exp = sorted(deconv_result.peaks, key=lambda p: p.id)
@@ -5974,10 +5677,11 @@ def step4_results():
                 use_container_width=True
             )
 
+            # --- Export 2.2 Gaussian Deconvolution vs Frequency ---
             st.markdown("**Export 2.2 Deconvolution vs Frequency** *(Spectrum + Total Fit + Peaks)*")
             
             freqs_deconv = 1.0 / (2.0 * np.pi * deconv_result.x_linear)
-            sort_idx_f = np.argsort(freqs_deconv)[::-1]
+            sort_idx_f = np.argsort(freqs_deconv)[::-1]  # high to low, as on Graph 2.2
             log_tau_f = np.log10(np.maximum(deconv_result.x_linear[sort_idx_f], 1e-15))
             
             freq_deconv_dict = {
@@ -6000,6 +5704,7 @@ def step4_results():
                 use_container_width=True
             )
 
+            # --- Export 2.4 Experimental vs Sequential RQ (ZARC) Model ---
             if data is not None and drt_result is not None:
                 st.markdown("**Export 2.4 Sequential RQ (ZARC) Model** *(Experimental + Total Model + Processes)*")
                 
@@ -6009,7 +5714,12 @@ def step4_results():
                 im_exp_s = data.im_z[sort_idx_exp]
                 omega_exp_s = 2.0 * np.pi * freq_exp_s
                 
-                R_inf_start = float(drt_result.R_inf)
+                R_inf_start = drt_result.R_inf
+                for i in range(len(im_exp_s) - 1):
+                    if im_exp_s[i] >= 0 and im_exp_s[i + 1] < 0:
+                        t = -im_exp_s[i] / (im_exp_s[i + 1] - im_exp_s[i])
+                        R_inf_start = float(re_exp_s[i] + t * (re_exp_s[i + 1] - re_exp_s[i]))
+                        break
                 
                 Z_total_exp = np.full_like(omega_exp_s, R_inf_start, dtype=complex)
                 if drt_result.L > 0:
@@ -6084,24 +5794,9 @@ Rpol: {drt_result.R_pol:.6f} Ω
                         report += f"Inductance L: {drt_result.L:.6e} H\n"
                     if drt_result.lambda_opt is not None:
                         report += f"Optimal λ: {drt_result.lambda_opt:.6e}\n"
-                    if 'lambda_criterion' in drt_result.metadata:
-                        report += f"Lambda Selection Criterion: {drt_result.metadata['lambda_criterion']}\n"
                     integral, ratio = drt_result.verify_integral()
                     report += f"DRT Integral: {integral:.6f} Ω\n"
-                    report += f"Integral/Rpol Ratio: {ratio:.4f}\n"
-
-                    if st.session_state.app_state.lin_kk_result is not None:
-                        kk = st.session_state.app_state.lin_kk_result
-                        report += (f"Lin-KK Validation: {'PASS' if kk['is_valid'] else 'FAIL'} "
-                                   f"(Max Res = {kk['max_residual_pct']:.2f}%, RMS = {kk['rms_residual_pct']:.2f}%, "
-                                   f"M = {kk['M']}, mu = {kk['mu']:.2f})\n")
-
-                    if st.session_state.app_state.rlf_poles:
-                        report += "\nRLF DISCRETE POLES:\n" + "-" * 40 + "\n"
-                        for idx_p, p in enumerate(st.session_state.app_state.rlf_poles, 1):
-                            report += f"Pole {idx_p}: tau = {p['tau']:.4e} s, f = {p['frequency']:.4e} Hz, R = {p['R']:.4e} Ohm\n"
-
-                    report += "\n"
+                    report += f"Integral/Rpol Ratio: {ratio:.4f}\n\n"
                 
                 report += f"""QUALITY METRICS:
 {"-"*40}
